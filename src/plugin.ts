@@ -39,6 +39,7 @@ import {
   searchResultLimit,
   searchTextLimit,
 } from "./memory";
+import { activeGrants, grantScope } from "./grants";
 import { isReactionEmoji, messageKind, messageSources, saveReaction } from "./reactions";
 import {
   answerSummary,
@@ -310,6 +311,7 @@ function memory(
     .limit(20)
     .all()
     .toReversed();
+  const granted = activeGrants(db, dot, now);
   return [
     {
       key: "open-dot.notes",
@@ -345,6 +347,8 @@ ${list(supervised.map(supervisionLine))}`,
       key: "open-dot.requests",
       text: `## Your workers' waiting requests (dot_permission, dot_question and dot_escalate; your owner audits every answer)
 ${requestPolicy}
+Your owner's active grants (only your owner makes or revokes them; open-dot lets you approve, once, a single-command request each one covers, and refuses the rest):
+${list(granted.map((grant) => `- grant #${grant.id}: ${grantScope(grant)}, until ${new Date(grant.expiresAt).toString()}`))}
 ${list(waiting.map((row) => requestLine(row, now)))}${
         waiting.length
           ? `

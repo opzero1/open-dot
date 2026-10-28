@@ -91,7 +91,9 @@ const ledgerTables = [
   "ledger_state",
   "observer_jobs",
 ];
-// 0026, 0027, 0028, 0030 and 0032 add these tables, so earlier migrations' tests leave them out.
+// 0035 adds the owner's grants.
+const grantTables = ["grants"];
+// 0026, 0027, 0028, 0030, 0032 and 0035 add these tables, so earlier migrations' tests leave them out.
 const later = [
   "feed_triggers",
   "trigger_occurrences",
@@ -100,6 +102,7 @@ const later = [
   "artifacts",
   ...archiveTables,
   ...ledgerTables,
+  ...grantTables,
 ];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
@@ -1553,6 +1556,7 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
         "run_workers",
         ...archiveTables,
         ...ledgerTables,
+        ...grantTables,
       ].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
@@ -1612,7 +1616,7 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, "artifacts", ...archiveTables, ...ledgerTables].toSorted(),
+      [...tables, "artifacts", ...archiveTables, ...ledgerTables, ...grantTables].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
@@ -1671,7 +1675,7 @@ test("0029 appends only nullable icon columns to slack_apps and keeps every 0028
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, ...archiveTables, ...ledgerTables].toSorted(),
+      [...tables, ...archiveTables, ...ledgerTables, ...grantTables].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     const added = db.$client
@@ -1743,7 +1747,7 @@ test("0030 adds the archive and an index of every note, kept by triggers for leg
       .map((row) => row.id);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, ...archiveTables, ...ledgerTables].toSorted(),
+      [...tables, ...archiveTables, ...ledgerTables, ...grantTables].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(rows(db.$client)).toEqual(before);
@@ -1848,7 +1852,11 @@ test("0031 appends only auto_recall, off, to memory_settings and keeps every 003
   old.close();
   const db = openDatabase(path);
   try {
-    expect(tableNames(db.$client).filter((name) => !ledgerTables.includes(name))).toEqual(tables);
+    expect(
+      tableNames(db.$client).filter(
+        (name) => !ledgerTables.includes(name) && !grantTables.includes(name),
+      ),
+    ).toEqual(tables);
     for (const name of tables) {
       const after = db.$client.query(`pragma table_info("${name}")`).all();
       const was = columns.get(name) ?? [];
@@ -1914,7 +1922,7 @@ test("0032 adds the ledger and observer tables, every new switch off, and keeps 
   old.close();
   const db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, ...ledgerTables].toSorted());
+    expect(tableNames(db.$client)).toEqual([...tables, ...ledgerTables, ...grantTables].toSorted());
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledgerOld, "0032");

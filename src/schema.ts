@@ -214,6 +214,33 @@ export const supervisions = sqliteTable(
 
 export type Supervision = typeof supervisions.$inferSelect;
 
+/**
+ * The owner's permission for a dot to approve its workers' merges, ready marks or deploys within a
+ * scope, until it expires or the owner revokes it. Only the owner's CLI makes one, after a yes typed
+ * at a terminal; no dot or worker tool writes this table.
+ */
+export const grants = sqliteTable("grants", {
+  id: integer().primaryKey({ autoIncrement: true }),
+  dot: text()
+    .notNull()
+    .references(() => dots.name),
+  operation: text({ enum: ["merge", "ready", "deploy"] }).notNull(),
+  // "owner/name" on GitHub, or null for any repository.
+  repo: text(),
+  // A merge into exactly this branch.
+  branch: text(),
+  // A merge or ready mark of exactly this pull request.
+  pr: integer(),
+  // A deploy naming a word that matches this pattern, where * matches anything.
+  target: text(),
+  expiresAt: integer("expires_at").notNull(),
+  createdBy: text("created_by").notNull(),
+  createdAt: integer("created_at").notNull(),
+  revokedAt: integer("revoked_at"),
+});
+
+export type Grant = typeof grants.$inferSelect;
+
 export interface FeedSnapshot {
   readonly prompt: string;
   readonly item: {

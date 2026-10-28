@@ -23,6 +23,7 @@ import {
   ledgerState,
   observerJobs,
   feed,
+  grants,
   hiddenMessages,
   notes,
   outbox,
@@ -507,6 +508,36 @@ test("memory goes into instruction entries, one per section, put only when it ch
     expect(noted).not.toContain("## Responsibilities");
   } finally {
     await loaded.cleanup?.();
+  }
+});
+
+test("the dot's context lists its owner's active grants, not expired or revoked ones", async () => {
+  const db = openDatabase(databasePath());
+  const grant = (target: string, fields: { expiresAt?: number; revokedAt?: number }) =>
+    db
+      .insert(grants)
+      .values({
+        dot: "jojo",
+        operation: "deploy",
+        target,
+        expiresAt: Date.now() + 3_600_000,
+        createdBy: "owner (CLI)",
+        createdAt: 0,
+        ...fields,
+      })
+      .run();
+  grant("preview-live", {});
+  grant("preview-expired", { expiresAt: Date.now() - 1 });
+  grant("preview-revoked", { revokedAt: Date.now() });
+  const loaded = await load(dot.directory);
+  try {
+    const context = await loaded.injected(dot.sessionID);
+    expect(context).toContain('deploy to a target matching "preview-live" in any repository');
+    expect(context).not.toContain("preview-expired");
+    expect(context).not.toContain("preview-revoked");
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
   }
 });
 
