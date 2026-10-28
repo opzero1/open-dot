@@ -150,6 +150,8 @@ struct MemoryState {
   var noteDraft = ""
   /// Supervisions being approved or ended.
   var supervising: Set<Int> = []
+  /// Grants being revoked.
+  var revoking: Set<Int> = []
   /// The new trigger form, triggers being changed, whether a draft is being saved, and open previews.
   var triggerDraft = TriggerDraft()
   var triggering: Set<Int> = []
@@ -455,6 +457,15 @@ func supervisionTimes(_ binding: Supervision, now: Date = Date()) -> String {
   return "\(created), approved \(ago(activated, now: now))"
 }
 
+/// How long a grant has left.
+func grantRemaining(_ grant: Grant, now: Date = Date()) -> String {
+  let minutes = Int((grant.expiresAt / 1000 - now.timeIntervalSince1970) / 60)
+  if minutes < 1 { return "Ends now" }
+  if minutes < 120 { return "Ends in \(minutes)m" }
+  if minutes < 48 * 60 { return "Ends in \(minutes / 60)h" }
+  return "Ends in \(minutes / 1440)d"
+}
+
 /// A dot's notes, responsibilities and reminders. Changes start no turn: the dot sees them in its
 /// next memory snapshot.
 struct MemoryView: View {
@@ -514,6 +525,14 @@ struct MemoryView: View {
             let bindings = memory.supervisions ?? []
             if bindings.isEmpty { empty }
             ForEach(bindings) { SupervisionRow(store: store, dot: name, binding: $0) }
+          }
+          if let grants = memory.grants {
+            section("Grants") {
+              Text("What \(name) may approve for its workers. Only you make one, with open-dot grant add in a terminal.")
+                .font(.caption2).foregroundStyle(.secondary)
+              if grants.isEmpty { empty }
+              ForEach(grants) { GrantRow(store: store, dot: name, grant: $0) }
+            }
           }
           if let audit = store.requestAudits[name] {
             section("Worker requests and answers") {
@@ -1180,6 +1199,49 @@ struct SupervisionRow: View {
     }
     guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
     store.changeSupervision(dot, binding, approve: approve)
+  }
+}
+
+/// An active grant. Revoking asks first and starts no turn.
+struct GrantRow: View {
+  let store: Store
+  let dot: String
+  let grant: Grant
+
+  var body: some View {
+    let busy = store.memories[dot]?.revoking.contains(grant.id) == true
+    VStack(alignment: .leading, spacing: 4) {
+      Text(verbatim: grant.summary).font(.callout).textSelection(.enabled)
+      HStack(spacing: 10) {
+        Text(verbatim: "\(grantRemaining(grant)), \(Date(timeIntervalSince1970: grant.expiresAt / 1000).formatted(date: .abbreviated, time: .shortened))")
+          .font(.caption2).foregroundStyle(.tertiary)
+        Spacer()
+        if busy {
+          Text("Saving…").font(.caption2).foregroundStyle(.secondary)
+        } else {
+          Button("Revoke…") { confirm() }
+            .accessibilityIdentifier("grant-revoke-\(grant.id)")
+        }
+      }
+      .buttonStyle(.plain)
+      .font(.caption2.weight(.semibold))
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("memory-grant-\(grant.id)")
+  }
+
+  /// Asks first, with Cancel as the default for Return and Escape.
+  private func confirm() {
+    let alert = NSAlert()
+    alert.messageText = "Revoke this grant?"
+    alert.informativeText = "\(dot) may no longer approve requests to \(grant.summary). Only you can grant it again."
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: "Revoke").hasDestructiveAction = true
+    guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+    store.revokeGrant(dot, grant)
   }
 }
 

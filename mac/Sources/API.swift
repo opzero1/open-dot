@@ -639,6 +639,18 @@ struct Supervision: Decodable, Equatable, Identifiable {
   var modeTitle: String { mode == "send" ? "watch and send" : "watch only" }
 }
 
+/// The owner's grant that lets a dot approve its workers' matching merges, ready marks or deploys
+/// until it expires. Only the owner's CLI makes one; the notch lists and revokes them.
+struct Grant: Decodable, Equatable, Identifiable {
+  let id: Int
+  /// "merge", "ready" or "deploy".
+  let operation: String
+  /// What it covers, in the daemon's words, such as "merge into feat/foo in acme/app".
+  let summary: String
+  let expiresAt: Double
+  let createdAt: Double
+}
+
 /// The GitHub reasons a feed trigger can filter on, as the daemon's feed labels them.
 let triggerReasons = ["Review requested", "Mentioned", "Team mentioned", "Assigned", "Comment", "Author"]
 
@@ -739,6 +751,8 @@ struct Memory: Decodable, Equatable {
   var reminders: [MemoryReminder]
   /// Requested and active supervisions. Older daemons send none.
   var supervisions: [Supervision]? = nil
+  /// Active grants. Older daemons send none.
+  var grants: [Grant]? = nil
   /// Draft, active and paused feed triggers. Older daemons send none.
   var triggers: [FeedTrigger]? = nil
   /// The observed ledger's current rows and how many were superseded. Older daemons send none.
@@ -1147,6 +1161,12 @@ enum APIError: Error {
     let path = "/dots/\(escape(dot))/memory/supervisions/\(id)"
     let data = approve ? try await send("POST", "\(path)/approve") : try await send("DELETE", path)
     return try decode(Body.self, data).supervision
+  }
+
+  /// Revokes a grant. Never retried on its own.
+  func revokeGrant(_ dot: String, _ id: Int) async throws -> Grant {
+    struct Body: Decodable { let grant: Grant }
+    return try decode(Body.self, await send("DELETE", "/dots/\(escape(dot))/memory/grants/\(id)")).grant
   }
 
   /// Saves a draft feed trigger, which runs nothing until the owner enables it. Never retried on its own.
