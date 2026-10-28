@@ -1291,6 +1291,22 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// Revokes a grant the owner confirmed, then reads the memory again. A failed or unanswered
+  /// revoke says so and is never sent again on its own.
+  func revokeGrant(_ name: String, _ grant: Grant) {
+    guard memories[name, default: MemoryState()].revoking.insert(grant.id).inserted else { return }
+    memories[name]?.notice = nil
+    Task {
+      do {
+        _ = try await api.revokeGrant(name, grant.id)
+      } catch {
+        memories[name, default: MemoryState()].notice = Self.describeMemory(error, "Not revoked", unknown: "It may have been revoked; the next refresh shows what the daemon has.")
+      }
+      memories[name]?.revoking.remove(grant.id)
+      await refreshMemory(name)
+    }
+  }
+
   /// Saves the owner's new feed trigger as a draft to review, then reads the memory again. A draft
   /// runs nothing. A failed or unanswered save says so and is never sent again on its own.
   func createTrigger(_ name: String) {
