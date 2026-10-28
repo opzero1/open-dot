@@ -139,9 +139,14 @@ test("ready and pull request merges need the exact number, repository and no ext
     "gh pr ready 35 --repo acme/app",
     "gh pr ready 34 --repo acme/other",
     "gh pr ready",
+    "GH_REPO=acme/other gh pr ready 34",
+    "env GH_REPO=acme/other gh pr ready 34",
     "gh pr merge 34 --repo acme/app",
   ])
     expect(shell(command, [ready]).refuse).toBeString();
+  const anywhere = grant({ operation: "ready", pr: 34 });
+  expect(shell("gh pr ready 34", [anywhere])).toEqual({ grant: anywhere });
+  expect(shell("GH_REPO=acme/other gh pr ready 34", [anywhere]).refuse).toBeString();
   const merge = grant({ pr: 12 });
   expect(shell("gh pr merge 12 --squash", [merge])).toEqual({ grant: merge });
   for (const command of ["gh pr merge 12 --admin", "gh pr merge 12 --delete-branch", "gh pr merge"])
