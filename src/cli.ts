@@ -17,10 +17,11 @@ import {
 } from "./doctor";
 import { createDot, ensureSession, findDot, listDots, pickDot } from "./dots";
 import { collect, github, linear } from "./feed";
+import { describeGrant, grantScope, parseGrant, revokeGrant, saveGrant } from "./grants";
 import { apiPath, databasePath } from "./home";
 import { instructionsPath } from "./instructions";
 import { OpenCode } from "./opencode";
-import { slackApps, type Supervision, supervisions } from "./schema";
+import { grants, slackApps, type Supervision, supervisions } from "./schema";
 import { sharedNotices, slackChat, slackClient, slackFeed } from "./slack";
 import { slackAgents } from "./slack-agents";
 import {
@@ -73,7 +74,13 @@ const usage = `Usage:
                                      Let a dot supervise a session you started, once you confirm
   open-dot watch list [name]         List requested and active supervisions
   open-dot watch approve <id>        Approve a dot's request to supervise a session, once you confirm
-  open-dot watch revoke <id>         End a supervision or decline a request`;
+  open-dot watch revoke <id>         End a supervision or decline a request
+  open-dot grant add <name> merge (--branch <branch> | --pr <n>) [--repo owner/name] (--until <HH:MM|date> | --for <30m|2h|1d>)
+  open-dot grant add <name> ready --pr <n> [--repo owner/name] (--until … | --for …)
+  open-dot grant add <name> deploy --target <pattern> [--repo owner/name] (--until … | --for …)
+                                     Let a dot approve its workers' matching merges, ready marks or deploys, once you confirm
+  open-dot grant list [name]         List active grants
+  open-dot grant revoke <id>         Revoke a grant`;
 
 const [command, ...args] = process.argv.slice(2);
 // Before anything opens the database, which would migrate it: doctor only reads.
@@ -333,6 +340,56 @@ const watchCommand = (sub: string | undefined, rest: string[]) => {
   }).pipe(Effect.provide(OpenCode.layer));
 };
 
+const grantCommand = (sub: string | undefined, rest: string[]) => {
+  if (sub === "list" && rest.length <= 1)
+    return Effect.sync(() => {
+      const now = Date.now();
+      const active = db
+        .select()
+        .from(grants)
+        .all()
+        .filter(
+          (grant) =>
+            grant.revokedAt === null &&
+            grant.expiresAt > now &&
+            (!rest[0] || grant.dot === rest[0]),
+        );
+      if (active.length === 0) return console.log("No active grants.");
+      for (const grant of active) console.log(describeGrant(grant));
+    });
+  const id = Number(rest[0]);
+  if (sub === "revoke" && rest.length === 1 && Number.isSafeInteger(id))
+    return Effect.suspend(() => {
+      const revoked = revokeGrant(db, id);
+      if ("missing" in revoked) return fail(`There's no grant #${id}.`);
+      if ("conflict" in revoked) return fail(`Grant #${id} already expired or was revoked.`);
+      return Effect.sync(() => console.log(`Revoked ${describeGrant(revoked.saved)}`));
+    });
+  const [dot, operation, ...flags] = rest;
+  if (sub !== "add" || !dot) return fail(usage);
+  return Effect.suspend(() => {
+    if (!findDot(db, dot)) return fail(`No dot named "${dot}".`);
+    const input = parseGrant(dot, operation, flags, Date.now());
+    if (typeof input === "string") return fail(`${input} Nothing changed.`);
+    // Only a person at a terminal can make a grant, so no dot's or worker's shell can.
+    if (!process.stdin.isTTY)
+      return fail("Run this in a terminal: a grant needs you to confirm it. Nothing changed.");
+    const preview = { ...input, id: 0, createdBy: "", createdAt: 0, revokedAt: null };
+    if (
+      !confirmed(
+        `Let ${dot} approve its workers' requests to ${grantScope(preview)}, until ${new Date(input.expiresAt).toLocaleString()}?${
+          input.branch === "main" || input.branch === "master" || /prod/i.test(input.target ?? "")
+            ? " This names main, master or production."
+            : ""
+        }`,
+      )
+    )
+      return Effect.sync(() => console.log("Nothing changed."));
+    const saved = saveGrant(db, input, "owner (CLI)");
+    return Effect.sync(() => console.log(`Active: ${describeGrant(saved)}`));
+  });
+};
+
 const open = (name: string | undefined) =>
   Effect.gen(function* () {
     const dot = yield* ensureSession(db, yield* pickDot(db, name));
@@ -490,9 +547,11 @@ const program =
               ? slackCommand(args[0], args[1], args.slice(2))
               : command === "watch"
                 ? watchCommand(args[0], args.slice(1))
-                : command === "instructions" && args.length === 1 && args[0]
-                  ? instructions(args[0])
-                  : Effect.sync(() => console.log(usage));
+                : command === "grant"
+                  ? grantCommand(args[0], args.slice(1))
+                  : command === "instructions" && args.length === 1 && args[0]
+                    ? instructions(args[0])
+                    : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(

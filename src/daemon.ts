@@ -33,15 +33,14 @@ import {
   workers,
 } from "./schema";
 import {
-  deletionRoot,
   escalate,
   graceMs,
   unseenLimitMs,
   invalidAnswer,
   malformedAnswer,
   ownershipProblem,
-  prohibited,
   requestNotice,
+  requestReview,
 } from "./requests";
 import {
   canSend,
@@ -750,7 +749,7 @@ const noteRequests = (
           const notice = enqueue(
             tx,
             dot.sessionID,
-            requestNotice(row, deletionRoot(tx, row)),
+            requestNotice(row, requestReview(tx, row)),
             SessionMessage.ID.create(),
             "steer",
           );
@@ -1087,8 +1086,7 @@ const whyNot = (
   if (fresh.sensitive) return { refuse: "It may ask for a secret." };
   if (JSON.stringify(fresh.detail) !== JSON.stringify(row.detail))
     return { refuse: "It changed after the dot answered." };
-  const guard =
-    answer.decision === "once" ? prohibited(row.detail, deletionRoot(db, row)) : undefined;
+  const guard = answer.decision === "once" ? requestReview(db, row).refuse : undefined;
   if (guard) return { refuse: `It ${guard}.` };
   const invalid =
     answer.decision === "reply" ? invalidAnswer(row.detail, answer.answer) : undefined;

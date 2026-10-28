@@ -89,6 +89,7 @@ import {
   updateApp,
 } from "./slack-setup";
 import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
+import { activeGrants, grantView, revokeGrant } from "./grants";
 import {
   createTrigger,
   enableTrigger,
@@ -1487,6 +1488,33 @@ const supervisionRoute = (
   return error(404, "There's no such binding for this dot.");
 };
 
+/**
+ * The owner revokes a grant with DELETE .../grants/<id>. The API can't make one: only the CLI does,
+ * after the owner confirms it at a terminal.
+ */
+const grantRoute = (
+  db: Db,
+  dot: string,
+  method: string,
+  rawID: string | undefined,
+  extra: string[],
+) => {
+  if (rawID === undefined || !positive.test(rawID) || !Number.isSafeInteger(Number(rawID)))
+    return error(404, "There's no such grant for this dot.");
+  if (extra.length || method !== "DELETE") return error(404, "Not found");
+  const change = revokeGrant(db, Number(rawID), dot);
+  if ("saved" in change) return Response.json({ grant: grantView(change.saved) });
+  if ("conflict" in change)
+    return Response.json(
+      {
+        error: "This grant already expired or was revoked.",
+        current: grantView(change.conflict),
+      },
+      { status: 409 },
+    );
+  return error(404, "There's no such grant for this dot.");
+};
+
 const triggerAnswer = (db: Db, change: TriggerChange) => {
   if ("saved" in change) return Response.json({ trigger: triggerView(db, change.saved) });
   if ("conflict" in change)
@@ -1755,6 +1783,7 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
   if (!dot) return error(404, `There's no dot named "${name}".`);
   const { method } = request;
   if (kind === "supervisions") return supervisionRoute(db, dot.name, method, rawID, extra);
+  if (kind === "grants") return grantRoute(db, dot.name, method, rawID, extra);
   if (kind === "triggers") return triggerRoute(db, dot, request, rawID, extra);
   if (kind === "responsibilities" && extra[0] === "runs")
     return extra.length === 1 && method === "GET"
@@ -1773,6 +1802,7 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
             observationsSuperseded: superseded,
           }))(listLedger(db, dot.name)),
           supervisions: openSupervisions(db, dot.name).map(supervisionView),
+          grants: activeGrants(db, dot.name).map(grantView),
           triggers: listTriggers(db, dot.name).map((row) => triggerView(db, row)),
         })
       : error(404, "Not found");

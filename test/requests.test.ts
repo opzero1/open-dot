@@ -8,7 +8,7 @@ import { worktreeDirectory } from "../src/home";
 import { formWaiting, redactedQuestion } from "../src/opencode";
 import { type Db, openDatabase } from "../src/db";
 import { graceMs, prohibited, queueAnswer, unseenLimitMs } from "../src/requests";
-import { dots, outbox, requests, type RequestAnswer, workers } from "../src/schema";
+import { dots, grants, outbox, requests, type RequestAnswer, workers } from "../src/schema";
 import { saveBinding } from "../src/supervise";
 import { fakeOpenCode, type FakeWaiting } from "./fake-opencode";
 
@@ -329,6 +329,55 @@ test("open-dot won't approve what it recognizes as off limits, but the dot may r
   expect(queue({ decision: "reject" })).toMatchObject({ state: "queued" });
   await tick();
   expect(fake.state.answers.map((sent) => sent.answer)).toEqual([{ decision: "reject" }]);
+});
+
+test("the dot may approve a merge, ready mark or deploy only while its owner's grant covers it", async () => {
+  const grant = (operation: "ready" | "deploy", fields: { pr?: number; target?: string }) =>
+    db
+      .insert(grants)
+      .values({
+        dot: "jojo",
+        operation,
+        ...fields,
+        expiresAt: Date.now() + 3_600_000,
+        createdBy: "owner (CLI)",
+        createdAt: 0,
+      })
+      .returning()
+      .get();
+  const ready = grant("ready", { pr: 12 });
+  // Another dot's grant covers nothing for jojo.
+  db.insert(grants)
+    .values({
+      dot: "dio",
+      operation: "deploy",
+      target: "preview",
+      expiresAt: Date.now() + 3_600_000,
+      createdBy: "owner (CLI)",
+      createdAt: 0,
+    })
+    .run();
+  const session = running();
+  fake.state.waiting.set(session, [
+    permission("shell: gh pr ready 12"),
+    permission("shell: gh pr ready 13", "per_2"),
+    permission("shell: wrangler deploy --env preview", "per_3"),
+  ]);
+  await tick();
+  expect(toDot().find((text) => text.includes("#1."))).toContain(`grant #${ready.id}`);
+  expect(queue({ decision: "once" }, 2)).toContain("no active grant");
+  expect(queue({ decision: "once" }, 3)).toContain("no active grant");
+  expect(queue({ decision: "once" }, 1)).toMatchObject({ state: "queued" });
+  await tick();
+  expect(request(1)).toMatchObject({ state: "answered" });
+
+  // A grant revoked after the dot answers stops the answer before it's sent.
+  const deploy = grant("deploy", { target: "preview" });
+  expect(queue({ decision: "once" }, 3)).toMatchObject({ state: "queued" });
+  db.update(grants).set({ revokedAt: Date.now() }).where(eq(grants.id, deploy.id)).run();
+  await tick();
+  expect(request(3)?.state).not.toBe("answered");
+  expect(fake.state.answers).toHaveLength(1);
 });
 
 const elsewhere = (resource: string) =>
@@ -696,7 +745,9 @@ test("deletions are approved only inside the worktree open-dot made for the work
   // Without a worktree of its own, nothing that deletes is approved, even a relative path.
   expect(shell("rm -rf build", null)).toContain("no worktree of its own");
   expect(shell("bun test", null)).toBeUndefined();
-  expect(shell("git merge main", root)).toBe("merges branches");
+  expect(shell("git merge main", root)).toBe(
+    "merges branches or a pull request, and no active grant from your owner covers it",
+  );
   expect(shell("git branch -D other", root)).toBeString();
 
   // A worker with its own worktree may delete inside it; one in a scratch directory may not.
