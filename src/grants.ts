@@ -171,7 +171,11 @@ export const covering = (
 ): Grant | undefined => {
   const candidates = active.filter((grant) => grant.operation === operation);
   if (candidates.length === 0) return undefined;
-  const [head = "", ...args] = unwrapped(words(command));
+  const tokens = words(command);
+  const [head = "", ...args] = unwrapped(tokens);
+  // An environment variable, such as GH_REPO, could point the command elsewhere.
+  const prefix = tokens.slice(0, tokens.length - args.length - 1);
+  if (prefix.some((word) => word === "env" || /^\w+=/.test(word))) return undefined;
   const tool = basename(head);
   const flag = args.findIndex((arg) => arg === "-R" || arg === "--repo");
   const named =
