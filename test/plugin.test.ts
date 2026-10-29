@@ -13,7 +13,7 @@ import { OpenCode, OpenCodeError } from "../src/opencode";
 import { createDot, findDot } from "../src/dots";
 import { databasePath, home, observerDirectory, outputDirectory } from "../src/home";
 import { cancelReminder, editNote, editResponsibility } from "../src/memory";
-import plugin from "../src/plugin";
+import plugin, { runsWordsTogether } from "../src/plugin";
 import { saveReaction } from "../src/reactions";
 import {
   archive,
@@ -587,6 +587,38 @@ test("an active responsibility stays in memory until it is done", async () => {
 
   await loaded.call("dot_update", { id: 1, status: "done" });
   expect(await loaded.injected(dot.sessionID)).not.toContain("Ship M3");
+  await loaded.cleanup?.();
+});
+
+test("text that runs words together is told apart from code, paths and long words", () => {
+  // Real Sol output from long-running coordinator sessions.
+  expect(
+    runsWordsTogether(
+      "Continueactualacceptance ATTEMPT4 newownDiffcoreclean e4701b4. Minimalrepair coreinspector nowexplicitmiddlewareaccepts preservingnodesedges, `.ts`originsaccepted SAMEcommittedbytesdigest+uniqueclasschecks; unknownkindsreject.",
+    ),
+  ).toBe(true);
+  expect(
+    runsWordsTogether(
+      "Run `getServerSidePropsForDashboardPage` in /Users/a/workspaces/diffcoreNestInspectorMain and see https://example.com/someVeryLongPathSegmentName. Internationalization and telecommunications stay readable, and DIFFCORE_CAPABILITY17_NATIVE is an environment variable.",
+    ),
+  ).toBe(false);
+});
+
+test("the dot can't store or send notes, next actions or tasks with words run together", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  const glued =
+    "OWNERAPPROVED continuation: Rootreadfullreportnowaccepted andacceptsboundedactualruntimeprogress, SAMEengineercompletedreleased.";
+  expect(await fails(loaded.call("dot_note", { text: glued }))).toBe(true);
+  expect(await fails(loaded.call("dot_track", { goal: "Ship M3", next_action: glued }))).toBe(true);
+  expect(await fails(loaded.call("dot_delegate", { task: glued }))).toBe(true);
+  expect(db.select().from(notes).all()).toEqual([]);
+  expect(db.select().from(responsibilities).all()).toEqual([]);
+  expect(db.select().from(workers).all()).toEqual([]);
+
+  await loaded.call("dot_track", { goal: "Ship M3", next_action: "Write the daemon." });
+  expect(await fails(loaded.call("dot_update", { id: 1, next_action: glued }))).toBe(true);
+  expect(await loaded.injected(dot.sessionID)).toContain("Next: Write the daemon.");
   await loaded.cleanup?.();
 });
 

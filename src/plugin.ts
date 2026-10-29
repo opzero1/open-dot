@@ -100,6 +100,37 @@ const ledgerOff = "The observed ledger is off for this dot.";
 const inputTypes: ReadonlySet<string> = new Set(["user", "synthetic", "shell"]);
 
 const text = (description: string) => Schema.String.annotate({ description });
+
+/**
+ * Whether text runs words together, like "Continueactualacceptance" or "SOURCEFAIL5findings",
+ * outside code, URLs and paths. GPT-6.1 Sol drifts into this in long sessions and copies it from
+ * its own earlier notes and worker prompts, so open-dot refuses to store or send it.
+ */
+export function runsWordsTogether(value: string) {
+  const prose = value
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ")
+    .replace(/\S*(?:[/\\_@#=]|[.:](?=\S))\S*/g, " ");
+  const words = prose.match(/[A-Za-z]+/g) ?? [];
+  const glued = words.filter((word) => {
+    if (word.length < 16) return false;
+    const parts = word.match(/[A-Z]+(?![a-z])|[A-Z]?[a-z]+/g) ?? [];
+    return (
+      parts.some((part) => part.length >= 18) ||
+      (parts.some((part) => part.length >= 2 && part === part.toUpperCase()) &&
+        parts.some((part) => part.length > 2 && part.slice(1) === part.slice(1).toLowerCase()))
+    );
+  }).length;
+  return glued >= 3 && glued * 40 >= words.length;
+}
+
+const plainText = (field: string, value: string) => {
+  if (runsWordsTogether(value))
+    throw new Error(
+      `${field} runs words together. Rewrite it in plain sentences with a space between every word; another model or your future self reads it after compaction.`,
+    );
+  return value;
+};
 const id = (description: string) => Schema.Int.annotate({ description });
 const withOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 const list = (lines: string[]) => (lines.length > 0 ? lines.join("\n") : "(none)");
@@ -611,7 +642,7 @@ export default Plugin.define({
             .values({
               dot: name,
               route,
-              text: input.text,
+              text: plainText("The reminder", input.text),
               dueAt,
               everyMinutes: every,
               state: "scheduled",
@@ -659,7 +690,12 @@ export default Plugin.define({
             throw new Error("The dot's conversation changed, so the note wasn't saved.");
           const row = db
             .insert(notes)
-            .values({ dot: name, text: input.text, createdAt: Date.now(), ...source })
+            .values({
+              dot: name,
+              text: plainText("The note", input.text),
+              createdAt: Date.now(),
+              ...source,
+            })
             .returning()
             .get();
           return {
@@ -848,7 +884,7 @@ ${dataJSON(part)}
               .values({
                 dot: name,
                 route,
-                task: input.task,
+                task: plainText("The task", input.task),
                 directory,
                 paths,
                 sessionID: Session.ID.create(),
@@ -920,8 +956,8 @@ ${dataJSON(part)}
             .insert(responsibilities)
             .values({
               dot: name,
-              goal: input.goal,
-              nextAction: input.next_action,
+              goal: plainText("The goal", input.goal),
+              nextAction: plainText("The next action", input.next_action),
               status: "active",
               schedule,
               nextRunAt: nextRunAfter(
@@ -978,7 +1014,9 @@ ${dataJSON(part)}
               return tx
                 .update(responsibilities)
                 .set({
-                  ...(input.next_action === undefined ? {} : { nextAction: input.next_action }),
+                  ...(input.next_action === undefined
+                    ? {}
+                    : { nextAction: plainText("The next action", input.next_action) }),
                   ...(input.status === undefined ? {} : { status: input.status }),
                   ...(schedule === undefined ? {} : { schedule }),
                   nextRunAt: nextRunAfter(current, after, now),
@@ -1028,7 +1066,7 @@ ${dataJSON(part)}
             .values({
               sessionID: target.sessionID,
               messageID: SessionMessage.ID.create(),
-              text: dotMessage(name, input.text),
+              text: dotMessage(name, plainText("The message", input.text)),
               state: "pending",
               fromDot: name,
               createdAt: now,
@@ -1252,7 +1290,7 @@ ${dataJSON(part)}
           }
           if (input.text === undefined || !input.text.trim())
             throw new Error("Write the message, or pass promote with a message ID.");
-          const message = input.text;
+          const message = plainText("The message", input.text);
           const now = Date.now();
           const messageID = SessionMessage.ID.create();
           const queued = db.transaction(
@@ -1315,7 +1353,8 @@ ${dataJSON(part)}
           const removing = input.remove === true;
           if (removing === (input.text !== undefined))
             throw new Error("Pass either text or remove: true.");
-          const instruction = input.text?.trim() ?? null;
+          const instruction =
+            input.text === undefined ? null : plainText("The instruction", input.text.trim());
           if (instruction !== null && !instruction) throw new Error("Write the instruction.");
           if (instruction !== null && instruction.length > instructionLimit)
             throw new Error(`Keep it to ${instructionLimit} characters.`);
