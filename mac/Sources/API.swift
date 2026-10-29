@@ -930,6 +930,18 @@ final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
   }
 }
 
+/// A dot's move to a fresh session, as the daemon confirmed it.
+struct FreshStart: Decodable, Equatable {
+  let sessionID: String
+  let previousSessionID: String
+  let previousTitle: String?
+}
+
+/// The daemon refused a fresh start because the dot is in the middle of a turn.
+struct FreshBusy: Error, Equatable {
+  let message: String
+}
+
 enum APIError: Error {
   case unreachable
   case lost
@@ -1153,6 +1165,20 @@ enum APIError: Error {
   func stopWorker(_ id: Int) async throws -> Dot.Worker {
     struct Body: Decodable { let worker: Dot.Worker }
     return try decode(Body.self, await send("POST", "/workers/\(id)/stop")).worker
+  }
+
+  /// Moves a dot to a fresh session the owner confirmed. A refusal because the dot is mid-turn is
+  /// `FreshBusy`, so the owner can choose to force it. Never retried on its own.
+  func startFresh(_ dot: String, force: Bool) async throws -> FreshStart {
+    let body = force ? Data(#"{"force":true}"#.utf8) : Data("{}".utf8)
+    let (status, data) = try await exchange("POST", "/dots/\(escape(dot))/fresh", body: body, timeout: 30)
+    struct Failure: Decodable { let error: String }
+    let text = (try? JSONDecoder().decode(Failure.self, from: data))?.error ?? HTTPURLResponse.localizedString(forStatusCode: status)
+    if status == 409 && !force && text.contains("middle of a turn") { throw FreshBusy(message: text) }
+    guard (200..<300).contains(status) else {
+      throw APIError.server(status == 404 && text == "Not found" ? "This daemon doesn't know fresh starts yet. Restart it, then try again." : text)
+    }
+    return try decode(FreshStart.self, data)
   }
 
   /// Approves a dot's request to supervise a session, or ends a binding. Never retried on its own.

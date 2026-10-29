@@ -111,7 +111,7 @@ final class SlackTests: XCTestCase {
     }
 
     let menu = dotMenu(store, dot: "jolyne")
-    let connectors = try XCTUnwrap(menu.items.last)
+    let connectors = try XCTUnwrap(menu.items.first { $0.identifier?.rawValue == "dot-menu-connectors" })
     XCTAssertEqual(connectors.identifier?.rawValue, "dot-menu-connectors")
     XCTAssertEqual(connectors.title, "Connectors")
     let item = try XCTUnwrap(connectors.submenu?.items.first)

@@ -98,7 +98,7 @@ final class DotMenuTests: XCTestCase {
     store.instructions["jolyne"] = draft("mine")
 
     let menu = dotMenu(store, dot: "jolyne")
-    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •", "Library", "Health", "Connectors"], "Unsaved instructions are marked")
+    XCTAssertEqual(menu.items.map(\.title), ["Memory", "Instructions •", "Library", "Health", "Connectors", "", "Start Fresh…"], "Unsaved instructions are marked")
     XCTAssertEqual(try item(menu, "dot-menu-connectors").submenu?.items.map(\.title), ["Slack"], "Slack is under Connectors")
     XCTAssertEqual(try item(menu, "dot-menu-instructions").accessibilityLabel(), "Instructions, unsaved changes")
     try choose(menu, "dot-menu-instructions")
@@ -106,7 +106,7 @@ final class DotMenuTests: XCTestCase {
     XCTAssertFalse(store.showingFeed)
 
     let other = dotMenu(store, dot: "jojo")
-    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions", "Library", "Health", "Connectors"])
+    XCTAssertEqual(other.items.map(\.title), ["Memory", "Instructions", "Library", "Health", "Connectors", "", "Start Fresh…"])
     try choose(other, "dot-menu-memory")
     await eventually { store.selected == "jojo" && store.pane == .memory }
     XCTAssertEqual(store.instructions["jolyne"]?.draft, "mine", "Switching dots keeps the draft")
@@ -115,6 +115,41 @@ final class DotMenuTests: XCTestCase {
     store.openDot("jolyne", .chat)
     XCTAssertEqual(store.selected, "jolyne")
     XCTAssertEqual(store.pane, .chat)
+  }
+
+  @MainActor func testStartFreshShowsOnlyTheNewSessionsChat() async throws {
+    let store = try isolatedStore()
+    var session = "ses_old"
+    store.latestPage = { _ in
+      let message = Message(id: "msg_\(session)", sessionID: session, kind: "dot", peer: nil,
+        text: "From \(session)", tools: [], attachments: [], feed: nil, time: 1, reactions: [])
+      return MessagePage(messages: [message], sessionID: session, next: nil, pending: [], recentEmojis: nil)
+    }
+    await store.refreshMessages("jolyne")
+    XCTAssertEqual(store.conversations["jolyne"]?.items.map(\.id), ["msg_ses_old"])
+    XCTAssertNotNil(try item(dotMenu(store, dot: "jolyne"), "dot-menu-fresh"))
+    XCTAssertTrue(freshConfirmation("jolyne").detail.contains("carry over"))
+
+    var forced: [Bool] = []
+    store.freshStart = { _, force in
+      forced.append(force)
+      if !force { throw FreshBusy(message: "jolyne is in the middle of a turn.") }
+      session = "ses_new"
+      return FreshStart(sessionID: "ses_new", previousSessionID: "ses_old", previousTitle: "jolyne (archived 2026-10-29)")
+    }
+    store.openDot("jolyne", .memory)
+    let busy = await store.startFresh("jolyne", force: false)
+    XCTAssertEqual(busy, .busy("jolyne is in the middle of a turn."))
+    XCTAssertEqual(store.pane, .memory, "A refusal changes nothing")
+    XCTAssertEqual(store.conversations["jolyne"]?.items.map(\.id), ["msg_ses_old"])
+
+    let started = await store.startFresh("jolyne", force: true)
+    XCTAssertEqual(started, .started(FreshStart(sessionID: "ses_new", previousSessionID: "ses_old", previousTitle: "jolyne (archived 2026-10-29)")))
+    XCTAssertEqual(forced, [false, true])
+    XCTAssertEqual(store.selected, "jolyne")
+    XCTAssertEqual(store.pane, .chat)
+    XCTAssertEqual(store.conversations["jolyne"]?.sessionID, "ses_new")
+    XCTAssertEqual(store.conversations["jolyne"]?.items.map(\.id), ["msg_ses_new"], "The old session's messages are gone")
   }
 
   @MainActor func testMenuViewsKeepChatUnreadUntilChatIsOpened() async throws {

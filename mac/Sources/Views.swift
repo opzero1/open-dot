@@ -1873,6 +1873,7 @@ private struct DotTabActions: ViewModifier {
       .accessibilityAction(named: "Library") { store.openDot(name, .library) }
       .accessibilityAction(named: "Health") { store.openDot(name, .health) }
       .accessibilityAction(named: "Slack") { store.openDot(name, .slack) }
+      .accessibilityAction(named: "Start fresh") { confirmStartFresh(name, store: store) }
   }
 }
 
@@ -1900,7 +1901,54 @@ private struct DotTabActions: ViewModifier {
   submenu.addItem(action("Slack", symbol: "number", id: "dot-menu-slack") { store.openDot(dot, .slack) })
   connectors.submenu = submenu
   menu.addItem(connectors)
+  menu.addItem(.separator())
+  let fresh = action("Start Fresh…", symbol: "arrow.counterclockwise", id: "dot-menu-fresh") { confirmStartFresh(dot, store: store) }
+  fresh.isEnabled = !store.freshening.contains(dot)
+  menu.addItem(fresh)
   return menu
+}
+
+/// The confirmation before a fresh start: what carries over and what stays behind, with Cancel
+/// first for Return and Escape.
+func freshConfirmation(_ dot: String) -> (title: String, detail: String) {
+  (
+    "Start \(dot) fresh?",
+    "\(dot) moves to a new OpenCode session and starts with a short handoff instead of its long history. Its notes, responsibilities, reminders, workers, grants, Slack threads and instructions carry over. Its current session is renamed as archived and kept, and its messages no longer show here."
+  )
+}
+
+@MainActor func confirmStartFresh(_ dot: String, store: Store) {
+  let text = freshConfirmation(dot)
+  let alert = NSAlert()
+  alert.messageText = text.title
+  alert.informativeText = text.detail
+  alert.addButton(withTitle: "Cancel")
+  alert.addButton(withTitle: "Start Fresh")
+  guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+  Task { await startFresh(dot, store: store, force: false) }
+}
+
+@MainActor private func startFresh(_ dot: String, store: Store, force: Bool) async {
+  store.hold()
+  defer { store.release() }
+  switch await store.startFresh(dot, force: force) {
+  case .busy(let message):
+    let alert = NSAlert()
+    alert.messageText = "\(dot) is in the middle of a turn"
+    alert.informativeText = "\(message)\n\nStarting fresh now leaves that turn running in the old session."
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: "Start Fresh Anyway").hasDestructiveAction = true
+    guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+    await startFresh(dot, store: store, force: true)
+  case .failed(let message):
+    let alert = NSAlert()
+    alert.messageText = "\(dot) didn't start fresh"
+    alert.informativeText = message
+    alert.addButton(withTitle: "OK")
+    _ = runAlert(alert, store)
+  case .started, nil:
+    break
+  }
 }
 
 /// Runs an alert while holding the notch open, so it doesn't fold away behind it.

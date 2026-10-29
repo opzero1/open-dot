@@ -381,6 +381,7 @@ struct MessageWindow: Equatable {
   /// The daemon reads of the latest page and of one message. Tests replace them.
   @ObservationIgnored var latestPage: @MainActor (String) async throws -> MessagePage = { _ in throw APIError.unreachable }
   @ObservationIgnored var oneMessage: @MainActor (MessageKey, String) async throws -> Message = { _, _ in throw APIError.unreachable }
+  @ObservationIgnored var freshStart: @MainActor (String, Bool) async throws -> FreshStart = { _, _ in throw APIError.unreachable }
   @ObservationIgnored var saveReaction: @MainActor (MessageKey, String?) async throws -> (reaction: Reaction, recent: [String]?) = { _, _ in throw APIError.unreachable }
   /// The Library reads and the export's save panel. Tests replace them.
   @ObservationIgnored var libraryPage: @MainActor (String, Int?) async throws -> ArtifactPage = { _, _ in throw APIError.unreachable }
@@ -409,6 +410,7 @@ struct MessageWindow: Equatable {
     latestPage = { try await api.messages($0) }
     oneMessage = { try await api.message($0, session: $1) }
     saveReaction = { try await api.react($0, emoji: $1) }
+    freshStart = { try await api.startFresh($0, force: $1) }
     libraryPage = { try await api.library($0, before: $1) }
     artifactBytes = { try await api.artifactContent($0, $1) }
     chooseExport = { [unowned self] name in savePanel(name, self) }
@@ -1272,6 +1274,39 @@ struct MessageWindow: Equatable {
       workerBusy.remove(worker.id)
       await refreshDots()
     }
+  }
+
+  /// Dots whose fresh start is in flight, so a second click sends nothing.
+  private(set) var freshening: Set<String> = []
+
+  /// What came of a fresh start: done, refused because the dot is mid-turn, or failed.
+  enum FreshOutcome: Equatable {
+    case started(FreshStart)
+    case busy(String)
+    case failed(String)
+  }
+
+  /// Moves a dot to a fresh session the owner confirmed, then shows its new chat, where the old
+  /// session's messages no longer appear. Never retried on its own.
+  func startFresh(_ name: String, force: Bool) async -> FreshOutcome? {
+    guard freshening.insert(name).inserted else { return nil }
+    defer { freshening.remove(name) }
+    let outcome: FreshOutcome
+    do {
+      outcome = .started(try await freshStart(name, force))
+    } catch let busy as FreshBusy {
+      return .busy(busy.message)
+    } catch {
+      if case .lost = error as? APIError {
+        outcome = .failed("No response from the daemon, so the outcome is unknown. Check the dot's chat before trying again.")
+      } else {
+        return .failed("Not started fresh. \(Self.describe(error))")
+      }
+    }
+    openDot(name, .chat)
+    await refreshMessages(name)
+    await refreshDots()
+    return outcome
   }
 
   /// Approves or ends a supervision the owner confirmed, then reads the memory again. A failed or
