@@ -441,15 +441,15 @@ const firstMatch = (text: string, words: readonly string[]) => {
 };
 
 /**
- * The dot's saved notes and, with its archive on, its archived messages from the bound session,
- * that match every word of three or more characters, best match first by BM25, a page at a time.
+ * The dot's saved notes and, with its archive on, its archived messages from every session it has
+ * had, so history from before a fresh start stays searchable, that match every word of three or more characters, best match first by BM25, a page at a time.
  */
 export function recall(db: Db, dot: Dot, words: readonly string[], limit: number, offset: number) {
   const terms = indexTerms(words);
   if (!terms.length) return { invalid: "Search for at least one word of 3 or more characters." };
   const archiveOn = settingsOf(db, dot.name).archive;
   const hits = db.all<{ id: number }>(
-    sql`SELECT rowid AS id FROM memory_fts WHERE memory_fts MATCH ${terms.join(" AND ")} AND dot = ${dot.name} AND (rowid < 0 OR (${archiveOn ? 1 : 0} = 1 AND session = ${dot.sessionID})) ORDER BY rank, rowid DESC LIMIT ${limit + 1} OFFSET ${offset}`,
+    sql`SELECT rowid AS id FROM memory_fts WHERE memory_fts MATCH ${terms.join(" AND ")} AND dot = ${dot.name} AND (rowid < 0 OR ${archiveOn ? 1 : 0} = 1) ORDER BY rank, rowid DESC LIMIT ${limit + 1} OFFSET ${offset}`,
   );
   const shown = hits.slice(0, limit);
   const noteIDs = shown.filter((hit) => hit.id < 0).map((hit) => -hit.id);
@@ -469,13 +469,7 @@ export function recall(db: Db, dot: Dot, words: readonly string[], limit: number
       ? db
           .select()
           .from(archive)
-          .where(
-            and(
-              eq(archive.dot, dot.name),
-              eq(archive.sessionID, dot.sessionID),
-              inArray(archive.id, messageIDs),
-            ),
-          )
+          .where(and(eq(archive.dot, dot.name), inArray(archive.id, messageIDs)))
           .all()
       : []
     ).map((row) => [row.id, row]),
@@ -526,22 +520,16 @@ export function recall(db: Db, dot: Dot, words: readonly string[], limit: number
   return { results, next: more ? offset + limit : null };
 }
 
-/** Part of one archived message of the bound session, from `offset`, at most `zoomLength` long. */
+/** Part of one archived message of any of the dot's sessions, from `offset`, at most `zoomLength` long. */
 export function zoom(db: Db, dot: Dot, messageID: string, offset: number) {
   if (!settingsOf(db, dot.name).archive)
     return { invalid: "Your conversation archive is off. Only your owner can turn it on." };
   const row = db
     .select()
     .from(archive)
-    .where(
-      and(
-        eq(archive.dot, dot.name),
-        eq(archive.sessionID, dot.sessionID),
-        eq(archive.messageID, messageID),
-      ),
-    )
+    .where(and(eq(archive.dot, dot.name), eq(archive.messageID, messageID)))
     .get();
-  if (!row) return { invalid: "There's no archived message with that ID in this conversation." };
+  if (!row) return { invalid: "There's no archived message with that ID." };
   if (offset > 0 && offset >= row.text.length)
     return { invalid: `offset must be below ${row.text.length}.` };
   // Never splits a surrogate pair at either end.

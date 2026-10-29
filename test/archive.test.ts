@@ -187,7 +187,7 @@ test("an unfinished reply is read again until it finishes or its turn ends", asy
   expect(archived().map((row) => row.id)).toContain("msg_crashed");
 });
 
-test("a rebind during a read saves nothing, and old sessions are no longer recalled", async () => {
+test("a rebind during a read saves nothing, and old sessions stay recallable", async () => {
   history().push(item("msg_a", "assistant", "the sqlite decision", 2_000));
   saveArchiveSettings(db, "jojo", { archive: true }, 1_000);
   fake.state.onPage = () =>
@@ -212,9 +212,15 @@ test("a rebind during a read saves nothing, and old sessions are no longer recal
   expect(db.select().from(archiveCursors).get()).toMatchObject({ sessionID: "ses_new" });
   const found = recall(db, jojo(), words("sqlite"), 8, 0);
   expect(found).toMatchObject({
-    results: [{ kind: "message", message: "msg_b", sessionID: "ses_new" }],
+    results: [
+      { kind: "message", message: "msg_b", sessionID: "ses_new" },
+      { kind: "message", message: "msg_a", sessionID: "ses_jojo" },
+    ],
   });
-  expect(zoom(db, jojo(), "msg_a", 0)).toHaveProperty("invalid");
+  expect(zoom(db, jojo(), "msg_a", 0)).toMatchObject({
+    sessionID: "ses_jojo",
+    text: "the sqlite decision",
+  });
 });
 
 test("a history cursor that would loop fails the pass without saving that page", async () => {
