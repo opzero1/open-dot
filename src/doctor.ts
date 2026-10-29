@@ -419,7 +419,7 @@ const startDaemon =
 const restartDaemon = "Restart the daemon, which writes a fresh api.json. doctor starts nothing.";
 
 /** api.json's address, only when it's plain http on this Mac's loopback. */
-const loopback = (value: unknown) => {
+export const loopback = (value: unknown) => {
   if (typeof value !== "string") return undefined;
   try {
     const url = new URL(value);

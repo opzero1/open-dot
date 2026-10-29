@@ -1,0 +1,1 @@
+ALTER TABLE `dots` ADD `fresh_session_id` text;

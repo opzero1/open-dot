@@ -12,6 +12,7 @@ import {
   databaseSampler,
   describeReport,
   doctor,
+  loopback,
   type Observations,
   observe,
 } from "./doctor";
@@ -55,6 +56,8 @@ const usage = `Usage:
   open-dot open [name]               Open a dot in OpenCode
   open-dot avatar <name> <file>      Set a dot's avatar from a square PNG or JPEG
   open-dot instructions <name>       Print the path of a dot's AGENTS.md, to edit it in an editor
+  open-dot fresh <name> [--force]    Move a dot to a new OpenCode session, keeping its memory, once you confirm.
+                                     The daemon must be running; --force skips the check for a turn in progress
   open-dot daemon                    Deliver reminders and run workers until stopped
   open-dot doctor [--json]           Check setup and runtime health, read only; starts nothing
   open-dot backup                    Back up the database without migrating it
@@ -424,6 +427,74 @@ const instructions = (name: string) =>
       : fail(`No dot named "${name}".`),
   );
 
+const field = (value: unknown, key: string): unknown =>
+  typeof value === "object" && value !== null ? Reflect.get(value, key) : undefined;
+
+const parsed = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Asks the running daemon to move the dot to a fresh session, with the owner's token from
+ * api.json, once the owner confirms at a terminal. The daemon does the work, so it can hold the
+ * dot's delivery while pending messages move.
+ */
+const fresh = (name: string, force: boolean) =>
+  Effect.suspend(() => {
+    const dot = findDot(db, name);
+    if (!dot) return fail(`No dot named "${name}".`);
+    if (!process.stdin.isTTY)
+      return fail(
+        "Run this in a terminal: a fresh start needs you to confirm it. Nothing changed.",
+      );
+    if (
+      !confirmed(
+        `Move ${name} to a new OpenCode session? Its notes, responsibilities, reminders, workers, grants and Slack threads carry over; its current session ${dot.sessionID} is renamed and kept.`,
+      )
+    )
+      return Effect.sync(() => console.log("Nothing changed."));
+    return Effect.promise(async () => {
+      let endpoint: unknown;
+      try {
+        endpoint = JSON.parse(readFileSync(apiPath(), "utf8"));
+      } catch {
+        return "The daemon isn't running, so nothing changed. Start it, then try again.";
+      }
+      const token = field(endpoint, "token");
+      const url = loopback(field(endpoint, "url"));
+      if (!url || typeof token !== "string")
+        return "api.json doesn't name a daemon on this Mac, so nothing changed. Restart the daemon.";
+      const answer = await fetch(new URL(`/dots/${encodeURIComponent(name)}/fresh`, url), {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(force ? { force: true } : {}),
+        redirect: "manual",
+      }).catch(() => undefined);
+      if (!answer)
+        return "Nothing answers at api.json's address. Start the daemon, then try again.";
+      const text = await answer.text();
+      if (answer.status === 201) {
+        const result = parsed(text);
+        const previous = String(field(result, "previousSessionID"));
+        const title = field(result, "previousTitle");
+        const moved = field(result, "moved");
+        console.log(
+          `${name} now uses session ${String(field(result, "sessionID"))}. ${typeof title === "string" ? `Its old session ${previous} is now "${title}".` : `Its old session ${previous} is kept, but OpenCode didn't confirm its new title.`}${typeof moved === "number" && moved > 0 ? ` ${moved} pending messages moved with it.` : ""}`,
+        );
+        return undefined;
+      }
+      if (answer.status === 404 && !text.includes(name))
+        return "This daemon doesn't know fresh starts yet. Restart it, then try again.";
+      const said = field(parsed(text), "error");
+      const message = typeof said === "string" ? said : text;
+      return `${message}${answer.status === 409 && !force ? " Pass --force to start fresh anyway." : ""}`;
+    }).pipe(Effect.andThen((problem) => (problem ? fail(problem) : Effect.void)));
+  });
+
 const list = Effect.sync(() => {
   const all = listDots(db);
   if (all.length === 0) return console.log("No dots yet. Run: open-dot create <name>");
@@ -551,7 +622,11 @@ const program =
                   ? grantCommand(args[0], args.slice(1))
                   : command === "instructions" && args.length === 1 && args[0]
                     ? instructions(args[0])
-                    : Effect.sync(() => console.log(usage));
+                    : command === "fresh" &&
+                        args[0] &&
+                        (args.length === 1 || (args.length === 2 && args[1] === "--force"))
+                      ? fresh(args[0], args[1] === "--force")
+                      : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(

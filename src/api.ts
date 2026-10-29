@@ -1,3 +1,4 @@
+import { startFresh } from "./fresh";
 import { existsSync } from "node:fs";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { SessionMessage } from "@opencode/client/effect";
@@ -1896,6 +1897,8 @@ const route = (
   if (rest === "messages" && extra.length === 0) {
     if (request.method === "POST") return send(db, dot, request);
   }
+  if (rest === "fresh" && extra.length === 0 && request.method === "POST")
+    return freshRoute(db, dot, request);
   const [id, part, index, ...more] = extra;
   if (rest === "memory")
     return id === "notes" &&
@@ -1941,6 +1944,39 @@ const route = (
     return attachment(db, dot, id, index, new URL(request.url).searchParams.get("sessionID"));
   return Effect.succeed(error(404, "Not found"));
 };
+
+/**
+ * Moves the dot to a new session, keeping its memory: the owner's own action, from the notch's
+ * confirmed menu item or `open-dot fresh`. Takes `{}` or `{ "force": true }`, at most 1 KiB.
+ */
+const freshRoute = (db: Db, dot: Dot, request: Request) =>
+  Effect.gen(function* () {
+    const raw = yield* Effect.tryPromise(() => request.text()).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (raw === undefined || raw.length > 1024) return error(400, "Send at most 1 KiB of JSON.");
+    let body: unknown = {};
+    try {
+      if (raw.trim()) body = JSON.parse(raw);
+    } catch {
+      return error(400, "Send a JSON object.");
+    }
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body) ||
+      Object.keys(body).some((key) => key !== "force") ||
+      ("force" in body && typeof body.force !== "boolean")
+    )
+      return error(400, 'Send {} or { "force": true }.');
+    const force = "force" in body && body.force === true;
+    return yield* startFresh(db, dot.name, force).pipe(
+      Effect.map((result) => Response.json(result, { status: 201 })),
+      Effect.catchTag("FreshError", (failure) =>
+        Effect.succeed(error(failure.status, failure.message)),
+      ),
+    );
+  });
 
 /** Runs a program to its end. Undefined when it exited 0, else why not. */
 export type Run = (argv: readonly string[], input?: string) => Promise<string | undefined>;

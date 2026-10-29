@@ -11,6 +11,29 @@ import {
 } from "./schema";
 import { maxEveryMinutes, nextRunAfter } from "./schedule";
 
+/**
+ * Whether text runs words together, like "Continueactualacceptance" or "SOURCEFAIL5findings",
+ * outside code, URLs and paths. GPT-6.1 Sol drifts into this in long sessions and copies it from
+ * its own earlier notes and worker prompts, so open-dot refuses to store or send it.
+ */
+export function runsWordsTogether(value: string) {
+  const prose = value
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ")
+    .replace(/\S*(?:[/\\_@#=]|[.:](?=\S))\S*/g, " ");
+  const words = prose.match(/[A-Za-z]+/g) ?? [];
+  const glued = words.filter((word) => {
+    if (word.length < 16) return false;
+    const parts = word.match(/[A-Z]+(?![a-z])|[A-Z]?[a-z]+/g) ?? [];
+    return (
+      parts.some((part) => part.length >= 18) ||
+      (parts.some((part) => part.length >= 2 && part === part.toUpperCase()) &&
+        parts.some((part) => part.length > 2 && part.slice(1) === part.slice(1).toLowerCase()))
+    );
+  }).length;
+  return glued >= 3 && glued * 40 >= words.length;
+}
+
 /** The longest note, goal or next action the owner can save, in UTF-16 code units. */
 export const memoryTextLimit = 2000;
 /** How far ahead the owner can move a reminder. */

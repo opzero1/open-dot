@@ -20,6 +20,9 @@ export const dots = sqliteTable("dots", {
   // What the dot is for, as given at creation. Other dots see it. Older dots have none.
   purpose: text(),
   createdAt: integer("created_at").notNull(),
+  // The session a "start fresh" saved before asking OpenCode to create it. Null when none is
+  // under way. A retry looks it up by this ID rather than creating another.
+  freshSessionID: text("fresh_session_id"),
 });
 
 export type Dot = typeof dots.$inferSelect;

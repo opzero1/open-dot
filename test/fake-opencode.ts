@@ -109,6 +109,7 @@ export function fakeOpenCode() {
     prompt: "ok" as "ok" | "fail" | "lost",
     instruct: "ok" as "ok" | "fail" | "lost",
     instructions: new Map<string, Map<string, string>>(),
+    titles: new Map<string, string>(),
   };
   const layer = Layer.succeed(OpenCode, {
     sessionExists: (sessionID) => Effect.sync(() => state.sessions.has(sessionID)),
@@ -302,6 +303,10 @@ export function fakeOpenCode() {
           : Effect.succeed(state.directories.get(sessionID)),
       ),
     sessionModel: (sessionID) => Effect.sync(() => state.models.get(sessionID)),
+    renameSession: (sessionID, title) =>
+      Effect.sync(() => {
+        state.titles.set(sessionID, title);
+      }),
     turnsSince: (sessionID, since) =>
       Effect.suspend(() =>
         state.superviseFailure

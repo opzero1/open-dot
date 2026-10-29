@@ -1834,3 +1834,27 @@ test("a marker survives reopening and doesn't follow the same message ID into a 
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("POST /dots/<name>/fresh needs the token, takes only force, and refuses a busy dot", async () => {
+  fake.state.sessions.add("ses_jojo");
+  const fresh = (body?: string, headers?: Record<string, string>) =>
+    call("/dots/jojo/fresh", {
+      method: "POST",
+      ...(body === undefined ? {} : { body }),
+      ...(headers ? { headers } : {}),
+    });
+  expect((await fresh("{}", { authorization: "Bearer wrong" })).status).toBe(401);
+  expect((await fresh('{"force":"yes"}')).status).toBe(400);
+  expect((await fresh('{"other":true}')).status).toBe(400);
+  fake.state.active.add("ses_jojo");
+  const busy = await fresh();
+  expect(busy.status).toBe(409);
+  expect(await busy.text()).toContain("middle of a turn");
+  expect(db.select().from(dots).where(eq(dots.name, "jojo")).get()?.sessionID).toBe("ses_jojo");
+  const forced = await fresh('{"force":true}');
+  expect(forced.status).toBe(201);
+  const body = (await forced.json()) as { sessionID: string; previousSessionID: string };
+  expect(body.previousSessionID).toBe("ses_jojo");
+  expect(db.select().from(dots).where(eq(dots.name, "jojo")).get()?.sessionID).toBe(body.sessionID);
+  expect((await call("/dots/nobody/fresh", { method: "POST" })).status).toBe(404);
+});

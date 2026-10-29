@@ -243,7 +243,7 @@ const gateOf = (sessionID: string) => {
   return gate;
 };
 
-const gated = (sessionID: string) => gateOf(sessionID).withPermits(1);
+export const gated = (sessionID: string) => gateOf(sessionID).withPermits(1);
 
 const stopOf = (db: Db | Tx, sessionID: string) => {
   const worker = db

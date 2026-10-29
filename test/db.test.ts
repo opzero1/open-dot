@@ -33,8 +33,25 @@ import {
 
 const repoMigrations = join(import.meta.dir, "..", "drizzle");
 
-// 0024, 0025, 0029, 0033 and 0034 append columns to these, so earlier migrations' tests compare only their first columns.
-const polished = ["slack_apps", "slack_events", "notes", "supervisions", "workers", "requests"];
+// 0024, 0025, 0029, 0033, 0034 and 0036 append columns to these, so earlier migrations' tests compare only their first columns.
+const polished = [
+  "slack_apps",
+  "slack_events",
+  "notes",
+  "supervisions",
+  "workers",
+  "requests",
+  "dots",
+];
+
+// What 0036 appends to dots, left out when comparing rows saved before it.
+const withoutFresh = (tables: unknown[][]) =>
+  tables.map(([name, items]) => [
+    name,
+    name === "dots"
+      ? (items as Record<string, unknown>[]).map(({ fresh_session_id: _added, ...rest }) => rest)
+      : items,
+  ]);
 
 // The columns a table had, quoted for a select, since later migrations append some.
 const storedColumns = (columns: Map<string, unknown>, name: string) =>
@@ -58,11 +75,12 @@ const iconColumns = [
 ];
 
 // A table's columns are the ones it had, but 0029 appends icon columns to slack_apps, 0033
-// instruction columns to supervisions and 0034 notice and path columns to requests and workers.
+// instruction columns to supervisions, 0034 notice and path columns to requests and workers, and
+// 0036 the fresh session column to dots.
 function sameColumns(sqlite: Database, name: string, before: unknown[]) {
   const after = sqlite.query(`pragma table_info("${name}")`).all();
   expect(
-    ["slack_apps", "supervisions", "workers", "requests"].includes(name)
+    ["slack_apps", "supervisions", "workers", "requests", "dots"].includes(name)
       ? after.slice(0, before.length)
       : after,
   ).toEqual(before);
@@ -309,7 +327,7 @@ test("0015 preserves pre-thread rows and null origins, then persists quotes and 
   const before = rows(old);
   old.close();
   const db = openDatabase(path);
-  expect(rows(db.$client)).toEqual(before);
+  expect(withoutFresh(rows(db.$client))).toEqual(before);
   expect(db.select().from(outbox).get()).toMatchObject({
     route: null,
     quote: null,
@@ -429,7 +447,7 @@ test("reactions migrate additively and both actors and removal tombstones surviv
   old.close();
 
   const db = openDatabase(path);
-  expect(rows(db.$client)).toEqual(before);
+  expect(withoutFresh(rows(db.$client))).toEqual(before);
   db.insert(reactions)
     .values([
       {
@@ -521,7 +539,7 @@ test("0016 adds only nullable outbox files and preserves every 0015 column, row 
   old.close();
   let db = openDatabase(path);
   try {
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expectLedger(db.$client, ledger, "0016");
     for (const { name } of tables) {
       const after = db.$client.query<Column, []>(`pragma table_info("${name}")`).all();
@@ -615,7 +633,7 @@ test("0017 adds only hidden_messages and preserves every 0016 table, column, row
   old.close();
   let db = openDatabase(path);
   try {
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     for (const name of tables) {
       const stored = columns.get(name);
       assert(stored, `Missing stored columns for ${name}`);
@@ -647,7 +665,7 @@ test("0017 adds only hidden_messages and preserves every 0016 table, column, row
     db.$client.close();
     db = openDatabase(path);
     expect(db.select().from(hiddenMessages).all()).toEqual([marker]);
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expectLedger(db.$client, ledger, "0017");
   } finally {
     db.$client.close();
@@ -707,7 +725,7 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
   old.close();
   let db = openDatabase(path);
   try {
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     // Later migrations may add tables; 0018 itself adds none.
     expect(tableNames(db.$client).filter((name) => tables.includes(name))).toEqual(tables);
     for (const name of tables) {
@@ -743,7 +761,7 @@ test("0018 adds only nullable outbox delivery and preserves every 0017 table, co
     ).toEqual([null, null]);
     db.$client.close();
     db = openDatabase(path);
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expectLedger(db.$client, ledger, "0018");
   } finally {
     db.$client.close();
@@ -796,7 +814,7 @@ test("0019 adds only recent_reactions and preserves every 0018 table, column, ro
   old.close();
   let db = openDatabase(path);
   try {
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     // Later migrations may add tables; 0019 itself is one CREATE TABLE.
     const added = tableNames(db.$client).filter((name) => !tables.includes(name));
     expect(added).toContain("recent_reactions");
@@ -832,7 +850,7 @@ test("0019 adds only recent_reactions and preserves every 0018 table, column, ro
     db.$client.close();
     db = openDatabase(path);
     expect(db.select().from(recentReactions).all()).toEqual([{ emoji: "🇯🇵", seq: 1 }]);
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expectLedger(db.$client, ledger, "0019");
   } finally {
     db.$client.close();
@@ -885,7 +903,7 @@ test("0020 adds memory versions that legacy writers still advance, and keeps eve
   const legacyUpdate = old.prepare("update notes set text = ? where id = 1");
   let db = openDatabase(path);
   try {
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     // 0022 and 0023 then add supervisions and requests.
     expect(
       tableNames(db.$client).filter(
@@ -1051,7 +1069,7 @@ test("0021 adds a nullable schedule that legacy status writers pause, and keeps 
   const oldTriggers = triggerSQL(old);
   let db = openDatabase(path);
   try {
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     // 0022 then adds supervisions and outbox.supervision, and 0023 requests.
     expect(
       tableNames(db.$client).filter(
@@ -1158,7 +1176,7 @@ test("0022 adds supervisions and a nullable outbox.supervision, and keeps every 
               name,
               (items as Record<string, unknown>[]).map(({ supervision: _added, ...rest }) => rest),
             ]
-          : [name, items],
+          : (withoutFresh([[name, items]])[0] ?? []),
       ),
     ).toEqual(before);
     expect(db.select().from(outbox).get()).toMatchObject({ messageID: "msg_1", supervision: null });
@@ -1229,7 +1247,7 @@ test("0023 adds only requests, one row per session, kind and request, and keeps 
         expect(after.slice(0, columns.get(name)?.length)).toEqual(columns.get(name) ?? []);
       else expect(after).toEqual(columns.get(name) ?? []);
     }
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0023");
     const insert = (kind: string) =>
@@ -1321,7 +1339,9 @@ test("0024 appends nullable Slack polish columns, keeps every 0023 row, and leav
                   ? noticeColumns
                   : name === "workers"
                     ? pathColumns
-                    : [],
+                    : name === "dots"
+                      ? ["fresh_session_id"]
+                      : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1410,7 +1430,9 @@ test("0025 appends nullable note sources, keeps every 0024 row and trigger, and 
                     dflt_value: null,
                     pk: 0,
                   }))
-                : [],
+                : name === "dots"
+                  ? [{ name: "fresh_session_id", notnull: 0, dflt_value: null, pk: 0 }]
+                  : [],
       );
     }
     expect(tables.map((name) => [name, rows(db.$client, name)])).toEqual(before);
@@ -1482,7 +1504,7 @@ test("0026 adds only the feed trigger tables, keeps every 0025 table, row and tr
   try {
     expect(tableNames(db.$client)).toEqual([...tables, ...later].toSorted());
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0026");
     db.$client.run(
@@ -1560,7 +1582,7 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
       ].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0027");
     // Nothing is invented from the old wake or the next run.
@@ -1619,7 +1641,7 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
       [...tables, "artifacts", ...archiveTables, ...ledgerTables, ...grantTables].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0028");
     expect(db.$client.query("select * from artifacts").all()).toEqual([]);
@@ -1690,7 +1712,9 @@ test("0029 appends only nullable icon columns to slack_apps and keeps every 0028
     expect(
       rows(db.$client).map(([name, list]) => [
         name,
-        (list as Record<string, unknown>[]).map(withoutIcons),
+        (list as Record<string, unknown>[])
+          .map(withoutIcons)
+          .map(({ fresh_session_id: _added, ...rest }) => rest),
       ]),
     ).toEqual(before);
     // The old app knows no icon, so the daemon sets it from the avatar once.
@@ -1750,7 +1774,7 @@ test("0030 adds the archive and an index of every note, kept by triggers for leg
       [...tables, ...archiveTables, ...ledgerTables, ...grantTables].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledger, "0030");
     // Every layer starts off, and nothing is archived or read.
@@ -1870,10 +1894,12 @@ test("0031 appends only auto_recall, off, to memory_settings and keeps every 003
               ? noticeColumns.length
               : name === "workers"
                 ? pathColumns.length
-                : 0,
+                : name === "dots"
+                  ? 1
+                  : 0,
       );
     }
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(db.$client.query("select auto_recall from memory_settings").all()).toEqual([
       { auto_recall: 0 },
     ]);
@@ -1923,7 +1949,7 @@ test("0032 adds the ledger and observer tables, every new switch off, and keeps 
   const db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual([...tables, ...ledgerTables, ...grantTables].toSorted());
-    expect(rows(db.$client)).toEqual(before);
+    expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledgerOld, "0032");
     expect(

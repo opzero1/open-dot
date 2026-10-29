@@ -53,6 +53,7 @@ export function createDot(db: Db, name: string, purpose: string) {
     sessionState: "creating",
     purpose,
     createdAt: Date.now(),
+    freshSessionID: null,
   };
   db.insert(dots).values(dot).run();
   return Effect.succeed(dot);

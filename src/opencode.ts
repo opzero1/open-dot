@@ -648,6 +648,11 @@ export class OpenCode extends Context.Service<
     readonly sessionModel: (
       sessionID: string,
     ) => Effect.Effect<Model.Ref | undefined, OpenCodeError>;
+    /** Sets the session's title. Idempotent, so a lost outcome is settled by doing it again. */
+    readonly renameSession: (
+      sessionID: string,
+      title: string,
+    ) => Effect.Effect<void, OpenCodeError>;
     /**
      * Every turn that ended at or after `since`, in milliseconds, oldest first, read page by page
      * down to that time, however many there are.
@@ -1101,6 +1106,10 @@ export class OpenCode extends Context.Service<
             Effect.map((session) => session.model),
             Effect.mapError(failed(`Could not look up session ${sessionID}`)),
           ),
+        renameSession: (sessionID, title) =>
+          client.session
+            .update({ sessionID: Session.ID.make(sessionID), title })
+            .pipe(Effect.mapError(failed(`Could not rename session ${sessionID}`))),
         turnsSince: (sessionID, since) =>
           Effect.gen(function* () {
             // Every turn end at or after `since`, newest first, and the time of the one before them.
