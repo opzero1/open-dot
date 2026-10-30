@@ -4,6 +4,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
 import { api, spawnRun } from "./api";
+import { deleteArchived } from "./archive";
 import { avatarPath, iconSizeWarning, setAvatar } from "./avatar";
 import { daemonLoops } from "./daemon";
 import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
@@ -83,7 +84,9 @@ const usage = `Usage:
   open-dot grant add <name> deploy --target <pattern> [--repo owner/name] (--until … | --for …)
                                      Let a dot approve its workers' matching merges, ready marks or deploys, once you confirm
   open-dot grant list [name]         List active grants
-  open-dot grant revoke <id>         Revoke a grant`;
+  open-dot grant revoke <id>         Revoke a grant
+  open-dot archive delete <name> <message ID>
+                                     Delete one archived message from a dot's memory, once you confirm`;
 
 const [command, ...args] = process.argv.slice(2);
 // Before anything opens the database, which would migrate it: doctor only reads.
@@ -342,6 +345,26 @@ const watchCommand = (sub: string | undefined, rest: string[]) => {
     return yield* Effect.sync(() => console.log(`Active: ${describeBinding(saved)}`));
   }).pipe(Effect.provide(OpenCode.layer));
 };
+
+/** The owner deletes one archived message, so recall and zoom never find it and it's never copied again. */
+const archiveDelete = (name: string, messageID: string) =>
+  Effect.suspend(() => {
+    if (!findDot(db, name)) return fail(`No dot named "${name}".`);
+    if (!/^msg_[\w-]{1,100}$/.test(messageID)) return fail(`"${messageID}" isn't a message ID.`);
+    if (!process.stdin.isTTY)
+      return fail(
+        "Run this in a terminal: deleting a message needs you to confirm it. Nothing changed.",
+      );
+    if (
+      !confirmed(
+        `Delete ${messageID} from ${name}'s archive? Recall and zoom won't find it again, and it's never copied back. OpenCode's own history keeps it.`,
+      )
+    )
+      return Effect.sync(() => console.log("Nothing changed."));
+    return deleteArchived(db, name, messageID)
+      ? Effect.sync(() => console.log(`Deleted ${messageID} from ${name}'s archive.`))
+      : fail(`${name} has no archived message ${messageID}.`);
+  });
 
 const grantCommand = (sub: string | undefined, rest: string[]) => {
   if (sub === "list" && rest.length <= 1)
@@ -626,7 +649,13 @@ const program =
                         args[0] &&
                         (args.length === 1 || (args.length === 2 && args[1] === "--force"))
                       ? fresh(args[0], args[1] === "--force")
-                      : Effect.sync(() => console.log(usage));
+                      : command === "archive" &&
+                          args.length === 3 &&
+                          args[0] === "delete" &&
+                          args[1] &&
+                          args[2]
+                        ? archiveDelete(args[1], args[2])
+                        : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(

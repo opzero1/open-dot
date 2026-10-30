@@ -413,6 +413,23 @@ export const archive = sqliteTable(
 
 export type Archived = typeof archive.$inferSelect;
 
+/**
+ * Archived messages the owner deleted, by ID only, never their text, so neither the archive walk
+ * nor a backfill copies them again.
+ */
+export const forgottenMessages = sqliteTable(
+  "forgotten_messages",
+  {
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    sessionID: text("session_id").notNull(),
+    messageID: text("message_id").notNull(),
+    forgottenAt: integer("forgotten_at").notNull(),
+  },
+  (table) => [unique().on(table.dot, table.sessionID, table.messageID)],
+);
+
 export const observationKinds = [
   "decision",
   "preference",

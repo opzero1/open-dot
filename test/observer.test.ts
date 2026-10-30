@@ -1485,6 +1485,100 @@ test("a reported cost and the day's stop it reaches are saved together or not at
   );
 });
 
+test("the owner deletes archived messages, or forgets a row with its sources; a checkpoint citing one goes, and no walk copies them back", async () => {
+  const { api } = await import("../src/api");
+  const handler = api(db, "secret", fake.layer);
+  const call = (method: string, path: string) =>
+    handler(
+      new Request(`http://127.0.0.1/dots/jojo/memory${path}`, {
+        method,
+        headers: { authorization: "Bearer secret" },
+      }),
+    );
+  saveArchiveSettings(
+    db,
+    "jojo",
+    { archive: true, backfill: true, ledger: true, frozenHead: true },
+    1,
+  );
+  fake.state.items.set("ses_jojo", [
+    { id: "msg_a", type: "user", text: "Use Postgres for analytics.", time: 4_000, complete: true },
+    { id: "msg_b", type: "user", text: "The Lisbon budget is 40k.", time: 4_001, complete: true },
+    compaction("msg_compact_1"),
+  ]);
+  const walk = () => Effect.runPromise(Effect.provide(archiveAll(db), fake.layer));
+  await walk();
+  const archived = () =>
+    db
+      .select()
+      .from(archive)
+      .all()
+      .map((entry) => entry.messageID);
+  expect(archived()).toEqual(["msg_a", "msg_b"]);
+  const observed = (text: string, source: string) =>
+    db
+      .insert(ledger)
+      .values({
+        dot: "jojo",
+        sessionID: "ses_jojo",
+        kind: "decision",
+        topic: "storage",
+        text,
+        priority: 1,
+        validFrom: 1,
+        sources: [source],
+        updatedBy: "observer",
+        createdAt: 1,
+        updatedAt: 1,
+      })
+      .returning()
+      .get();
+  observed("Postgres for analytics.", "msg_a");
+  const lisbon = observed("Lisbon budget 40k.", "msg_b");
+  work();
+  const dot = db.select().from(dots).get();
+  if (!dot) throw new Error("no dot");
+  expect(headFor(db, dot, { id: "msg_compact_1", native: false })?.text).toContain('"msg_a"');
+  const epoch = () => db.select().from(ledgerState).get()?.epoch ?? 0;
+
+  for (const bad of ["/archive/not_a_message", "/archive/msg_a?force=1"])
+    expect((await call("DELETE", bad)).status).toBe(404);
+  expect((await call("DELETE", "/archive/msg_nowhere")).status).toBe(404);
+  expect((await call("DELETE", "/archive/msg_a")).status).toBe(204);
+  expect(archived()).toEqual(["msg_b"]);
+  expect(epoch()).toBe(1);
+  // The checkpoint cited it, so it's gone until the next compaction; the row stays, its source missing.
+  expect(headFor(db, dot, { id: "msg_compact_1", native: false })).toBeUndefined();
+  expect(rows()).toHaveLength(2);
+  // A repeat is still deleted, and a backfill walking the session again copies nothing back.
+  expect((await call("DELETE", "/archive/msg_a")).status).toBe(204);
+  saveArchiveSettings(db, "jojo", { backfill: false }, 2);
+  saveArchiveSettings(db, "jojo", { backfill: true }, 3);
+  await walk();
+  expect(archived()).toEqual(["msg_b"]);
+
+  // Forgetting a row may delete the archived messages it came from too.
+  expect((await call("DELETE", `/observations/${lisbon.id}?version=1&sources=yes`)).status).toBe(
+    400,
+  );
+  expect((await call("DELETE", `/observations/${lisbon.id}?version=1&sources=true`)).status).toBe(
+    204,
+  );
+  expect(archived()).toEqual([]);
+  await walk();
+  expect(archived()).toEqual([]);
+  // Only IDs are kept, never the text.
+  expect(
+    db.$client
+      .query("SELECT * FROM forgotten_messages ORDER BY message_id")
+      .all()
+      .map((entry) => Object.keys(entry as object)),
+  ).toEqual([
+    ["dot", "session_id", "message_id", "forgotten_at"],
+    ["dot", "session_id", "message_id", "forgotten_at"],
+  ]);
+});
+
 test("the observer's notes never keep a planted secret", () => {
   const ops = parseOps(
     JSON.stringify({

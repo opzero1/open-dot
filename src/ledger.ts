@@ -5,6 +5,7 @@ import {
   archive,
   type Dot,
   dots,
+  forgottenMessages,
   ledger,
   ledgerState,
   memorySettings,
@@ -401,17 +402,69 @@ export const editObservation = (db: Db, dot: string, id: number, version: number
   );
 
 /**
- * Forgets a row: deletes it, never the archived messages it came from. Like an edit it advances
- * the epoch, so no job that saw it can bring it back, and takes the checkpoint away, topic index
- * and all, until the next compaction.
+ * Deletes the dot's archived messages with these IDs, from one session or any, and their full-text
+ * entries with them, and keeps each ID, never its text, so no archive walk or backfill copies it
+ * again. It advances the epoch, so automatic recall's kept block and any observer job that may
+ * have read them are dropped, and takes away a checkpoint that cites one. The number of messages
+ * now forgotten, counting ones already forgotten before.
  */
-export const forgetObservation = (db: Db, dot: string, id: number, version: number) =>
+export function forgetMessages(
+  db: Db,
+  dot: string,
+  messageIDs: readonly string[],
+  sessionID?: string,
+) {
+  if (!messageIDs.length) return 0;
+  const scope = and(
+    eq(archive.dot, dot),
+    inArray(archive.messageID, [...messageIDs]),
+    sessionID === undefined ? undefined : eq(archive.sessionID, sessionID),
+  );
+  const rows = db.select().from(archive).where(scope).all();
+  const now = Date.now();
+  for (const row of rows)
+    db.insert(forgottenMessages)
+      .values({ dot, sessionID: row.sessionID, messageID: row.messageID, forgottenAt: now })
+      .onConflictDoNothing()
+      .run();
+  if (rows.length) db.delete(archive).where(scope).run();
+  const before = db
+    .select({ messageID: forgottenMessages.messageID })
+    .from(forgottenMessages)
+    .where(
+      and(
+        eq(forgottenMessages.dot, dot),
+        inArray(forgottenMessages.messageID, [...messageIDs]),
+        sessionID === undefined ? undefined : eq(forgottenMessages.sessionID, sessionID),
+      ),
+    )
+    .all();
+  if (!rows.length) return new Set(before.map((row) => row.messageID)).size;
+  bump(db, dot);
+  // Message IDs are plain `msg_` words, so the checkpoint's JSON names one exactly as it is.
+  const head = stateOf(db, dot).headText;
+  if (head && rows.some((row) => head.includes(`"${row.messageID}"`))) suppressHead(db, dot);
+  return new Set(before.map((row) => row.messageID)).size;
+}
+
+/**
+ * Forgets a row: deletes it and, with `sources`, the archived messages it came from too. Like an
+ * edit it advances the epoch, so no job that saw it can bring it back, and takes the checkpoint
+ * away, topic index and all, until the next compaction.
+ */
+export const forgetObservation = (
+  db: Db,
+  dot: string,
+  id: number,
+  version: number,
+  sources = false,
+) =>
   db.transaction(
     (tx): Outcome<ReturnType<typeof observationView>> => {
       const removed = tx
         .delete(ledger)
         .where(and(eq(ledger.id, id), eq(ledger.dot, dot), eq(ledger.version, version)))
-        .returning({ id: ledger.id })
+        .returning()
         .get();
       if (!removed) {
         const now = tx
@@ -421,6 +474,7 @@ export const forgetObservation = (db: Db, dot: string, id: number, version: numb
           .get();
         return now ? { conflict: observationView(db, now) } : { missing: true };
       }
+      if (sources) forgetMessages(db, dot, removed.sources, removed.sessionID);
       bump(db, dot);
       suppressHead(db, dot);
       return { deleted: true };

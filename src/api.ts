@@ -4,7 +4,12 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { SessionMessage } from "@opencode/client/effect";
 import { and, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { type Context, Effect, Layer, Result } from "effect";
-import { archiveStatus, parseArchiveSettings, saveArchiveSettings } from "./archive";
+import {
+  archiveStatus,
+  deleteArchived,
+  parseArchiveSettings,
+  saveArchiveSettings,
+} from "./archive";
 import { avatarRevision, readAvatar } from "./avatar";
 import {
   editObservation,
@@ -1642,7 +1647,18 @@ const search = (db: Db, dot: string, request: Request) => {
  * needs OpenCode or starts a turn; the daemon's archive pass reads history on its own.
  */
 const archiveRoute = async (db: Db, dot: Dot, request: Request, rawID: string | undefined) => {
-  if (rawID !== undefined) return error(404, "Not found");
+  if (rawID !== undefined) {
+    if (request.method !== "DELETE" || new URL(request.url).search) return error(404, "Not found");
+    let messageID: string;
+    try {
+      messageID = decodeURIComponent(rawID);
+    } catch {
+      return error(404, "Not found");
+    }
+    return /^msg_[\w-]{1,100}$/.test(messageID) && deleteArchived(db, dot.name, messageID)
+      ? new Response(null, { status: 204 })
+      : error(404, "There's no such archived message for this dot.");
+  }
   if (request.method === "PUT") {
     const value = await messageBody(request, 1024).catch(() => undefined);
     if (value instanceof Response) return value;
@@ -1835,14 +1851,30 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
     return error(404, "There's no such item for this dot.");
   const id = Number(rawID);
   if (method === "DELETE" && kind !== "responsibilities") {
-    const params = [...new URL(request.url).searchParams];
-    const [key, value = ""] = params[0] ?? [];
-    if (params.length !== 1 || key !== "version" || !positive.test(value))
-      return error(400, "Send ?version=<the version you saw>.");
+    const query = new URL(request.url).searchParams;
+    const params = [...query];
+    const value = query.get("version") ?? "";
+    // Forgetting an observation may also delete the archived messages it came from.
+    const sources = kind === "observations" ? query.get("sources") : null;
+    if (
+      params.length !== (sources === null ? 1 : 2) ||
+      query.getAll("version").length !== 1 ||
+      (sources !== null && (sources !== "true" || query.getAll("sources").length !== 1)) ||
+      !positive.test(value)
+    )
+      return error(
+        400,
+        kind === "observations"
+          ? "Send ?version=<the version you saw>, and &sources=true to delete its archived messages too."
+          : "Send ?version=<the version you saw>.",
+      );
     const version = Number(value);
     if (!Number.isSafeInteger(version)) return error(400, "Send ?version=<the version you saw>.");
     if (kind === "observations")
-      return answer(forgetObservation(db, dot.name, id, version), "observation");
+      return answer(
+        forgetObservation(db, dot.name, id, version, sources === "true"),
+        "observation",
+      );
     return kind === "notes"
       ? answer(deleteNote(db, dot.name, id, version), "note")
       : answer(cancelReminder(db, dot.name, id, version), "reminder");

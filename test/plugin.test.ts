@@ -2489,3 +2489,52 @@ test("issue61: no memory tool stores a planted secret", async () => {
     db.$client.close();
   }
 });
+
+test("issue61: a deleted archived message is never recalled, auto-recalled or zoomed again", async () => {
+  const { deleteArchived } = await import("../src/archive");
+  const db = openDatabase(databasePath());
+  filler(db);
+  archived(db, "msg_budget", "The quarterly budget for the Lisbon offsite is 40k euros.");
+  archived(db, "msg_noted", "Noted: Lisbon offsite budget capped at 40k.", "dot");
+  archived(db, "msg_earlier", "Lisbon offsite budget from before.", "owner", "ses_earlier");
+  saveArchiveSettings(db, "jojo", { archive: true, autoRecall: true }, 1);
+  const history: HistoryItem[] = [
+    ownerAsk("msg_ask", "Remind me what budget we set for the Lisbon offsite?"),
+    { id: "msg_invocation", type: "assistant", text: "", time: { created: 11 } },
+  ];
+  const loaded = await load(dot.directory, history);
+  const recalled = async () =>
+    (
+      data((await loaded.call("dot_recall", { query: "Lisbon budget" })).content, "recall") as {
+        message?: string;
+      }[]
+    ).map((hit) => hit.message);
+  try {
+    expect(new Set(await recalled())).toEqual(new Set(["msg_budget", "msg_earlier", "msg_noted"]));
+    // The block for this owner message is computed now and kept for the rest of its turn.
+    expect(recalledData(await loaded.injected(dot.sessionID))?.map((hit) => hit.message)).toContain(
+      "msg_budget",
+    );
+    expect(deleteArchived(db, "jojo", "msg_budget")).toBe(true);
+    expect(deleteArchived(db, "jojo", "msg_earlier")).toBe(true);
+    // A repeat is still deleted; a message never archived isn't.
+    expect(deleteArchived(db, "jojo", "msg_budget")).toBe(true);
+    expect(deleteArchived(db, "jojo", "msg_nowhere")).toBe(false);
+
+    expect(await recalled()).toEqual(["msg_noted"]);
+    // Even within the same turn, the kept block is dropped and built again without it.
+    const again = recalledData(await loaded.injected(dot.sessionID));
+    expect(again?.map((hit) => hit.message)).toEqual(["msg_noted"]);
+    for (const id of ["msg_budget", "msg_earlier"])
+      expect(await fails(loaded.call("dot_zoom", { message_id: id }))).toBe(true);
+    const index = db.$client
+      .query<{ n: number }, []>(
+        "SELECT count(*) AS n FROM memory_fts WHERE text LIKE '%quarterly%'",
+      )
+      .get();
+    expect(index?.n).toBe(0);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});

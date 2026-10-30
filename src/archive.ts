@@ -9,11 +9,12 @@ import {
   archiveCursors,
   type Dot,
   dots,
+  forgottenMessages,
   memorySettings,
   notes,
   type PendingMessage,
 } from "./schema";
-import { dropCompaction, queueCompaction } from "./ledger";
+import { dropCompaction, forgetMessages, queueCompaction } from "./ledger";
 import { dataJSON } from "./supervise";
 
 /**
@@ -210,8 +211,27 @@ const archived = (
     dot.sessionID,
     items.filter((item) => item.type === "user").map((item) => item.id),
   );
+  // Messages the owner deleted are never copied again, whatever the walk reads.
+  const ids = items.map((item) => item.id);
+  const forgotten = new Set(
+    (ids.length
+      ? db
+          .select({ messageID: forgottenMessages.messageID })
+          .from(forgottenMessages)
+          .where(
+            and(
+              eq(forgottenMessages.dot, dot.name),
+              eq(forgottenMessages.sessionID, dot.sessionID),
+              inArray(forgottenMessages.messageID, ids),
+            ),
+          )
+          .all()
+      : []
+    ).map((row) => row.messageID),
+  );
   return items.flatMap((item) => {
     if (item.type !== "user" && item.type !== "assistant") return [];
+    if (forgotten.has(item.id)) return [];
     if (!settings.backfill && (settings.archiveSince === null || item.time < settings.archiveSince))
       return [];
     const source = sources.get(item.id);
@@ -411,6 +431,14 @@ export const archiveAll = (db: Db) =>
       ),
     { discard: true },
   );
+
+/**
+ * The owner's deletion of one archived message of any of the dot's sessions: the row and its
+ * full-text entry go, the ID is kept so it's never copied again, and a checkpoint citing it is
+ * taken away. False when the dot never archived that message.
+ */
+export const deleteArchived = (db: Db, dot: string, messageID: string) =>
+  db.transaction(() => forgetMessages(db, dot, [messageID]) > 0, { behavior: "immediate" });
 
 /** The most results a recall returns, its default, and the furthest it pages. */
 export const recallLimit = 20;
