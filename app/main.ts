@@ -1273,7 +1273,10 @@ const clipboardFor = (): Clipboard => (smoke ? smokeClipboard : nativeClipboard.
 interface Armed {
   dot: string;
   step: PickupStep;
+  /** The app a bot or app-level token must name. */
   appID: string | null;
+  /** The dot's app as its Slack view showed it when armed, or null for none. */
+  binding: string | null;
   seen: number;
   deadline: number;
   mismatched: boolean;
@@ -1282,6 +1285,7 @@ interface Armed {
 interface Held {
   dot: string;
   step: "access" | "linkBot";
+  binding: string | null;
   token: string;
   deadline: number;
   // A picked-up app-level token waiting for the owner to confirm it replaces `replace`.
@@ -1311,6 +1315,18 @@ const pickupState = (): PickupState => ({
 
 const announce = () => emit({ kind: "pickup", state: pickupState() });
 
+const leftView = "Pickup stopped when you left the dot's Slack view. Nothing was kept.";
+
+/** Whether the Slack view still shows this dot with the app it showed when the pickup began. */
+const pinned = (to: { dot: string; binding: string | null }) =>
+  shownSlack?.dot === to.dot && shownSlack.appID === to.binding;
+
+/** Why a pickup that's no longer pinned stopped. */
+const unpinned = (dot: string) =>
+  shownSlack?.dot === dot
+    ? "The dot's app changed, so the pickup stopped. Nothing was kept."
+    : leftView;
+
 const dropHeld = () => {
   if (held) {
     held.token = "";
@@ -1330,8 +1346,6 @@ const endPickup = (said?: string) => {
   if (dot && said) pickupNotice = { dot, text: said };
   announce();
 };
-
-const leftView = "Pickup stopped when you left the dot's Slack view. Nothing was kept.";
 
 /** Sends what a pickup took, once, and says what became of it. */
 const deliverPickup = async (dot: string, run: () => Promise<Reply<unknown>>, what: string) => {
@@ -1354,7 +1368,7 @@ const deliverPickup = async (dot: string, run: () => Promise<Reply<unknown>>, wh
 const checkPickup = async () => {
   const now = Date.now();
   if (held) {
-    if (shownSlack?.dot !== held.dot) return endPickup(leftView);
+    if (!pinned(held)) return endPickup(unpinned(held.dot));
     if (now >= held.deadline)
       return endPickup(
         held.step === "linkBot"
@@ -1364,9 +1378,7 @@ const checkPickup = async () => {
   }
   const pickup = armed;
   if (!pickup || pickupBusy) return;
-  if (shownSlack?.dot !== pickup.dot) return endPickup(leftView);
-  if (pickup.appID && shownSlack.appID !== pickup.appID)
-    return endPickup("The dot's app changed, so the pickup stopped. Nothing was kept.");
+  if (!pinned(pickup)) return endPickup(unpinned(pickup.dot));
   if (now >= pickup.deadline)
     return endPickup(
       `No ${pickupNames[pickup.step]} was copied within 2 minutes, so the pickup stopped. Nothing was kept.`,
@@ -1376,11 +1388,7 @@ const checkPickup = async () => {
   // Whether this look still stands after an await: no stop, leave, new arm, app change or
   // timeout came meanwhile. A secret read once it doesn't is dropped, never held or sent.
   const stands = () =>
-    look === pickupGeneration &&
-    armed === pickup &&
-    shownSlack?.dot === pickup.dot &&
-    (!pickup.appID || shownSlack.appID === pickup.appID) &&
-    Date.now() < pickup.deadline;
+    look === pickupGeneration && armed === pickup && pinned(pickup) && Date.now() < pickup.deadline;
   try {
     const board = clipboardFor();
     const revision = await board.revision();
@@ -1411,7 +1419,13 @@ const checkPickup = async () => {
     switch (pickup.step) {
       case "access":
       case "linkBot":
-        held = { dot, step: pickup.step, token: copied, deadline: now + pickupMilliseconds };
+        held = {
+          dot,
+          step: pickup.step,
+          binding: pickup.binding,
+          token: copied,
+          deadline: now + pickupMilliseconds,
+        };
         pickupNotice = {
           dot,
           text:
@@ -1423,7 +1437,8 @@ const checkPickup = async () => {
         return;
       case "refresh": {
         const first = held;
-        if (!first || first.dot !== dot || first.step !== "access") return endPickup();
+        if (!first || first.dot !== dot || first.step !== "access" || !pinned(first))
+          return endPickup();
         const token = first.token;
         endPickup();
         pickupBusy = false;
@@ -1435,11 +1450,15 @@ const checkPickup = async () => {
       }
       case "linkApp": {
         const first = held;
-        if (!first || first.dot !== dot || first.step !== "linkBot") return endPickup();
+        if (!first || first.dot !== dot || first.step !== "linkBot" || !pinned(first))
+          return endPickup();
         const view = await reply("GET", `/dots/${segment(dot)}/slack`);
-        if (look !== pickupGeneration || held !== first || shownSlack?.dot !== dot) return;
+        if (look !== pickupGeneration || held !== first) return;
+        if (!pinned(first)) return endPickup(unpinned(dot));
         const bound =
           view.ok && isRecord(view.value) && isRecord(view.value.app) ? view.value.app : undefined;
+        // The daemon's app now, whatever its state; one other than shown when armed ends it all.
+        const daemonApp = bound && isSlackAppID(bound.appID) ? bound.appID : null;
         const boundID =
           bound &&
           (bound.state === "created" || bound.state === "active") &&
@@ -1455,6 +1474,8 @@ const checkPickup = async () => {
           announce();
           return;
         }
+        if (daemonApp !== first.binding)
+          return endPickup("The dot's app changed, so the pickup stopped. Nothing was kept.");
         if (boundID && linkAppID(copied) !== boundID) {
           // Held until the owner confirms the replacement, within the bot token's own time.
           first.app = copied;
@@ -1509,13 +1530,23 @@ const armPickup = async (dot: unknown, step: unknown, appID: unknown): Promise<P
     return pickupState();
   const chosen = step;
   if (shownSlack?.dot !== dot) return pickupState();
+  // Pinned to the app the view shows now: a bot or app-level token must name that same app.
+  const pin = { dot, binding: shownSlack.appID };
   // Any look still out for an earlier arm delivers nothing.
   const look = ++pickupGeneration;
-  if ((chosen === "bot" || chosen === "app") && !appID) return pickupState();
+  if ((chosen === "bot" || chosen === "app") && (!appID || appID !== pin.binding))
+    return pickupState();
   const after = pickupAfter(chosen);
   if (
     after &&
-    !(held && held.dot === dot && held.step === after && !held.app && Date.now() < held.deadline)
+    !(
+      held &&
+      held.dot === dot &&
+      held.binding === pin.binding &&
+      held.step === after &&
+      !held.app &&
+      Date.now() < held.deadline
+    )
   ) {
     endPickup();
     pickupNotice = {
@@ -1527,7 +1558,11 @@ const armPickup = async (dot: unknown, step: unknown, appID: unknown): Promise<P
   }
   if (!after) dropHeld();
   const revision = await clipboardFor().revision();
-  if (look !== pickupGeneration || shownSlack?.dot !== dot) return pickupState();
+  if (look !== pickupGeneration) return pickupState();
+  if (!pinned(pin)) {
+    endPickup(unpinned(dot));
+    return pickupState();
+  }
   if (revision === undefined) {
     pickupAvailable = false;
     endPickup("The app can't watch the clipboard here, so pickup is off. Use the secure fields.");
@@ -1538,6 +1573,7 @@ const armPickup = async (dot: unknown, step: unknown, appID: unknown): Promise<P
     dot,
     step: chosen,
     appID: chosen === "bot" || chosen === "app" ? appID : null,
+    binding: pin.binding,
     seen: revision,
     deadline: Date.now() + pickupMilliseconds,
     mismatched: false,
@@ -1552,6 +1588,10 @@ const confirmReplace = (dot: unknown, appID: unknown, replace: unknown): PickupS
   const first = held;
   if (!first?.app || first.dot !== dot || first.replace !== appID || typeof replace !== "boolean")
     return pickupState();
+  if (!pinned(first)) {
+    endPickup(unpinned(first.dot));
+    return pickupState();
+  }
   const bot = first.token;
   const linked = first.app;
   const replaced = first.replace ?? "";
@@ -1581,17 +1621,8 @@ const slackShown = (dot: unknown, appID: unknown) => {
   shownSlack = isName(dot) && (appID === null || isSlackAppID(appID)) ? { dot, appID } : undefined;
   if (pickupNotice && pickupNotice.dot !== shownSlack?.dot) pickupNotice = undefined;
   // Leaving the view, or the dot's app changing, ends the pickup now, even while a look is out.
-  const left =
-    (armed &&
-      (shownSlack?.dot !== armed.dot ||
-        (armed.appID !== null && shownSlack.appID !== armed.appID))) ||
-    (held && shownSlack?.dot !== held.dot);
-  if (left)
-    endPickup(
-      armed && shownSlack?.dot === armed.dot
-        ? "The dot's app changed, so the pickup stopped. Nothing was kept."
-        : leftView,
-    );
+  const stopped = (armed && !pinned(armed) && armed) || (held && !pinned(held) && held);
+  if (stopped) endPickup(unpinned(stopped.dot));
   else if (armed || held) void checkPickup();
 };
 

@@ -2849,6 +2849,123 @@ test("Slack: tokens for another app wait in their fields while asked, and go onc
   expect(written.stdout.toString()).toBe("");
 }, 170_000);
 
+test("Slack: a pickup ends and sends nothing once the dot's app changes, armed, holding or asked to replace", async () => {
+  const bot = ["xoxb", "8888888888", "9999999999999", "f".repeat(24)].join("-");
+  const other = ["xapp", "1", "AOTHER01", "7777777777", "e".repeat(64)].join("-");
+  await scenario(
+    "slack-app-change",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      const secrets = () =>
+        fake.data.calls.filter(
+          (call) =>
+            call.method === "POST" &&
+            (call.path.startsWith("/dots/jojo/slack/link") ||
+              call.path.startsWith("/dots/jojo/slack/tokens") ||
+              call.path.startsWith("/slack/config")),
+        );
+      const arm = async (step: string) => {
+        await until(
+          `!document.querySelector('[data-pickup="${step}"]')?.disabled`,
+          `the ${step} pickup`,
+        );
+        await js(`document.querySelector('[data-pickup="${step}"]').click(), true`);
+        await until(`!!document.querySelector("[data-pickup-status]")`, `the armed ${step}`);
+      };
+      const notice = (text: string, label: string) =>
+        until(
+          `!!document.querySelector("[data-slack-notice]")?.innerText.includes(${JSON.stringify(text)})`,
+          label,
+        );
+      // The daemon binds the dot to another app; the view finds it on its next refresh.
+      const rebind = async (appID: string) => {
+        const slack = fake.data.slack as { app: { appID: string } };
+        slack.app.appID = appID;
+        await notice("The dot's app changed", `the pickup stopped for ${appID}`);
+      };
+      const nothingSent = async () => {
+        await delay(1_000);
+        expect(secrets()).toEqual([]);
+        expect(
+          await js(
+            `[${JSON.stringify(bot)}, ${JSON.stringify(other)}].some((token) => document.documentElement.outerHTML.includes(token))`,
+          ),
+        ).toBe(false);
+      };
+      await openPane(app, "Slack");
+      await until(`!!document.querySelector('[data-pickup="linkBot"]')`, "the link pickup");
+
+      // Armed for the bot token, which names no app: a new app stops it, and a later copy is left.
+      await arm("linkBot");
+      await rebind("AB2APP01");
+      expect(await js(`!!document.querySelector("[data-pickup-status]")`)).toBe(false);
+      await app.clipboard(bot);
+      await nothingSent();
+      expect(await js(`document.body.innerText.includes("Bot token held in memory only")`)).toBe(
+        false,
+      );
+
+      // Holding the bot token: a new app drops it, so the app-level token can't follow it.
+      await arm("linkBot");
+      await app.clipboard(bot);
+      await until(
+        `document.body.innerText.includes("Bot token held in memory only")`,
+        "the held bot token",
+      );
+      await rebind("AB3APP01");
+      expect(await js(`document.body.innerText.includes("Bot token held in memory only")`)).toBe(
+        false,
+      );
+      expect(
+        await js(`window.openDot.pickup("jojo", "linkApp", null).then((state) => state.step)`),
+      ).toBeNull();
+      await app.clipboard(other);
+      await nothingSent();
+
+      // Asked whether the app-level token replaces the app: a new app ends it, and Replace it
+      // sends nothing.
+      await arm("linkBot");
+      await app.clipboard(bot);
+      await until(
+        `document.body.innerText.includes("Bot token held in memory only")`,
+        "the held bot token again",
+      );
+      await arm("linkApp");
+      await app.clipboard(other);
+      await until(`!!document.querySelector("[role=alertdialog]")`, "the replace question");
+      await rebind("AB4APP01");
+      if (await js(`!!document.querySelector("[role=alertdialog]")`))
+        await press("[role=alertdialog]", "Replace it");
+      await nothingSent();
+
+      // The daemon's app changing before the view shows it ends the pickup at the pair's check.
+      await arm("linkBot");
+      await app.clipboard(bot);
+      await until(
+        `document.body.innerText.includes("Bot token held in memory only")`,
+        "the held bot token once more",
+      );
+      await arm("linkApp");
+      (fake.data.slack as { app: { appID: string } }).app.appID = "AB5APP01";
+      await app.clipboard(other);
+      await notice("The dot's app changed", "the pickup stopped at the pair's check");
+      if (await js(`!!document.querySelector("[role=alertdialog]")`))
+        await press("[role=alertdialog]", "Replace it");
+      await nothingSent();
+    },
+  );
+  const written = Bun.spawnSync([
+    "grep",
+    "-rlE",
+    "xoxb-|xapp-",
+    join(scratch, "slack-app-change", "app-data"),
+  ]);
+  expect(written.stdout.toString()).toBe("");
+}, 170_000);
+
 test("avatars: a failed read is asked for again, a deleted one clears, and Command-2 and Escape keep the draft", async () => {
   await scenario(
     "avatar",
