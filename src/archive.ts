@@ -1,7 +1,7 @@
 import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { Effect } from "effect";
 import type { Db } from "./db";
-import { fold, indexTerms, noteSource, redact, snippet } from "./memory";
+import { fold, indexTerms, noteSource, redact, snippet, stopwords } from "./memory";
 import { type HistoryItem, OpenCode, OpenCodeError } from "./opencode";
 import { messageKind, messageSources } from "./reactions";
 import {
@@ -577,12 +577,6 @@ const autoRecallCandidates = 50;
  * owner's words, or the only one. Not calibrated on real use yet: the measurement set will tune it.
  */
 export const autoRecallThreshold = -2;
-
-const stopwords = new Set(
-  "the and for are but not you your yours with that this these those what when where which who why how have has had was were will would could should can did does doing done from into onto about above after again against all also any because been before being below between both each few more most other some such than then there their them they too very just only own same here off out over under until upon our ours its it's i'm i've i'll you're don't didn't isn't aren't wasn't can't won't let lets get got make made like want need know think said say says tell told please thanks thank okay yes yeah".split(
-    " ",
-  ),
-);
 
 /** Lowercase without combining marks, decomposed, so `café` and `cafe\u0301` compare equal. */
 const loose = (text: string) => text.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "");

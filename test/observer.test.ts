@@ -1485,6 +1485,77 @@ test("a reported cost and the day's stop it reaches are saved together or not at
   );
 });
 
+/** An observer answer adding the owner's tea preference. */
+const tea = (sources: readonly string[], text = "The owner prefers green tea in the afternoon.") =>
+  JSON.stringify({
+    ops: [{ op: "add", kind: "preference", topic: "Drinks", text, priority: 2, sources }],
+  });
+
+test("a fact the owner forgot is never added back by a later job; the owner's own edit to it clears that", async () => {
+  observerOn();
+  const [first] = enough();
+  answering(() => tea([first ?? ""]));
+  work();
+  await pass();
+  await pass();
+  const [preference] = rows();
+  expect(preference?.text).toBe("The owner prefers green tea in the afternoon.");
+  expect(forgetObservation(db, "jojo", preference?.id ?? 0, 1)).toEqual({ deleted: true });
+
+  // A later job reads new text and, say, the dot restating it: the same fact, reworded a little,
+  // citing the new message or the old one, isn't saved again.
+  const later = message(
+    `I'll keep green tea ready for the afternoon. ${"z".repeat(tokenJobChars)}`,
+  );
+  answering(() =>
+    JSON.stringify({
+      ops: [
+        {
+          op: "add",
+          kind: "preference",
+          topic: "Drinks",
+          text: "Owner prefers green tea in the afternoon",
+          priority: 2,
+          sources: [later],
+        },
+        {
+          op: "add",
+          kind: "fact",
+          topic: "Lisbon",
+          text: "The Lisbon offsite budget is 40k.",
+          priority: 1,
+          sources: [first],
+        },
+      ],
+    }),
+  );
+  work();
+  await pass();
+  await pass();
+  expect(jobs().at(-1)?.state).toBe("done");
+  expect(rows().map((each) => each.text)).toEqual(["The Lisbon offsite budget is 40k."]);
+
+  // The owner's own edit restating the fact clears its tombstone, so it may be observed again.
+  const lisbon = rows()[0];
+  const edited = editObservation(
+    db,
+    "jojo",
+    lisbon?.id ?? 0,
+    1,
+    "The owner prefers green tea in the afternoon.",
+  );
+  expect(edited).toMatchObject({ saved: { updatedBy: "owner" } });
+  message(`More tea talk. ${"w".repeat(tokenJobChars)}`);
+  answering(() => tea([later]));
+  work();
+  await pass();
+  await pass();
+  expect(rows().map((each) => each.text)).toEqual([
+    "The owner prefers green tea in the afternoon.",
+    "The owner prefers green tea in the afternoon.",
+  ]);
+});
+
 test("the owner deletes archived messages, or forgets a row with its sources; a checkpoint citing one goes, and no walk copies them back", async () => {
   const { api } = await import("../src/api");
   const handler = api(db, "secret", fake.layer);

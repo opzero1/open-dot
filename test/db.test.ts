@@ -111,9 +111,9 @@ const ledgerTables = [
 ];
 // 0035 adds the owner's grants.
 const grantTables = ["grants"];
-// 0037 adds the deleted messages' tombstones.
-const forgetTables = ["forgotten_messages"];
-// 0026, 0027, 0028, 0030, 0032, 0035 and 0037 add these tables, so earlier migrations' tests leave them out.
+// 0037 and 0038 add the forget tombstones.
+const forgetTables = ["forgotten_messages", "forgotten_observations"];
+// 0026, 0027, 0028, 0030, 0032, 0035, 0037 and 0038 add these tables, so earlier migrations' tests leave them out.
 const later = [
   "feed_triggers",
   "trigger_occurrences",

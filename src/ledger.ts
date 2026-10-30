@@ -1,11 +1,13 @@
 import { and, asc, desc, eq, gt, inArray, isNull, lt, max, sql } from "drizzle-orm";
 import type { Db } from "./db";
-import { indexTerms, memoryText, type Outcome, snippet } from "./memory";
+import { createHash } from "node:crypto";
+import { indexTerms, memoryText, type Outcome, snippet, stopwords } from "./memory";
 import {
   archive,
   type Dot,
   dots,
   forgottenMessages,
+  forgottenObservations,
   ledger,
   ledgerState,
   memorySettings,
@@ -367,6 +369,37 @@ export function zoomObservation(db: Db, dot: string, id: number) {
   };
 }
 
+/**
+ * A fact's words as a forget tombstone keeps them: letters and digits, three or more characters,
+ * not common words, each once and hashed with the dot's name, so the forgotten text isn't kept.
+ */
+const factWords = (dot: string, text: string) => {
+  const words = [...new Set(loose(text).split(/[^\p{L}\p{N}]+/u))].filter(
+    (word) => Array.from(word).length >= 3 && !stopwords.has(word),
+  );
+  return (words.length ? words : [loose(text).trim()])
+    .map((word) => createHash("sha256").update(`${dot}\0${word}`).digest("hex").slice(0, 16))
+    .toSorted();
+};
+
+/** Two facts are the same when at least three quarters of all their words are shared. */
+const sameFact = (a: readonly string[], b: readonly string[]) => {
+  const left = new Set(a);
+  const all = new Set([...a, ...b]).size;
+  return all > 0 && b.filter((word) => left.has(word)).length / all >= 0.75;
+};
+
+/** The dot's forget tombstones that match `text`. */
+const tombstonesOf = (db: Db, dot: string, text: string) => {
+  const words = factWords(dot, text);
+  return db
+    .select()
+    .from(forgottenObservations)
+    .where(eq(forgottenObservations.dot, dot))
+    .all()
+    .filter((row) => sameFact(row.words, words));
+};
+
 const bump = (db: Db, dot: string) => {
   stateOf(db, dot);
   db.update(ledgerState)
@@ -394,6 +427,10 @@ export const editObservation = (db: Db, dot: string, id: number, version: number
         .where(and(eq(ledger.id, id), eq(ledger.dot, dot)))
         .get();
       if (!saved) return now ? { conflict: observationView(db, now) } : { missing: true };
+      // The owner stating a forgotten fact again is their explicit re-add: it may be observed again.
+      const cleared = tombstonesOf(db, dot, text).map((row) => row.id);
+      if (cleared.length)
+        tx.delete(forgottenObservations).where(inArray(forgottenObservations.id, cleared)).run();
       bump(db, dot);
       suppressHead(db, dot);
       return { saved: observationView(db, saved) };
@@ -475,6 +512,9 @@ export const forgetObservation = (
         return now ? { conflict: observationView(db, now) } : { missing: true };
       }
       if (sources) forgetMessages(db, dot, removed.sources, removed.sessionID);
+      tx.insert(forgottenObservations)
+        .values({ dot, words: factWords(dot, removed.text), forgottenAt: Date.now() })
+        .run();
       bump(db, dot);
       suppressHead(db, dot);
       return { deleted: true };
@@ -662,7 +702,19 @@ export function applyJob(db: Db, job: ObserverJob, ops: readonly ObservationOp[]
           .returning()
           .get();
       };
+      // A fact the owner forgot is never written again, reworded or not, whatever it cites.
+      const tombstones = tx
+        .select()
+        .from(forgottenObservations)
+        .where(eq(forgottenObservations.dot, job.dot))
+        .all();
+      const forgotten = (text: string | undefined) => {
+        if (text === undefined) return false;
+        const words = factWords(job.dot, text);
+        return tombstones.some((row) => sameFact(row.words, words));
+      };
       for (const op of ops) {
+        if (forgotten(op.text)) continue;
         if (op.op === "add") insert(op);
         else if (op.op === "supersede") {
           const old = target(op.id);

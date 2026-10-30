@@ -468,6 +468,19 @@ export const ledger = sqliteTable("ledger", {
 export type Observation = typeof ledger.$inferSelect;
 
 /**
+ * Observed rows the owner forgot, kept as hashes of their words, never their text, so the observer
+ * can't add the same fact back. The owner's own edit to the same words clears one.
+ */
+export const forgottenObservations = sqliteTable("forgotten_observations", {
+  id: integer().primaryKey({ autoIncrement: true }),
+  dot: text()
+    .notNull()
+    .references(() => dots.name),
+  words: text({ mode: "json" }).$type<readonly string[]>().notNull(),
+  forgottenAt: integer("forgotten_at").notNull(),
+});
+
+/**
  * Each dot's observer and checkpoint state. `epoch` advances whenever the owner edits or forgets
  * a row, so a job begun before then saves nothing. `observed_through` is the last archive row a
  * job was queued for. The head is the checkpoint text for one text compaction of one session.
