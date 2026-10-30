@@ -43,6 +43,8 @@ import {
   firstLines,
   mergeWork,
   pageWork,
+  logCounts,
+  turnCalls,
   workSummary,
 } from "../chat";
 
@@ -503,16 +505,40 @@ test("Delivered marks only a trailing owner message with nothing pending, and un
   expect(unreadSince(messages, "d")).toBe(0);
 });
 
+const editCall = (callID: string, path: string) => ({
+  messageID: "m",
+  callID,
+  name: "edit",
+  status: "done" as const,
+  startedAt: null,
+  endedAt: null,
+  label: path,
+  files: [{ path, additions: 1, deletions: 0 }],
+});
+
 describe("work log", () => {
   const counts = { commands: 0, edits: 0, edited: 0, failed: 0, total: 0 };
   const log = (anchor: string | null, total: number) => ({
     anchor,
     calls: [],
-    omitted: 0,
     counts: { ...counts, total },
     complete: true,
     open: anchor === null,
     more: null,
+  });
+
+  test("loaded calls count each call and each edited file once across the whole turn", () => {
+    // The conversation listed one edit of a.ts and counted two calls it read.
+    const shown = [editCall("c2", "a.ts")];
+    const read = { counts: { ...counts, edits: 2, edited: 1, total: 2 } };
+    expect(logCounts(read, turnCalls([], shown))).toBe(read.counts);
+    // A continuation brings both earlier edits, one of a.ts again and the listed one twice.
+    const all = turnCalls(
+      [editCall("c0", "a.ts"), editCall("c1", "b.ts"), editCall("c2", "a.ts")],
+      shown,
+    );
+    expect(all.map((call) => call.callID)).toEqual(["c0", "c1", "c2"]);
+    expect(logCounts(read, all)).toMatchObject({ edits: 3, edited: 2, total: 3 });
   });
 
   test("summaries count commands, edited files, other calls and failures", () => {

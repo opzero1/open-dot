@@ -9,6 +9,7 @@ import type {
   QuoteView,
   ReceiptStatus,
   Result,
+  ToolCallView,
   WorkCounts,
   WorkLogView,
 } from "./bridge";
@@ -717,6 +718,41 @@ export const mergeWork = (
   }
   return { sessionID: page.sessionID, logs, open };
 };
+
+const editTools: ReadonlySet<string> = new Set(["edit", "write", "apply_patch", "multiedit"]);
+const commandTools: ReadonlySet<string> = new Set(["bash", "shell"]);
+
+/** A turn's calls in order, each once, from earlier loads and the log's own. */
+export const turnCalls = (earlier: readonly ToolCallView[], listed: readonly ToolCallView[]) => {
+  const seen = new Set<string>();
+  return [...earlier, ...listed].filter((call) => {
+    const key = `${call.messageID}\0${call.callID}`;
+    return !seen.has(key) && seen.add(key);
+  });
+};
+
+/** Counts of calls each held once, every edited path counted once across the whole turn. */
+export const callCounts = (calls: readonly ToolCallView[]): WorkCounts => {
+  const edited = new Set<string>();
+  for (const call of calls)
+    if (call.status === "done" && editTools.has(call.name))
+      for (const file of call.files) edited.add(file.path);
+  return {
+    commands: calls.filter((call) => commandTools.has(call.name)).length,
+    edits: calls.filter((call) => editTools.has(call.name)).length,
+    edited: edited.size,
+    failed: calls.filter((call) => call.status === "error").length,
+    total: calls.length,
+  };
+};
+
+/**
+ * A log's counts once earlier calls are loaded. The daemon's counts cover the newest calls it
+ * read, and the calls held here are the newest too, so whichever covers more holds the other:
+ * counting the held calls themselves, never adding page counts, keeps each file and call once.
+ */
+export const logCounts = (log: Pick<WorkLogView, "counts">, calls: readonly ToolCallView[]) =>
+  calls.length >= log.counts.total ? callCounts(calls) : log.counts;
 
 const plural = (count: number, one: string, many = `${one}s`) =>
   `${count} ${count === 1 ? one : many}`;

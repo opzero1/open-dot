@@ -49,7 +49,6 @@ const workCounts = { commands: "n", edits: "n", edited: "n", failed: "n", total:
 export const workLogShape = {
   "anchor?": "s",
   calls: [toolCall],
-  omitted: "n",
   counts: workCounts,
   complete: "b",
   open: "b",
@@ -202,7 +201,7 @@ export const shapes: Record<Operation, Shape> = {
     "since?": "n",
     observedAt: "n",
   },
-  work: { calls: [toolCall], omitted: "n", counts: workCounts, complete: "b", "more?": "s" },
+  work: { calls: [toolCall], counts: workCounts, complete: "b", "more?": "s" },
   toolDetail: {
     ...toolCall,
     "input?": "s",

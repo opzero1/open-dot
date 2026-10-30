@@ -1264,6 +1264,16 @@ button:disabled {
   font-family: var(--mono);
 }
 
+.tool-file-path {
+  display: inline-block;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  font-family: var(--mono);
+}
+
 .tool-file .added {
   color: #1a7f37;
 }

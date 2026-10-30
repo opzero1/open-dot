@@ -116,17 +116,16 @@ export interface WorkCounts {
 export interface WorkLogView {
   anchor: string | null;
   calls: ToolCallView[];
-  omitted: number;
+  /** Counts of every call the daemon read, listed or not. */
   counts: WorkCounts;
   complete: boolean;
   open: boolean;
   more: string | null;
 }
 
-/** Earlier calls of a turn, read on request. */
+/** Earlier calls of a turn, read on request; `counts` are of these calls only. */
 export interface WorkPage {
   calls: ToolCallView[];
-  omitted: number;
   counts: WorkCounts;
   complete: boolean;
   more: string | null;

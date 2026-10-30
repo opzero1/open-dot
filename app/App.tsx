@@ -27,7 +27,6 @@ import type {
   SendResult,
   ToolCallView,
   ToolDetailView,
-  WorkCounts,
   WorkLogView,
 } from "./bridge";
 import {
@@ -74,6 +73,8 @@ import {
   unreadSince,
   workerActions,
   type WorkState,
+  logCounts,
+  turnCalls,
   workSummary,
 } from "./chat";
 import { Feed } from "./Feed";
@@ -2022,9 +2023,13 @@ const ToolDetailBody = ({
   }, [dot, sessionID, call.messageID, call.callID, call.status]);
   if (problem) return <div className="tool-detail status warning">{problem}</div>;
   if (!detail) return <div className="tool-detail muted">Loading…</div>;
-  const unavailable = detail.files.filter(
-    (file) => file.additions === null && !detail.patches.some((patch) => patch.path === file.path),
-  );
+  const edits = editTools.has(detail.name);
+  // Each named file without a reported diff, and, for an edit naming none, the call as a whole.
+  const unavailable = edits
+    ? detail.files.filter(
+        (file) => !detail.patches.some((patch) => patch.path === file.path && patch.patch),
+      )
+    : [];
   return (
     <div className="tool-detail">
       {detail.input ? <LongText label="Input" text={detail.input} /> : null}
@@ -2032,20 +2037,20 @@ const ToolDetailBody = ({
       {detail.output ? <LongText label="Output" text={detail.output} /> : null}
       {detail.patches.map((patch, index) =>
         patch.patch ? (
-          <DiffBlock key={index} code={patch.patch} />
-        ) : (
-          <div key={index} className="muted">
-            {patch.path}: diff unavailable
+          <div key={index} className="tool-patch">
+            <div className="tool-file-path">{patch.path}</div>
+            <DiffBlock code={patch.patch} />
           </div>
-        ),
+        ) : null,
       )}
-      {editTools.has(detail.name)
-        ? unavailable.map((file) => (
-            <div key={file.path} className="muted">
-              {file.path}: diff unavailable
-            </div>
-          ))
-        : null}
+      {unavailable.map((file, index) => (
+        <div key={index} className="muted">
+          {file.path}: diff unavailable
+        </div>
+      ))}
+      {edits && !detail.files.length && !detail.patches.some((patch) => patch.patch) ? (
+        <div className="muted">Diff unavailable</div>
+      ) : null}
       {detail.truncated ? (
         <div className="muted">Some of this was too long, so it was cut or left out.</div>
       ) : null}
@@ -2079,8 +2084,9 @@ const ToolRow = ({
         <span className="tool-name">{call.name}</span>
         <span className="tool-label">{call.label}</span>
         {editTools.has(call.name)
-          ? call.files.map((file) => (
-              <span key={file.path} className="tool-file">
+          ? call.files.map((file, index) => (
+              <span key={index} className="tool-file">
+                <span className="tool-file-path">{file.path}</span>{" "}
                 {file.additions === null ? (
                   <span className="muted">diff unavailable</span>
                 ) : (
@@ -2092,6 +2098,9 @@ const ToolRow = ({
               </span>
             ))
           : null}
+        {editTools.has(call.name) && !call.files.length ? (
+          <span className="tool-file muted">diff unavailable</span>
+        ) : null}
         <span className={`tool-status ${call.status}`}>{statusWords[call.status]}</span>
       </button>
       {open ? <ToolDetailBody dot={dot} sessionID={sessionID} call={call} /> : null}
@@ -2112,30 +2121,19 @@ const WorkLog = ({
   running: boolean;
 }) => {
   const [open, setOpen] = useState(false);
-  const [earlier, setEarlier] = useState<{ calls: ToolCallView[]; counts: WorkCounts[] }>({
-    calls: [],
-    counts: [],
-  });
+  const [earlier, setEarlier] = useState<ToolCallView[]>([]);
   const [more, setMore] = useState(log.more);
   const [complete, setComplete] = useState(log.complete);
   const [loading, setLoading] = useState(false);
   const [problem, setProblem] = useState<string>();
   // A newer read of the same turn starts the continuation over.
   useEffect(() => {
-    setEarlier({ calls: [], counts: [] });
+    setEarlier([]);
     setMore(log.more);
     setComplete(log.complete);
   }, [log.more, log.complete]);
-  const counts = earlier.counts.reduce(
-    (sum, part) => ({
-      commands: sum.commands + part.commands,
-      edits: sum.edits + part.edits,
-      edited: sum.edited + part.edited,
-      failed: sum.failed + part.failed,
-      total: sum.total + part.total,
-    }),
-    log.counts,
-  );
+  const calls = turnCalls(earlier, log.calls);
+  const counts = logCounts(log, calls);
   const loadEarlier = () => {
     if (!more || loading) return;
     setLoading(true);
@@ -2146,15 +2144,12 @@ const WorkLog = ({
         setProblem(result.error);
         return;
       }
-      setEarlier((current) => ({
-        calls: [...result.value.calls, ...current.calls],
-        counts: [...current.counts, result.value.counts],
-      }));
+      setEarlier((current) => [...result.value.calls, ...current]);
       setMore(result.value.more);
+      // The cursor carries whether the turn is partial, so the latest page says it all.
       setComplete(result.value.complete);
     });
   };
-  const calls = [...earlier.calls, ...log.calls];
   return (
     <div className="work-log" data-work-log={log.anchor ?? "open"}>
       <button
@@ -2168,9 +2163,13 @@ const WorkLog = ({
       </button>
       {open ? (
         <div className="work-calls">
-          {!complete ? (
+          {!complete || more ? (
             <div className="muted">
-              Partial history: this turn began earlier than open-dot read.{" "}
+              {!complete
+                ? more
+                  ? "Partial history: this turn's earlier calls aren't loaded yet. "
+                  : "Partial history: some of this turn's calls are missing. "
+                : ""}
               {more ? (
                 <button
                   type="button"
@@ -2184,9 +2183,6 @@ const WorkLog = ({
             </div>
           ) : null}
           {problem ? <div className="status warning">{problem}</div> : null}
-          {log.omitted ? (
-            <div className="muted">{log.omitted} earlier calls aren't listed.</div>
-          ) : null}
           <ul>
             {calls.map((call) => (
               <ToolRow

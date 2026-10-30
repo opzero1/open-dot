@@ -1017,7 +1017,6 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
             ]),
             toolCall("c3", "bash", "false", "error"),
           ],
-          omitted: 0,
           counts: { commands: 2, edits: 1, edited: 1, failed: 1, total: 3 },
           complete: true,
           open: false,
@@ -1097,7 +1096,7 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         await js(
           `[...document.querySelectorAll("[data-tool-call]")].map((row) => row.querySelector(".tool-call-head").textContent)`,
         ),
-      ).toEqual(["$bashbun testDone", "✎editsrc/a.ts+2 −1Done", "$bashfalseError"]);
+      ).toEqual(["$bashbun testDone", "✎editsrc/a.tssrc/a.ts +2 −1Done", "$bashfalseError"]);
       await js(`document.querySelector("[data-tool-call='c2'] .tool-call-head").click(), true`);
       await until(
         `!!document.querySelector("[data-tool-call='c2'] .diff .diff-add")`,
