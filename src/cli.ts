@@ -129,6 +129,26 @@ if (command === "backup" || command === "restore") {
     process.exit(1);
   }
 }
+// Help, or a command open-dot doesn't have, never opens or migrates the database.
+if (
+  ![
+    "create",
+    "list",
+    "avatar",
+    "open",
+    "daemon",
+    "slack",
+    "watch",
+    "grant",
+    "instructions",
+    "fresh",
+    "archive",
+    "observation",
+  ].includes(command ?? "")
+) {
+  console.log(usage);
+  process.exit(0);
+}
 if (command === "daemon") {
   const release = claimDaemon(databasePath());
   process.on("exit", release);

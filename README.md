@@ -300,7 +300,8 @@ Files are named `open-dot-<UTC timestamp>-before-<first pending migration>.db`. 
 with no pending migrations do not back up or acquire the migration lock. Concurrent migrators
 wait for the same SQLite lock, then recheck the ledger; the lock is released even if a process
 crashes. Waiting is bounded to 60 seconds; a timeout fails the open instead of migrating unlocked.
-In-memory test databases have no backups.
+In-memory test databases have no backups. `open-dot` with no command, `help` or an unknown command
+prints its usage without opening the database.
 
 Make a backup without running migrations:
 

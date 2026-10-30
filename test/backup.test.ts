@@ -530,6 +530,18 @@ test("CLI backup copies a pending database without applying migrations", () => {
   }
 });
 
+test("CLI help and unknown commands leave a pending database unmigrated", () => {
+  const { path, home } = fixture(true);
+  const before = readFileSync(path);
+  for (const args of [[], ["help"], ["--help"], ["forget"]]) {
+    const output = cli(home, ...args);
+    expect(output.exit).toBe(0);
+    expect(output.stdout).toStartWith("Usage:");
+  }
+  expect(readFileSync(path)).toEqual(before);
+  expect(backups(path)).toEqual([]);
+});
+
 test("missing backup or restore sources and current databases are never created", () => {
   const { path, home } = fixture();
   const missing = join(home, "missing.db");
