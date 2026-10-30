@@ -391,7 +391,7 @@ export const archiveCursors = sqliteTable("archive_cursors", {
 /**
  * The owner's and the dot's own text from a dot's bound conversation, copied from OpenCode's
  * public history: no reasoning, tool calls, attachments, notices or other dots' messages. Rows are
- * never changed; a rebound dot reads only its current session's rows.
+ * never changed, only deleted by the owner; a rebound dot reads only its current session's rows.
  */
 export const archive = sqliteTable(
   "archive",
@@ -441,7 +441,7 @@ export const observationKinds = [
 /**
  * What a background observer noted about a dot's conversation, kept apart from the dot's own
  * notes. A superseded row stays, pointing at its replacement; the owner may edit or forget any
- * row, and forgetting deletes it, never the archived messages it came from.
+ * row, and forgetting deletes it and, if the owner asks, the archived messages it came from.
  */
 export const ledger = sqliteTable("ledger", {
   id: integer().primaryKey({ autoIncrement: true }),
