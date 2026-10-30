@@ -1120,6 +1120,44 @@ test("an older page or error read for a window that's gone is dropped, so histor
   );
 }, 170_000);
 
+test("Undo clicked before its delete settles waits for it, then restores the message once", async () => {
+  await scenario(
+    "undo",
+    (fake) => {
+      fake.messages = many(10).map((item) => ({ ...item, kind: "dot" as const }));
+    },
+    async ({ fake, js, until, menu, press }) => {
+      await until(`!!t.msg("m5")`, "the latest page");
+      const puts = () =>
+        fake.log.puts.filter((put) => put.id === "m5").map((put) => put.body.hidden);
+      // Every read waits, so no read can show the delete saved before Undo is clicked.
+      const { promise: held, resolve: unhold } = Promise.withResolvers<void>();
+      fake.hold = held;
+      await menu("m5", "Delete");
+      await press(".modal", "Delete");
+      await press(".toast", "Undo");
+      await until(
+        `!!document.querySelector(".toast")?.textContent.includes("Undoing once")`,
+        "the waiting Undo",
+      );
+      await delay(1500);
+      expect(puts()).toEqual([true]);
+      expect(await js(`!!t.msg("m5")`)).toBe(false);
+      // The reads answer: the delete settles, then the one restore goes and the message is back.
+      fake.hold = undefined;
+      unhold();
+      await until(
+        `!!t.msg("m5") && !t.msg("m5").classList.contains("hidden") && !t.msg("m5").dataset.blocked`,
+        "the restored message",
+      );
+      await delay(2500);
+      expect(puts()).toEqual([true, false]);
+      expect(fake.hidden.has("m5")).toBe(false);
+      expect(await js(`!!t.msg("m5") && !t.msg("m5").classList.contains("hidden")`)).toBe(true);
+    },
+  );
+}, 170_000);
+
 test("Back to latest keeps a same-session quote, and drops it when the dot rebinds meanwhile, keeping the draft", async () => {
   await scenario(
     "rebind",

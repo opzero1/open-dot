@@ -307,6 +307,8 @@ const App = () => {
   const epochs = useRef(new Map<string, number>());
   // Per dot, the session of the last page applied; Back to latest drops the page, not this.
   const sessions = useRef(new Map<string, string>());
+  // Undo of a delete clicked before that delete settled, by dot and message: it runs once it has.
+  const undoes = useRef(new Map<string, { name: string; id: string; sessionID: string }>());
 
   /** Drops intents once nothing can change their message or a read settled them, and fences them. */
   const dropIntents = useCallback(
@@ -344,6 +346,11 @@ const App = () => {
       if (session !== undefined && session !== page.sessionID) {
         // A new session: old actions, quotes and intents no longer apply; the draft text stays.
         fences.current.delete(name);
+        for (const [key, undo] of undoes.current)
+          if (undo.name === name) {
+            undoes.current.delete(key);
+            showToast({ text: `Undo no longer applies: ${name} moved to a new conversation.` });
+          }
         updateIntents((all) => without(all, name));
         updateDrafts((all) => {
           const kept = all.get(name);
@@ -371,7 +378,15 @@ const App = () => {
         return new Map(current).set(name, last);
       });
     },
-    [conversationsRef, settle, updateConversations, updateDrafts, updateIntents, updateSent],
+    [
+      conversationsRef,
+      settle,
+      showToast,
+      updateConversations,
+      updateDrafts,
+      updateIntents,
+      updateSent,
+    ],
   );
 
   const readChat = useCallback(
@@ -608,7 +623,7 @@ const App = () => {
   /** One change to one message at a time. */
   const mutate = (
     name: string,
-    message: MessageView,
+    message: Pick<MessageView, "id" | "sessionID">,
     change: Pick<Intent, "emoji" | "hidden">,
   ): Promise<boolean> => {
     if (intentsRef.current.get(name)?.has(message.id)) {
@@ -633,15 +648,35 @@ const App = () => {
     void mutate(name, message, { emoji: next });
   };
 
-  const hide = (name: string, message: MessageView, hidden: boolean) => {
+  const hide = (name: string, message: Pick<MessageView, "id" | "sessionID">, hidden: boolean) => {
     void mutate(name, message, { hidden }).then((done) => {
       if (done && hidden)
         showToast({
           text: "Message deleted from the app.",
-          undo: () => hide(name, message, false),
+          undo: () => undoDelete(name, message),
         });
     });
   };
+
+  /** Undo of a delete that's still settling waits for it rather than being refused. */
+  const undoDelete = (name: string, message: Pick<MessageView, "id" | "sessionID">) => {
+    if (!intentsRef.current.get(name)?.has(message.id)) return hide(name, message, false);
+    undoes.current.set(`${name}\n${message.id}`, {
+      name,
+      id: message.id,
+      sessionID: message.sessionID,
+    });
+    showToast({ text: "Undoing once open-dot shows the delete saved…" });
+  };
+
+  // A waiting Undo runs once its delete has settled, as the restore Show deleted offers.
+  useEffect(() => {
+    for (const [key, undo] of undoes.current) {
+      if (intentsRef.current.get(undo.name)?.has(undo.id)) continue;
+      undoes.current.delete(key);
+      hide(undo.name, undo, false);
+    }
+  });
 
   // The composer.
 
@@ -1148,8 +1183,9 @@ const App = () => {
             <button
               type="button"
               onClick={() => {
-                toast.undo?.();
+                // Cleared first, so a toast the undo shows, saying it's waiting, stays.
                 setToast(undefined);
+                toast.undo?.();
               }}
             >
               Undo
