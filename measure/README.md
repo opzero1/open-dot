@@ -66,3 +66,13 @@ After some real use, the owner writes a private fixture with the same shape, `"s
 - Optionally, the ledger rows the observer actually wrote.
 
 Keep it outside the repository, for example under `~/.opendot/evidence/issue-42/`. Never commit it, and never paste its contents into an issue.
+
+## Where the memory tail goes (#62)
+
+`cache.ts` scores the prompt cache cost of the plugin's tail placement against putting the tail after the owner's message, with the plugin's own `placeTail`, OpenCode 2.2.0's automatic cache hints and Anthropic's prefix cache. It calls no model or OpenCode, and its token sizes are a scenario's, not provider counts:
+
+```
+bun measure/cache.ts
+```
+
+The result, and why the placement stays, is in `docs/PLAN.md` under "Verified OpenCode behavior".

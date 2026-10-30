@@ -282,7 +282,8 @@ open-dot doctor --json   # the same report for scripts
 ```
 
 It reports the daemon (through `api.json`), the database schema, OpenCode, each dot's saved
-session, queued and unknown sends, each feed source's last pass, and Slack setup. Each check is
+session, queued and unknown sends, today's prompt cache use, each feed source's last pass, and
+Slack setup. Each check is
 `healthy`, `stale`, `failed`, `unknown`, `not_configured` or `disabled`. It exits 1 when any check
 failed. The app shows the same report under Health in a dot's ⋯ menu.
 
@@ -304,6 +305,13 @@ Its words are fixed text with counts: no names, tokens, paths, session or Slack 
 or raw errors, and none of the daemon's own words. `open-dot slack status` still gives Slack's full
 explanation; a Slack app saved as active is reported as unknown, since a saved state isn't a
 working connection.
+
+The `cache` check sums every dot's model steps today, as OpenCode reports them: tokens read from
+the prompt cache, written to it and sent uncached, and the cache hit ratio. It fails when a dot's
+latest three steps after a turn's first each wrote at least 20,000 tokens to the cache and more
+than they read, the sign that its conversation is cached again on every step; an OpenCode upgrade
+may have changed how cache hints are ordered. A dot's Health in the app lists its own steps per
+day this week. Steps count from when the daemon first reads the dot's conversation to its end.
 
 Feed passes are known only to a running daemon, in memory, so they read as unknown while it's
 stopped and until its first pass after a start. A send whose outcome was lost stays unknown until
