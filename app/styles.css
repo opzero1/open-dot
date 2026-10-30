@@ -1119,3 +1119,13 @@ button:disabled {
 .modal-box {
   max-width: 460px;
 }
+
+.command-output {
+  margin: 4px 0 0;
+  max-height: 160px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

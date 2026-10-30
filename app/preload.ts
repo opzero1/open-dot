@@ -37,6 +37,7 @@ const bridge: Bridge = {
   slackShown: call("slackShown"),
   confirmReplace: call("confirmReplace"),
   exportArtifact: call("exportArtifact"),
+  opencode: call("opencode"),
   onEvent: (listener: (event: AppEvent) => void) => {
     const handle = (_event: unknown, payload: AppEvent) => listener(payload);
     ipcRenderer.on(eventChannel, handle);

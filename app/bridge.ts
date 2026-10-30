@@ -176,6 +176,27 @@ export interface WorkerOpen {
   error?: string;
 }
 
+/** A command the owner can run on OpenCode's background server: `<bin> service <action>`. */
+export type ServiceAction = "status" | "start" | "restart" | "stop";
+
+/**
+ * OpenCode's background server as the app last read it with `service status`, the command running
+ * now, and the last command the owner ran with what it printed or why it failed.
+ */
+export interface ServiceView {
+  state: "running" | "stopped" | "unknown";
+  url: string | null;
+  checkedAt: number | null;
+  problem: string | null;
+  busy: Exclude<ServiceAction, "status"> | null;
+  last: {
+    action: Exclude<ServiceAction, "status">;
+    ok: boolean;
+    output: string;
+    at: number;
+  } | null;
+}
+
 // The daemon's other surfaces, as the app reads them. Every text field is data from the daemon,
 // and through it from dots, workers, feeds and Slack: the renderer shows it, never acts on it.
 
@@ -676,6 +697,11 @@ export interface Bridge {
   confirmReplace(dot: string, appID: string, replace: boolean): Promise<PickupState>;
   /** Downloads a Library file by ID, checks its size and digest, and offers to save it. */
   exportArtifact(dot: string, artifact: Artifact): Promise<Reply<{ saved: boolean }>>;
+  /**
+   * Reads OpenCode's server status, or runs the owner's Start, Restart or Stop: main asks before
+   * Restart and Stop, and the answer is the view afterwards, unchanged when the owner cancelled.
+   */
+  opencode(action: ServiceAction): Promise<Result<ServiceView>>;
   /** Called when main shows the window or the shortcut failed; returns an unsubscribe. */
   onEvent(listener: (event: AppEvent) => void): () => void;
 }
@@ -683,7 +709,8 @@ export interface Bridge {
 export type AppEvent =
   | { kind: "shown" }
   | { kind: "shortcut"; registered: boolean }
-  | { kind: "pickup"; state: PickupState };
+  | { kind: "pickup"; state: PickupState }
+  | { kind: "opencode"; view: ServiceView };
 
 export const channels = [
   "dots",
@@ -715,6 +742,7 @@ export const channels = [
   "slackShown",
   "confirmReplace",
   "exportArtifact",
+  "opencode",
 ] as const satisfies readonly Exclude<keyof Bridge, "onEvent">[];
 
 export type Channel = (typeof channels)[number];

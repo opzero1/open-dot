@@ -758,7 +758,11 @@ interface State {
 }
 
 /** Starts the hidden app against a fake daemon, with temporary HOME, TMPDIR and app data. */
-const launch = async (name: string, setup: (fake: FakeDaemon) => void) => {
+const launch = async (
+  name: string,
+  setup: (fake: FakeDaemon) => void,
+  env: Record<string, string> = {},
+) => {
   const home = join(scratch, name);
   const opendot = join(home, "opendot");
   const temporary = join(home, "tmp");
@@ -775,6 +779,9 @@ const launch = async (name: string, setup: (fake: FakeDaemon) => void) => {
       OPEN_DOT_HOME: opendot,
       OPEN_DOT_APP_DATA: join(home, "app-data"),
       OPEN_DOT_APP_SMOKE: "1",
+      // Never the owner's OpenCode: main runs only an absolute fake a test names here.
+      OPEN_DOT_OPENCODE: "",
+      ...env,
     },
     stdin: "pipe",
     stdout: "pipe",
@@ -883,8 +890,9 @@ const scenario = async (
   name: string,
   setup: (fake: FakeDaemon) => void,
   run: (app: App) => Promise<void>,
+  env: Record<string, string> = {},
 ) => {
-  const app = await launch(name, setup);
+  const app = await launch(name, setup, env);
   try {
     await run(app);
     const { recorded, violations } = await app.state();
@@ -2672,6 +2680,67 @@ test("Library exports through the save dialog only, Health reads, and Start Fres
         "the fresh session",
       );
     },
+  );
+}, 170_000);
+
+test("OpenCode server: Health shows its status, Start runs the binary, and Stop runs only once the owner confirms", async () => {
+  const directory = mkdtempSync(join(scratch, "opencode-fake-"));
+  const log = join(directory, "log");
+  const serverState = join(directory, "state");
+  writeFileSync(serverState, "stopped");
+  const binary = join(directory, "opencode2");
+  writeFileSync(
+    binary,
+    `#!/bin/sh
+echo "$*" >> '${log}'
+case "$2" in
+  status) if [ "$(cat '${serverState}')" = running ]; then echo "running http://127.0.0.1:4999"; else echo stopped; fi ;;
+  start) echo running > '${serverState}'; echo "http://127.0.0.1:4999" ;;
+  stop) echo stopped > '${serverState}' ;;
+esac
+`,
+  );
+  chmodSync(binary, 0o755);
+  const calls = () => (existsSync(log) ? Bun.file(log).text() : Promise.resolve(""));
+  await scenario(
+    "opencode",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { until, press, state, command } = app;
+      const server = '[data-section="opencode"]';
+      await openPane(app, "Health");
+      await until(`!!document.querySelector('[data-opencode-state="stopped"]')`, "stopped");
+      await press(server, "Start");
+      await until(
+        `document.querySelector('${server}').innerText.includes("Running at http://127.0.0.1:4999")`,
+        "running after Start",
+      );
+      await until(
+        `!!document.querySelector('[data-opencode-last="ok"]')?.innerText.includes("http://127.0.0.1:4999")`,
+        "Start's output",
+      );
+      // Stop asks first; a Cancel runs nothing.
+      await press(server, "Stop…");
+      const asked = async () =>
+        ((await state()).recorded as Recorded & { confirms: string[] }).confirms;
+      for (let tick = 0; tick < 50 && (await asked()).length < 1; tick++) await delay(100);
+      expect(await asked()).toEqual(["stop"]);
+      await delay(300);
+      expect((await calls()).includes("service stop")).toBe(false);
+      await command({ confirm: true });
+      await press(server, "Stop…");
+      await until(`!!document.querySelector('[data-opencode-state="stopped"]')`, "stopped again");
+      expect(await asked()).toEqual(["stop", "stop"]);
+      const ran = (await calls()).split("\n").filter(Boolean);
+      expect(ran.filter((line) => line !== "service status")).toEqual([
+        "service start",
+        "service stop",
+      ]);
+      expect(ran.every((line) => /^service (status|start|stop)$/.test(line))).toBe(true);
+    },
+    { OPEN_DOT_OPENCODE: binary },
   );
 }, 170_000);
 

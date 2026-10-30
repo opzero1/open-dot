@@ -11,6 +11,7 @@ import {
   ipcMain,
   type IpcMainInvokeEvent,
   Menu,
+  type MenuItemConstructorOptions,
   nativeImage,
   nativeTheme,
   protocol,
@@ -52,6 +53,7 @@ import {
   type ReceiptStatus,
   type Result,
   type SendResult,
+  type ServiceAction,
   type TrayState,
 } from "./bridge";
 import {
@@ -68,6 +70,7 @@ import {
 } from "./chat";
 import { type Clipboard, helperClipboard } from "./clipboard";
 import { decoded } from "./decode";
+import { isServiceAction, serviceBinary, serviceControl } from "./service";
 import {
   isSlackAppID,
   linkAppID,
@@ -90,7 +93,10 @@ const recorded = {
   shares: [] as { texts: number; files: number; directory: string }[],
   saves: [] as { name: string; bytes: number }[],
   quitPrompts: 0,
+  // The OpenCode commands main asked the owner about, which the driver's `confirm` answers.
+  confirms: [] as string[],
 };
+let smokeConfirm = false;
 
 if (process.env.OPEN_DOT_APP_DATA) app.setPath("userData", resolve(process.env.OPEN_DOT_APP_DATA));
 // A normal Dock app otherwise: its icon stays while it runs, hidden or not, and clicking it
@@ -1723,6 +1729,108 @@ const trayIcon = (busy: boolean) => {
 let trayState: TrayState = { busy: false, unread: 0 };
 let shortcutRegistered = true;
 
+// OpenCode's background server. The smoke test runs only the absolute fake binary it names, never
+// one found on a PATH, so no test reaches the owner's OpenCode.
+const named = serviceBinary(process.env);
+const loginShell = process.env.SHELL?.trim();
+const opencode = serviceControl({
+  binary: smoke ? (named.startsWith("/") ? named : undefined) : named,
+  shell: smoke ? undefined : loginShell?.startsWith("/") ? loginShell : "/bin/zsh",
+  env: process.env,
+  onChange: (view) => {
+    updateTray();
+    emit({ kind: "opencode", view });
+  },
+});
+
+const asks = {
+  restart: {
+    message: "Restart OpenCode?",
+    detail:
+      "Restarting OpenCode's background server interrupts every running session, your dots and their workers included. open-dot reconnects once it's back.",
+    button: "Restart OpenCode",
+  },
+  stop: {
+    message: "Stop OpenCode?",
+    detail:
+      "Stopping OpenCode's background server interrupts every running session, your dots and their workers included, and none runs again until you start it. open-dot reconnects once it's back.",
+    button: "Stop OpenCode",
+  },
+} as const;
+
+/** Runs the owner's OpenCode command, asking first before Restart and Stop. */
+const controlOpenCode = async (action: ServiceAction) => {
+  if (action !== "status" && opencode.view().busy)
+    return { ok: false as const, error: "Another OpenCode command is still running." };
+  if (action === "restart" || action === "stop") {
+    const ask = asks[action];
+    let confirmed: boolean;
+    if (smoke) {
+      recorded.confirms.push(action);
+      confirmed = smokeConfirm;
+    } else {
+      const options = {
+        type: "warning" as const,
+        message: ask.message,
+        detail: ask.detail,
+        buttons: ["Cancel", ask.button],
+        defaultId: 0,
+        cancelId: 0,
+      };
+      const parent = window?.isVisible() ? window : undefined;
+      const answer = parent
+        ? await dialog.showMessageBox(parent, options)
+        : await dialog.showMessageBox(options);
+      confirmed = answer.response === 1;
+    }
+    if (!confirmed) return { ok: true as const, value: opencode.view() };
+  }
+  return opencode.run(action);
+};
+
+/** The menu bar menu's OpenCode commands: a failure is shown, since the window may be hidden. */
+const controlFromMenu = async (action: ServiceAction) => {
+  const result = await controlOpenCode(action);
+  const last = opencode.view().last;
+  const error = !result.ok ? result.error : last && !last.ok ? last.output : undefined;
+  if (error && !smoke)
+    void dialog.showMessageBox({
+      type: "warning",
+      message: "OpenCode's command didn't work.",
+      detail: error.slice(-1_000),
+    });
+};
+
+const openCodeItems = (): MenuItemConstructorOptions[] => {
+  const view = opencode.view();
+  const busy = view.busy !== null;
+  const state = view.busy
+    ? `OpenCode: ${{ start: "starting", restart: "restarting", stop: "stopping" }[view.busy]}…`
+    : `OpenCode: ${{ running: "running", stopped: "stopped", unknown: "not known" }[view.state]}`;
+  const last = view.last
+    ? `Last ${view.last.action}: ${view.last.ok ? "done" : "failed"}${view.last.output ? ` — ${view.last.output.split("\n")[0]?.slice(0, 60)}` : ""}`
+    : undefined;
+  return [
+    { label: state, enabled: false },
+    ...(last ? [{ label: last, enabled: false }] : []),
+    {
+      label: "Start OpenCode",
+      enabled: !busy && view.state !== "running",
+      click: () => void controlFromMenu("start"),
+    },
+    {
+      label: "Restart OpenCode…",
+      enabled: !busy && view.state !== "stopped",
+      click: () => void controlFromMenu("restart"),
+    },
+    {
+      label: "Stop OpenCode…",
+      enabled: !busy && view.state !== "stopped",
+      click: () => void controlFromMenu("stop"),
+    },
+  ];
+};
+
 const updateTray = () => {
   if (!tray) return;
   tray.setImage(trayIcon(trayState.busy));
@@ -1739,6 +1847,8 @@ const updateTray = () => {
           : "Control-Option-Space is taken by another app",
         enabled: false,
       },
+      { type: "separator" },
+      ...openCodeItems(),
       { type: "separator" },
       { label: "Quit open-dot", click: () => app.quit() },
     ]),
@@ -1947,6 +2057,8 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
   slackShown,
   confirmReplace,
   exportArtifact,
+  opencode: (action) =>
+    isServiceAction(action) ? controlOpenCode(action) : { ok: false, error: "Bad command." },
 };
 
 const smokeAnswer = (value: unknown) => process.stdout.write(`SMOKE ${JSON.stringify(value)}\n`);
@@ -1981,6 +2093,7 @@ const smokeDriver = () => {
       }
       if (command.clipboardHold === "text" || command.clipboardHold === "clear")
         fakeClipboard.hold = command.clipboardHold;
+      if (typeof command.confirm === "boolean") smokeConfirm = command.confirm;
       if (command.clipboardRelease === true) {
         fakeClipboard.hold = null;
         for (const done of releaseClipboard.splice(0)) done();
@@ -2046,6 +2159,9 @@ void app.whenReady().then(() => {
   tray.on("click", showWindow);
   shortcutRegistered = globalShortcut.register("Control+Alt+Space", toggleWindow);
   updateTray();
+  // Only reads: whether OpenCode's server runs, for the menu and the Health view.
+  void opencode.status();
+  setInterval(() => void opencode.status(), 60_000);
   window?.webContents.on("did-finish-load", () =>
     emit({ kind: "shortcut", registered: shortcutRegistered }),
   );

@@ -1,8 +1,9 @@
 /** @jsxImportSource react */
-// A dot's Library and the daemon's Health: read-only views. Export only saves a copy where the
-// owner chooses, never previewing or opening it, and nothing here repairs or restarts anything.
+// A dot's Library and the daemon's Health. Export only saves a copy where the owner chooses, never
+// previewing or opening it. Health repairs nothing; its OpenCode server controls run only when the
+// owner clicks them, and main asks first before Restart and Stop.
 import { useCallback, useEffect, useState } from "react";
-import type { Artifact, HealthCheck, HealthReport } from "./bridge";
+import type { Artifact, HealthCheck, HealthReport, ServiceAction, ServiceView } from "./bridge";
 import { ago } from "./surfaces";
 import { bridge, bytes } from "./ui";
 
@@ -184,6 +185,88 @@ const HealthRow = ({ check }: { check: HealthCheck }) => (
   </li>
 );
 
+const serverStates = { running: "Running", stopped: "Stopped", unknown: "Not known" } as const;
+const serverBusy = { start: "Starting…", restart: "Restarting…", stop: "Stopping…" } as const;
+
+/** OpenCode's background server, with the owner's Start, Restart… and Stop…. */
+const OpenCodeServer = () => {
+  const [view, setView] = useState<ServiceView>();
+  const [error, setError] = useState<string>();
+
+  const run = useCallback(async (action: ServiceAction) => {
+    const result = await bridge.opencode(action);
+    if (!result.ok) return setError(result.error);
+    setError(undefined);
+    setView(result.value);
+  }, []);
+
+  useEffect(() => {
+    void run("status");
+    return bridge.onEvent((event) => {
+      if (event.kind === "opencode") setView(event.view);
+    });
+  }, [run]);
+
+  const busy = view?.busy ?? null;
+  return (
+    <section className="pane-section" aria-label="OpenCode server" data-section="opencode">
+      <h3>OpenCode server</h3>
+      <div className="item-line">
+        <span data-opencode-state={view?.state ?? "loading"}>
+          {busy
+            ? serverBusy[busy]
+            : view
+              ? `${serverStates[view.state]}${view.url ? ` at ${view.url}` : ""}`
+              : "Checking…"}
+        </span>
+        {view?.checkedAt ? <span className="note">checked {ago(view.checkedAt)}</span> : null}
+      </div>
+      {view?.problem && !busy ? <div className="note">{view.problem}</div> : null}
+      <div className="pane-tools">
+        <button
+          type="button"
+          disabled={!view || busy !== null || view.state === "running"}
+          onClick={() => void run("start")}
+        >
+          Start
+        </button>
+        <button
+          type="button"
+          disabled={!view || busy !== null || view.state === "stopped"}
+          onClick={() => void run("restart")}
+        >
+          Restart…
+        </button>
+        <button
+          type="button"
+          className="danger"
+          disabled={!view || busy !== null || view.state === "stopped"}
+          onClick={() => void run("stop")}
+        >
+          Stop…
+        </button>
+      </div>
+      <p className="note">
+        Restart and Stop interrupt every running session, your dots and their workers included.
+        open-dot never runs these on its own, and reconnects once OpenCode is back.
+      </p>
+      {error ? (
+        <div className="item-error" role="alert">
+          {error}
+        </div>
+      ) : null}
+      {view?.last ? (
+        <div data-opencode-last={view.last.ok ? "ok" : "failed"}>
+          <div className="note">
+            {`${view.last.action[0]?.toUpperCase()}${view.last.action.slice(1)} ${view.last.ok ? "finished" : "failed"} ${ago(view.last.at)}`}
+          </div>
+          {view.last.output ? <pre className="command-output">{view.last.output}</pre> : null}
+        </div>
+      ) : null}
+    </section>
+  );
+};
+
 export const Health = () => {
   const [report, setReport] = useState<HealthReport>();
   const [error, setError] = useState<string>();
@@ -191,7 +274,7 @@ export const Health = () => {
 
   const check = useCallback(async () => {
     setLoading(true);
-    const result = await bridge.call("health");
+    const [result] = await Promise.all([bridge.call("health"), bridge.opencode("status")]);
     setLoading(false);
     if (!result.ok) return setError(result.error);
     setError(undefined);
@@ -211,6 +294,7 @@ export const Health = () => {
         </div>
       </header>
       <div className="pane-body">
+        <OpenCodeServer />
         <p className="note">The same report as open-dot doctor. Nothing here repairs anything.</p>
         {error ? (
           <div className="item-error" role="alert">
