@@ -1159,8 +1159,11 @@ const hide = (db: Db, dot: Dot, id: string, request: Request, commit: () => bool
     if (id.length > 255) return error(404, "There's no such message in recent history.");
     if (dot.sessionState !== "ready" || body.sessionID !== dot.sessionID)
       return error(409, "The dot's conversation changed. Refresh before deleting.");
-    // Restoring removes only this session's marker; it needs no OpenCode read.
+    // Restoring removes only this session's marker; it needs no OpenCode read. The dot may have
+    // rebound while the request waited for its OpenCode connection.
     if (!body.hidden) {
+      if (rebound(db, dot))
+        return error(409, "The dot's conversation changed. Refresh before restoring.");
       if (!commit()) return newerWrite();
       db.delete(hiddenMessages)
         .where(

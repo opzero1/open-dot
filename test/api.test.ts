@@ -2102,3 +2102,39 @@ test("a write still connecting to OpenCode can't land over a retry and the owner
   expect(hiding.status).toBe(409);
   expect(saved().hidden).toEqual([]);
 });
+
+test("a Restore still connecting to OpenCode refuses once the dot rebinds and keeps the marker", async () => {
+  db.insert(hiddenMessages)
+    .values({ dot: "jojo", sessionID: "ses_jojo", messageID: "msg_answer", hiddenAt: 1 })
+    .run();
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const connected = Promise.withResolvers<void>();
+  let connecting = false;
+  const layer = Layer.effect(
+    OpenCode,
+    Effect.promise(async () => {
+      connecting = true;
+      await connected.promise;
+      return oc;
+    }),
+  );
+  const restoring = api(
+    db,
+    "secret",
+    layer,
+  )(
+    new Request("http://127.0.0.1/dots/jojo/messages/msg_answer/hidden", {
+      method: "PUT",
+      headers: { authorization: "Bearer secret" },
+      body: JSON.stringify({ sessionID: "ses_jojo", hidden: false }),
+    }),
+  );
+  await Bun.sleep(10);
+  expect(connecting).toBe(true);
+  db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  connected.resolve();
+  expect((await restoring).status).toBe(409);
+  expect(db.select().from(hiddenMessages).all()).toMatchObject([
+    { dot: "jojo", sessionID: "ses_jojo", messageID: "msg_answer" },
+  ]);
+});
