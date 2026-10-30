@@ -1675,9 +1675,17 @@ test("the owner's own row brings a forgotten fact back, even with no row left to
     ["owner", "The owner prefers green tea in the afternoon."],
     ["observer", "Owner likes green tea in the afternoon."],
   ]);
-  // The owner's own row keeps no credential either.
-  expect((await add({ text: `Deploy with ghp_${"A1b2".repeat(9)}` })).status).toBe(201);
-  expect(JSON.stringify(rows())).not.toContain("A1b2");
+  // The owner's own row keeps no credential either, even one joined to a word by "_" or "-".
+  const tokens = [
+    `ghp_${"A1b2".repeat(9)}`,
+    "xoxb-1234567890-abcdefghijkl",
+    `sk-proj${"Z9y8".repeat(5)}`,
+  ];
+  for (const token of tokens)
+    for (const text of [`Deploy with ${token}`, `See report_${token}.md`, `notes-${token}`])
+      expect((await add({ text })).status).toBe(201);
+  const stored = JSON.stringify(db.$client.query("SELECT * FROM ledger").all());
+  for (const leak of ["A1b2A1b2", "abcdefghijkl", "Z9y8Z9y8"]) expect(stored).not.toContain(leak);
 });
 
 test("the owner's own edit restating a forgotten fact clears it too", async () => {
