@@ -325,6 +325,8 @@ const segment = (value: string) => encodeURIComponent(value);
 // Sends: an ID-only record is saved before every POST, so a lost answer is looked up, never resent.
 
 const attemptsFile = () => join(app.getPath("userData"), "sends.json");
+// Message IDs whose POST is still out.
+const posting = new Set<string>();
 
 const isAttempt = (value: unknown): value is Attempt =>
   isRecord(value) &&
@@ -419,11 +421,45 @@ const send = async (input: unknown): Promise<SendResult> => {
       "This daemon can't confirm the app's sends. Update and restart open-dot's daemon.",
     );
   const messageID = SessionMessage.ID.create();
+  const attempt = { dot, sessionID, messageID, createdAt: Date.now() };
+  // While the POST is out, receipts can't retire its record: only this send, once it has an
+  // outcome, settles it or hands it on to reconcile.
+  posting.add(messageID);
   try {
-    writeAttempts([...readAttempts(), { dot, sessionID, messageID, createdAt: Date.now() }]);
-  } catch {
-    return refused("Couldn't save the send record, so nothing was sent.");
+    try {
+      writeAttempts([...readAttempts(), attempt]);
+    } catch {
+      return refused("Couldn't save the send record, so nothing was sent.");
+    }
+    const outcome = await post(target, key, attempt, text, replyTo, images);
+    if (outcome.outcome !== "unknown") return outcome;
+    // The answer was lost: ask about this ID at once, which settles it if the daemon has it.
+    const status = await receipt(attempt);
+    if (!status.ok || !settled(status.value)) return outcome;
+    if (status.value === "cancelled")
+      return refused(
+        "open-dot cancelled a message it hadn't confirmed, so it wasn't sent. It's still in the message box.",
+      );
+    return {
+      outcome: "saved",
+      id: messageID,
+      ...(status.value === "held"
+        ? { warning: "open-dot has the message and is holding it until the dot can take it." }
+        : {}),
+    };
+  } finally {
+    posting.delete(messageID);
   }
+};
+
+const post = async (
+  target: Endpoint,
+  key: string,
+  { dot, sessionID, messageID }: Attempt,
+  text: string,
+  replyTo: string | undefined,
+  images: DraftImage[],
+): Promise<SendResult> => {
   const result = await json(
     "POST",
     `/dots/${segment(dot)}/messages`,
@@ -488,10 +524,8 @@ const receipts: readonly unknown[] = [
 ] satisfies ReceiptStatus[];
 const isReceipt = (value: unknown): value is ReceiptStatus => receipts.includes(value);
 
-const reconcile = async (input: unknown): Promise<Result<ReceiptStatus>> => {
-  const messageID = isRecord(input) ? input.messageID : undefined;
-  const attempt = readAttempts().find((known) => known.messageID === messageID);
-  if (!attempt) return { ok: true, value: "unknown" };
+/** The daemon's receipt for a saved attempt, dropping the record once the daemon has it. */
+const receipt = async (attempt: Attempt): Promise<Result<ReceiptStatus>> => {
   const result = await json(
     "GET",
     `/dots/${segment(attempt.dot)}/pending/${segment(attempt.messageID)}?sessionID=${segment(attempt.sessionID)}`,
@@ -501,6 +535,16 @@ const reconcile = async (input: unknown): Promise<Result<ReceiptStatus>> => {
   if (!isReceipt(status)) return { ok: false, error: "The daemon's receipt wasn't understood." };
   if (settled(status)) forgetAttempt(attempt.messageID);
   return { ok: true, value: status };
+};
+
+/** Sends whose answer is lost, not those whose POST is still out. */
+const unresolved = () => readAttempts().filter((attempt) => !posting.has(attempt.messageID));
+
+const reconcile = async (input: unknown): Promise<Result<ReceiptStatus>> => {
+  const messageID = isRecord(input) ? input.messageID : undefined;
+  const attempt = unresolved().find((known) => known.messageID === messageID);
+  if (!attempt) return { ok: true, value: "unknown" };
+  return receipt(attempt);
 };
 
 interface Authoritative {
@@ -865,10 +909,10 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
     });
   },
   send,
-  attempts: () => readAttempts(),
+  attempts: unresolved,
   reconcile,
   forget: (id) => {
-    if (isName(id)) forgetAttempt(id);
+    if (isName(id) && !posting.has(id)) forgetAttempt(id);
   },
   react: (dot, id, sessionID, emoji) => {
     if (!isName(dot) || !isName(id) || !isName(sessionID) || !(emoji === null || isText(emoji, 64)))

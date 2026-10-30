@@ -605,7 +605,10 @@ const App = () => {
     const name = selected;
     const captured = capture(draft);
     if (!captured.text.trim() && !captured.images.length) return;
-    if (unknownHere.length && !sendAnyway) {
+    const unknownSent = [...sentRef.current.values()].some(
+      (item) => item.dot === name && item.state === "unknown",
+    );
+    if ((unknownHere.length || unknownSent) && !sendAnyway) {
       setComposerError(
         name,
         "An earlier message's delivery is still unknown. Check the conversation first, or choose Send anyway.",
@@ -935,7 +938,10 @@ const App = () => {
               {composerError ? (
                 <div className="composer-error" data-composer-error>
                   {composerError}
-                  {unknownHere.length ? (
+                  {unknownHere.length ||
+                  [...sent.values()].some(
+                    (item) => item.dot === selected && item.state === "unknown",
+                  ) ? (
                     <button type="button" onClick={() => setSendAnyway(true)}>
                       Send anyway
                     </button>

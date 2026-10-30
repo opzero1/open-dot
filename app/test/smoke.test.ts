@@ -817,6 +817,47 @@ test("changes to older messages settle by their own reads, stale reads can't und
   );
 }, 170_000);
 
+test("a send whose receipt the daemon has before its POST answers settles when that answer is lost, and nothing resends", async () => {
+  await scenario(
+    "receipt-first",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hi" }];
+    },
+    async ({ fake, js, until, state }) => {
+      await until(`!!t.msg("m1")`, "the first page");
+      // The daemon commits the send at once, so its receipt is known, but holds the POST's answer.
+      fake.onPost = (post) => {
+        if (post.text !== "Lost") return undefined;
+        fake.receipts.set(post.messageID, "sent");
+        fake.pending.push({ id: post.messageID, status: "sent", delivery: "queue" });
+        return new Promise<Response>(() => {});
+      };
+      await js(`t.type("Lost"), t.enter(), true`);
+      for (let tick = 0; tick < 50 && !fake.log.posts.length; tick++) await delay(100);
+      const id = fake.log.posts[0]?.messageID;
+      if (!id) throw new Error("No post.");
+      // Past several of the app's receipt checks: the record stays while its POST is out.
+      await delay(4500);
+      expect((await state()).attempts.map((attempt) => attempt.messageID)).toEqual([id]);
+      expect(fake.log.receipts).toBe(0);
+      // The daemon restarts, dropping the POST's connection: the receipt settles the draft.
+      fake.restart();
+      await until(`t.box().value === ""`, "the draft to settle", 30);
+      expect((await state()).attempts).toEqual([]);
+      expect(fake.log.receipts).toBeGreaterThan(0);
+      expect(
+        await js(`!!document.querySelector("[data-attempt-unknown]") ||
+          !!document.querySelector("[data-composer-error]")?.textContent.includes("Send anyway")`),
+      ).toBe(false);
+      // Return on the empty box sends nothing; the next message sends once.
+      await js(`t.enter(), true`);
+      await js(`t.type("Next"), t.enter(), true`);
+      await until(`t.box().value === ""`, "the next send");
+      expect(fake.log.posts.map((post) => post.text)).toEqual(["Lost", "Next"]);
+    },
+  );
+}, 170_000);
+
 test("Copy and Share are all or nothing, and pending, attachment and worker rows match the notch", async () => {
   const app = await scenario(
     "parity",
