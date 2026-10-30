@@ -93,6 +93,8 @@ const recorded = {
 };
 
 if (process.env.OPEN_DOT_APP_DATA) app.setPath("userData", resolve(process.env.OPEN_DOT_APP_DATA));
+// A normal Dock app otherwise: its icon stays while it runs, hidden or not, and clicking it
+// ("activate") shows the window. Only the hidden smoke test runs without one.
 if (smoke) app.setActivationPolicy("accessory");
 
 const scheme = "app";
@@ -1693,7 +1695,6 @@ const emit = (event: AppEvent) => window?.webContents.send(eventChannel, event);
 
 const showWindow = () => {
   if (!window || smoke) return;
-  app.setActivationPolicy("regular");
   window.show();
   window.focus();
   emit({ kind: "shown" });
@@ -1798,9 +1799,6 @@ const createWindow = () => {
     if (quitting) return;
     event.preventDefault();
     window?.hide();
-  });
-  window.on("hide", () => {
-    if (!smoke) app.setActivationPolicy("accessory");
   });
   void window.loadURL(`${origin}/index.html`);
   if (!startHidden) contents.once("did-finish-load", showWindow);
