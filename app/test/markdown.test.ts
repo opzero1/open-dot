@@ -36,10 +36,12 @@ test("hostile markdown renders no raw HTML, scripts, styles, handlers or unsafe 
   expect(html).toContain('<span class="link-inert">js</span>');
 });
 
-test("remote images never load and become labels", () => {
-  const html = render("![tracker](https://example.com/pixel.png)");
+test("remote images never load: they become labelled links, or labels when unsafe", () => {
+  const html = render("![tracker](https://example.com/pixel.png) ![x](javascript:alert(1))");
   expect(html).not.toContain("<img");
-  expect(html).toContain("[image: tracker]");
+  expect(html).toContain('href="https://example.com/pixel.png"');
+  expect(html).toContain("[image: tracker]</a>");
+  expect(html).toContain('<span class="image-inert">[image: x]</span>');
 });
 
 test("only media the daemon listed for the reply load, and only through it", () => {
@@ -51,15 +53,16 @@ test("only media the daemon listed for the reply load, and only through it", () 
   };
   const html = renderToStaticMarkup(
     createElement(Markdown, {
-      text: `![chart](${url}#top) ![other](https://example.com/other.png) [${url}](${url}) [named](${url})`,
+      text: `![chart](${url}#top) ![other](https://example.com/other.png) [${url}](${url}) [named](${url}) ![ref][c]\n\n[c]: ${url}`,
       media,
     }),
   );
-  // Until it loads, a listed image is a link to its page; the unlisted one stays a label.
+  // Until it loads, a listed image, inline or by reference, is a link to its page; the unlisted
+  // one is a plain link that never loads.
   expect(html).not.toContain("<img");
   expect(html).toContain('data-media="0123456789abcdef"');
-  expect(html.match(/data-media=/g)).toHaveLength(2);
-  expect(html).toContain("[image: other]");
+  expect(html.match(/data-media=/g)).toHaveLength(3);
+  expect(html).toContain('href="https://example.com/other.png"');
 });
 
 test("GitHub-flavored markdown renders headings, lists, task lists, tables and quotes", () => {

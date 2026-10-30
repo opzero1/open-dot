@@ -455,12 +455,15 @@ const RemoteMedia = ({
 }) => {
   const [url, setURL] = useState<string>();
   const [failed, setFailed] = useState(false);
+  // Bytes that passed the daemon's checks can still fail to decode or play: the link comes back.
+  const [broken, setBroken] = useState(false);
   useEffect(() => {
     let live = true;
     let held = 0;
     let made: string | undefined;
     setURL(undefined);
     setFailed(false);
+    setBroken(false);
     void media.load(entry.id).then((result) => {
       if (!live) return;
       const size = result.ok ? result.value.data.byteLength : 0;
@@ -485,12 +488,12 @@ const RemoteMedia = ({
       if (made) URL.revokeObjectURL(made);
     };
   }, [media, entry.id, entry.kind]);
-  if (!url)
+  if (!url || broken)
     return (
       <span
         className="remote-media-pending"
         data-media={entry.id}
-        data-failed={failed || undefined}
+        data-failed={failed || broken || undefined}
       >
         {fallback}
       </span>
@@ -505,7 +508,7 @@ const RemoteMedia = ({
       title={entry.url}
       onClick={() => media.onOpenImage(url)}
     >
-      <img src={url} alt={alt} />
+      <img src={url} alt={alt} onError={() => setBroken(true)} />
     </button>
   ) : (
     <video
@@ -518,6 +521,7 @@ const RemoteMedia = ({
       muted
       playsInline
       preload="metadata"
+      onError={() => setBroken(true)}
     />
   );
 };
@@ -546,6 +550,9 @@ const components: Components = {
         alt={alt ?? ""}
         fallback={<Link href={entry.url}>{label}</Link>}
       />
+    ) : safeExternalURL(src) ? (
+      // Not previewed, such as past the listing cap: still a link, opened outside the app.
+      <Link href={src}>{label}</Link>
     ) : (
       <span className="image-inert">{label}</span>
     );
