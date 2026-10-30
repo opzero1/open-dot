@@ -90,7 +90,12 @@ const usage = `Usage:
   open-dot archive delete <name> <message ID>
                                      Delete one archived message from a dot's memory, once you confirm
   open-dot observation add <name> <text>
-                                     Add your own observed row, such as a fact you forgot and want back, once you confirm`;
+                                     Add your own observed row, such as a fact you forgot and want back, once you confirm
+
+Forgetting: forget an observed row in the notch's Memory view. The observer won't note it again
+from the messages it came from, or with the same text under any topic, but may if you say it again
+in a new message. To erase it completely, forget it and delete its source messages: choose Forget
+and Delete Sources in the notch, or run archive delete for each source message.`;
 
 const [command, ...args] = process.argv.slice(2);
 // Before anything opens the database, which would migrate it: doctor only reads.
