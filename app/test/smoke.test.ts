@@ -89,6 +89,13 @@ class FakeDaemon {
   release: (() => void) | undefined;
   // While set, every other message read waits for it.
   hold: Promise<void> | undefined;
+  // While set, every receipt read waits for it.
+  receiptHold: Promise<void> | undefined;
+  // Other dots, listed after jojo, whose latest page waits for their own hold.
+  others = new Map<
+    string,
+    { messages: FakeMessage[]; hold: Promise<void> | undefined; reads: number }
+  >();
   onPost: ((body: Post) => Response | Promise<Response> | undefined) | undefined;
   onPut: ((id: string, part: string) => Response | Promise<Response> | undefined) | undefined;
   index = 0;
@@ -100,6 +107,7 @@ class FakeDaemon {
     staleCursors: 0,
     olderReads: 0,
     receipts: 0,
+    dotReads: 0,
     // Requests each server instance got, by its number.
     requests: [] as number[],
   };
@@ -159,7 +167,8 @@ class FakeDaemon {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
-    if (path === "/dots")
+    if (path === "/dots") {
+      this.log.dotReads++;
       return Response.json([
         {
           name: "jojo",
@@ -169,7 +178,33 @@ class FakeDaemon {
           workers: this.workers,
           sessions: [],
         },
+        ...[...this.others.keys()].map((name) => ({
+          name,
+          purpose: "Another dot.",
+          busy: false,
+          avatar: null,
+          workers: [],
+          sessions: [],
+        })),
       ]);
+    }
+    const other = /^\/dots\/([^/]+)\/messages$/.exec(path)?.[1];
+    const dot = other ? this.others.get(other) : undefined;
+    if (dot && method === "GET") {
+      dot.reads++;
+      await dot.hold;
+      return Response.json({
+        messages: dot.messages.map((item, at) => ({
+          ...this.view(item, at),
+          sessionID: `ses_${other}`,
+        })),
+        sessionID: `ses_${other}`,
+        next: null,
+        pending: [],
+        recentEmojis: [],
+        clientMessageIDs: true,
+      });
+    }
     if (path === "/dots/jojo/messages" && method === "GET") {
       const before = url.searchParams.get("before");
       const limit = Number(url.searchParams.get("limit") ?? 50);
@@ -244,6 +279,7 @@ class FakeDaemon {
     const receipt = /^\/dots\/jojo\/pending\/([^/]+)$/.exec(path);
     if (receipt?.[1] && method === "GET" && this.capable) {
       this.log.receipts++;
+      await this.receiptHold;
       if (this.failReceipts) return Response.json({ error: "Not now." }, { status: 503 });
       const status = this.receipts.get(receipt[1]) ?? "unknown";
       return Response.json({ id: receipt[1], sessionID: this.sessionID, status });
@@ -1072,6 +1108,80 @@ test("a send saved behind an unreadable answer stays to reconcile by its ID, and
       expect(new Set(fake.log.posts.map((post) => post.messageID)).size).toBe(3);
     },
   );
+}, 170_000);
+
+test("a slow background chat or receipt holds up only itself: the selected chat and the dots keep refreshing", async () => {
+  const { promise: heldB, resolve: releaseB } = Promise.withResolvers<void>();
+  await scenario(
+    "independent",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hi" }];
+      fake.others.set("kiki", {
+        messages: [{ id: "k1", kind: "dot", text: "From kiki" }],
+        hold: heldB,
+        reads: 0,
+      });
+    },
+    async ({ fake, js, until, state }) => {
+      const kiki = fake.others.get("kiki");
+      if (!kiki) throw new Error("No kiki.");
+      await until(`!!t.msg("m1")`, "jojo's first page");
+      for (let tick = 0; tick < 50 && !kiki.reads; tick++) await delay(100);
+      expect(kiki.reads).toBeGreaterThan(0);
+      const busy = `!!document.querySelector('[data-dot="jojo"]')?.hasAttribute("data-busy")`;
+
+      // kiki's read is held: jojo's chat and the dot list still refresh on their own clocks, well
+      // before main gives up on kiki after ten seconds.
+      fake.messages.push({ id: "m2", kind: "dot", text: "Still here" });
+      fake.busy = true;
+      const dotReads = fake.log.dotReads;
+      await until(`!!t.msg("m2")`, "jojo's change while kiki is held", 4);
+      await until(busy, "the sidebar's busy badge while kiki is held", 4);
+      expect(fake.log.dotReads).toBeGreaterThan(dotReads);
+
+      // A send whose receipt read is held: it blocks neither, and isn't asked about twice at once.
+      fake.failReceipts = true;
+      fake.onPost = (post) => {
+        if (post.text !== "Garbled") return undefined;
+        fake.receipts.set(post.messageID, "sent");
+        fake.pending.push({ id: post.messageID, status: "sent", delivery: "queue" });
+        return new Response('{"id":', {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      await js(`t.type("Garbled"), t.enter(), true`);
+      await until(`!!document.querySelector("[data-attempt-unknown]")`, "the unknown send");
+      const { promise: heldReceipt, resolve: releaseReceipt } = Promise.withResolvers<void>();
+      fake.receiptHold = heldReceipt;
+      fake.failReceipts = false;
+      const asked = fake.log.receipts;
+      for (let tick = 0; tick < 200 && fake.log.receipts === asked; tick++) await delay(100);
+      expect(fake.log.receipts).toBe(asked + 1);
+      fake.messages.push({ id: "m3", kind: "dot", text: "And here" });
+      fake.busy = false;
+      await until(`!!t.msg("m3")`, "jojo's change while its receipt is held", 4);
+      await until(`!(${busy})`, "the sidebar while the receipt is held", 4);
+      expect(fake.log.receipts).toBe(asked + 1);
+
+      // Released, each settles: the send by its ID, never resent, and kiki's chat opens.
+      fake.receiptHold = undefined;
+      releaseReceipt();
+      await until(
+        `!document.querySelector("[data-attempt-unknown]")`,
+        "the held receipt to settle",
+        30,
+      );
+      await until(`t.box().value === ""`, "the settled draft to clear");
+      expect((await state()).attempts).toEqual([]);
+      expect(fake.log.posts.map((post) => post.text)).toEqual(["Garbled"]);
+      kiki.hold = undefined;
+      releaseB();
+      await js(`document.querySelector('[data-dot="kiki"]').click(), true`);
+      await until(`!!t.msg("k1")`, "kiki's chat once released", 30);
+    },
+  );
+  releaseB();
 }, 170_000);
 
 test("an older page or error read for a window that's gone is dropped, so history never skips", async () => {

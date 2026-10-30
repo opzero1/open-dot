@@ -296,6 +296,14 @@ const App = () => {
 
   const failures = useRef(new Map<string, number>());
   const due = useRef(new Map<string, number>());
+  // The dot list's and each send receipt's clocks, kept while the scheduler restarts.
+  const clocks = useRef({
+    dots: 0,
+    dotFailures: 0,
+    list: 0,
+    receipts: new Map<string, number>(),
+    receiptFailures: new Map<string, number>(),
+  });
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   const dotsRef = useRef(dots);
@@ -465,72 +473,125 @@ const App = () => {
     [sentRef, setComposerError, setDraft, updateSent],
   );
 
-  const refreshAttempts = useCallback(async () => {
-    const known = await bridge.attempts();
-    for (const attempt of known) {
-      const result = await bridge.reconcile(attempt);
-      if (result.ok) settleSend(attempt, result.value);
-    }
-    setAttempts(await bridge.attempts());
-  }, [settleSend]);
-
   useEffect(() => {
     const run = { stopped: false };
-    let dotsDue = 0;
-    let dotFailures = 0;
-    const tick = async () => {
-      const now = Date.now();
-      if (now >= dotsDue) {
-        dotsDue = Infinity;
-        const result = await bridge.dots();
-        if (result.ok) {
-          dotFailures = 0;
-          dotsDue = Date.now() + 2000;
-          setDots(result.value);
-          setDotsError(undefined);
-          setSelected((current) =>
-            current && result.value.some((item) => item.name === current)
-              ? current
-              : result.value[0]?.name,
-          );
-          await refreshAttempts();
-        } else {
-          dotFailures++;
-          dotsDue = Date.now() + backoff(dotFailures) * 1000;
-          setDotsError(result.error);
+    // The dot list, each conversation and each send's receipt are read on their own clocks. A
+    // key's due time is Infinity while its read is out, so a slow read delays only its own key.
+    const clock = clocks.current;
+    const { receipts: receiptDue, receiptFailures } = clock;
+    const start = (task: () => Promise<void>) => void task().catch(() => {});
+
+    const readDots = async () => {
+      const result = await bridge.dots();
+      if (result.ok) {
+        clock.dotFailures = 0;
+        clock.dots = Date.now() + 2000;
+        setDots(result.value);
+        setDotsError(undefined);
+        setSelected((current) =>
+          current && result.value.some((item) => item.name === current)
+            ? current
+            : result.value[0]?.name,
+        );
+      } else {
+        clock.dotFailures++;
+        clock.dots = Date.now() + backoff(clock.dotFailures) * 1000;
+        setDotsError(result.error);
+      }
+    };
+
+    const readReceipt = async (attempt: Attempt) => {
+      const id = attempt.messageID;
+      const result = await bridge
+        .reconcile(attempt)
+        .catch((): Result<ReceiptStatus> => ({ ok: false, error: "No receipt." }));
+      const failed = result.ok ? 0 : (receiptFailures.get(id) ?? 0) + 1;
+      receiptFailures.set(id, failed);
+      receiptDue.set(id, Date.now() + Math.max(2, backoff(failed)) * 1000);
+      if (result.ok) settleSend(attempt, result.value);
+      setAttempts(await bridge.attempts());
+    };
+
+    const listReceipts = async () => {
+      const known = await bridge.attempts();
+      clock.list = Date.now() + 2000;
+      if (run.stopped) return;
+      setAttempts(known);
+      const open = new Set(known.map((attempt) => attempt.messageID));
+      for (const id of receiptDue.keys())
+        if (!open.has(id)) {
+          receiptDue.delete(id);
+          receiptFailures.delete(id);
         }
-      }
-    };
-    const chats = async () => {
       const now = Date.now();
-      const names = [
-        ...new Set([selectedRef.current, ...dotsRef.current.map((item) => item.name)]),
-      ];
-      await Promise.all(
-        names.map(async (name) => {
-          if (!name || now < (due.current.get(name) ?? 0)) return;
-          due.current.set(name, Infinity);
-          await readChat(name);
-          // Changes whose call returned are settled by reading their own message, which may be
-          // far older than the latest page.
-          for (const [id, intent] of intentsRef.current.get(name) ?? [])
-            if (intent.settledAt !== undefined) await refreshMessage(name, id, intent.sessionID);
-          if (due.current.get(name) === Infinity)
-            due.current.set(name, Date.now() + (name === selectedRef.current ? 1000 : 30_000));
-        }),
-      );
-    };
-    const loop = async () => {
-      while (!run.stopped) {
-        await Promise.all([tick(), chats()]).catch(() => {});
-        await new Promise((done) => setTimeout(done, 250));
+      for (const attempt of known) {
+        if (now < (receiptDue.get(attempt.messageID) ?? 0)) continue;
+        receiptDue.set(attempt.messageID, Infinity);
+        start(async () => {
+          try {
+            await readReceipt(attempt);
+          } finally {
+            if (receiptDue.get(attempt.messageID) === Infinity)
+              receiptDue.set(attempt.messageID, Date.now() + 2000);
+          }
+        });
       }
     };
-    void loop();
+
+    const readConversation = async (name: string) => {
+      try {
+        await readChat(name);
+        // Changes whose call returned are settled by reading their own message, which may be
+        // far older than the latest page.
+        for (const [id, intent] of intentsRef.current.get(name) ?? [])
+          if (intent.settledAt !== undefined) await refreshMessage(name, id, intent.sessionID);
+      } finally {
+        // A read asked for while this one was out (due set to 0) runs next instead of waiting.
+        if (due.current.get(name) === Infinity)
+          due.current.set(name, Date.now() + (name === selectedRef.current ? 1000 : 30_000));
+      }
+    };
+
+    const tick = () => {
+      const now = Date.now();
+      if (now >= clock.dots) {
+        clock.dots = Infinity;
+        start(async () => {
+          try {
+            await readDots();
+          } finally {
+            if (clock.dots === Infinity) clock.dots = Date.now() + 2000;
+          }
+        });
+      }
+      if (now >= clock.list) {
+        clock.list = Infinity;
+        start(async () => {
+          try {
+            await listReceipts();
+          } finally {
+            if (clock.list === Infinity) clock.list = Date.now() + 2000;
+          }
+        });
+      }
+      for (const name of new Set([
+        selectedRef.current,
+        ...dotsRef.current.map((item) => item.name),
+      ])) {
+        if (!name || now < (due.current.get(name) ?? 0)) continue;
+        due.current.set(name, Infinity);
+        start(() => readConversation(name));
+      }
+    };
+    const timer = setInterval(() => {
+      if (!run.stopped) tick();
+    }, 250);
+    tick();
     return () => {
       run.stopped = true;
+      clearInterval(timer);
     };
-  }, [intentsRef, readChat, refreshAttempts, refreshMessage]);
+  }, [intentsRef, readChat, refreshMessage, settleSend]);
 
   useEffect(() => {
     if (selected) due.current.set(selected, 0);
@@ -998,7 +1059,7 @@ const App = () => {
                   run: () =>
                     void bridge.forget(attempt.messageID).then(() => {
                       updateSent((current) => without(current, attempt.messageID));
-                      return refreshAttempts();
+                      return bridge.attempts().then(setAttempts);
                     }),
                 });
               }}
