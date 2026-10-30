@@ -8,9 +8,15 @@ import {
   archiveStatus,
   deleteArchived,
   parseArchiveSettings,
+  recallDefault,
+  recallLimit,
+  recallOffsetLimit,
   saveArchiveSettings,
+  settingsOf,
+  zoom,
 } from "./archive";
 import { avatarRevision, readAvatar } from "./avatar";
+import { recallResults } from "./compose";
 import {
   addObservation,
   editObservation,
@@ -1813,16 +1819,18 @@ const search = (db: Db, dot: string, request: Request) => {
  */
 const archiveRoute = async (db: Db, dot: Dot, request: Request, rawID: string | undefined) => {
   if (rawID !== undefined) {
-    if (request.method !== "DELETE" || new URL(request.url).search) return error(404, "Not found");
+    const missing = error(404, "There's no such archived message for this dot.");
     let messageID: string;
     try {
       messageID = decodeURIComponent(rawID);
     } catch {
       return error(404, "Not found");
     }
+    if (request.method === "GET") return archivedRead(db, dot, request, messageID);
+    if (request.method !== "DELETE" || new URL(request.url).search) return error(404, "Not found");
     return /^msg_[\w-]{1,100}$/.test(messageID) && deleteArchived(db, dot.name, messageID)
       ? new Response(null, { status: 204 })
-      : error(404, "There's no such archived message for this dot.");
+      : missing;
   }
   if (request.method === "PUT") {
     const value = await messageBody(request, 1024).catch(() => undefined);
@@ -1832,6 +1840,69 @@ const archiveRoute = async (db: Db, dot: Dot, request: Request, rawID: string | 
     saveArchiveSettings(db, dot.name, change, Date.now());
   } else if (request.method !== "GET") return error(404, "Not found");
   return Response.json({ ...archiveStatus(db, dot), observerStatus: observerStatus(db, dot) });
+};
+
+/**
+ * `GET …/memory/archive/<message>[?offset=<n>]`: at most 4,000 characters of one archived message
+ * of any of the dot's sessions, from open-dot's database, as data, for the owner's recall search.
+ * 404 while the archive is off. It needs no OpenCode and starts no turn.
+ */
+const archivedRead = (db: Db, dot: Dot, request: Request, messageID: string) => {
+  const query = new URL(request.url).searchParams;
+  const raw = query.get("offset");
+  if (
+    [...query.keys()].some((key) => key !== "offset") ||
+    query.getAll("offset").length > 1 ||
+    (raw !== null && !/^(0|[1-9]\d{0,8})$/.test(raw))
+  )
+    return error(400, "offset must be 0 or more.");
+  if (!/^msg_[\w-]{1,100}$/.test(messageID))
+    return error(404, "There's no such archived message for this dot.");
+  const part = zoom(db, dot, messageID, raw === null ? 0 : Number(raw));
+  if (!("invalid" in part)) return Response.json(part);
+  return part.invalid.startsWith("offset")
+    ? error(400, part.invalid)
+    : error(404, "There's no such archived message for this dot, or its archive is off.");
+};
+
+/**
+ * `GET …/memory/recall?q=<words>[&limit=<1–20>][&offset=<0–200>]`: the owner's recall search, the
+ * same results `dot_recall` gives: notes and, with the archive on, archived messages of any of the
+ * dot's sessions, led on the first page by matching observed rows while the ledger is on, whatever
+ * the compaction mode. It only reads open-dot's database: no model, no OpenCode, no turn.
+ */
+const recallRoute = (db: Db, dot: Dot, request: Request) => {
+  const query = new URL(request.url).searchParams;
+  const usage = error(
+    400,
+    `Send ?q=<words>, and optionally &limit=<1 to ${recallLimit}> and &offset=<0 to ${recallOffsetLimit}>.`,
+  );
+  if (
+    query.getAll("q").length !== 1 ||
+    query.getAll("limit").length > 1 ||
+    query.getAll("offset").length > 1 ||
+    [...query.keys()].some((key) => key !== "q" && key !== "limit" && key !== "offset")
+  )
+    return usage;
+  const rawLimit = query.get("limit");
+  const rawOffset = query.get("offset");
+  const limit = rawLimit === null ? recallDefault : Number(rawLimit);
+  const offset = rawOffset === null ? 0 : Number(rawOffset);
+  if (
+    (rawLimit !== null && (!positive.test(rawLimit) || limit > recallLimit)) ||
+    (rawOffset !== null && (!/^(0|[1-9]\d{0,3})$/.test(rawOffset) || offset > recallOffsetLimit))
+  )
+    return usage;
+  const words = parseSearch(query.get("q"));
+  if ("invalid" in words) return error(400, words.invalid);
+  const found = recallResults(db, dot, words, limit, offset, true);
+  if ("invalid" in found) return error(400, found.invalid);
+  return Response.json({
+    query: words.join(" "),
+    archive: settingsOf(db, dot.name).archive,
+    results: found.results,
+    next: found.next,
+  });
 };
 
 /**
@@ -1991,6 +2062,10 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
   if (kind === "search")
     return rawID === undefined && method === "GET"
       ? search(db, dot.name, request)
+      : error(404, "Not found");
+  if (kind === "recall")
+    return rawID === undefined && method === "GET"
+      ? recallRoute(db, dot, request)
       : error(404, "Not found");
   if (kind === "archive") return archiveRoute(db, dot, request, rawID);
   if (
