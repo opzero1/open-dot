@@ -1,10 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import { BlockList, isIP } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Nodes } from "mdast";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
@@ -59,22 +60,39 @@ export const mediaID = (url: string) => createHash("sha256").update(url).digest(
 const mediaLimit = 8;
 
 /**
- * The media a reply shows inline: its Markdown images, and bare links (text equal to the URL) to
- * an image or video file. Code, HTML and links with their own text are never fetched.
+ * The media a reply shows inline: its Markdown images, inline or by reference, and bare links
+ * (text equal to the URL) to an image or video file. Code, HTML and links with their own text are
+ * never fetched.
  */
 export const mediaLinks = (text: string): MediaLink[] => {
   if (text.length > 200_000 || !text.includes("http")) return [];
+  const tree = fromMarkdown(text, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] });
+  // Reference definitions by their normalized label; the first of a label wins, as in CommonMark.
+  const definitions = new Map<string, string>();
+  const define = (node: Nodes) => {
+    if (node.type === "definition" && !definitions.has(node.identifier))
+      definitions.set(node.identifier, node.url);
+    if ("children" in node) for (const child of node.children) define(child);
+  };
+  define(tree);
   const found = new Map<string, MediaLink>();
   const walk = (node: Nodes) => {
     if (found.size >= mediaLimit) return;
-    if (node.type === "image" || (node.type === "link" && textOf(node) === node.url)) {
-      const url = mediaURL(node.url);
-      const kind = url && (extensionKind(url) ?? (node.type === "image" ? "image" : undefined));
+    const image = node.type === "image" || node.type === "imageReference";
+    const target =
+      node.type === "image" || node.type === "link"
+        ? node.url
+        : node.type === "imageReference" || node.type === "linkReference"
+          ? definitions.get(node.identifier)
+          : undefined;
+    if (target !== undefined && (image || textOf(node) === target)) {
+      const url = mediaURL(target);
+      const kind = url && (extensionKind(url) ?? (image ? "image" : undefined));
       if (url && kind) found.set(url, { id: mediaID(url), url, kind });
     }
     if ("children" in node) for (const child of node.children) walk(child);
   };
-  walk(fromMarkdown(text, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] }));
+  walk(tree);
   return [...found.values()];
 };
 
@@ -97,14 +115,20 @@ for (const [network, prefix] of [
   ["240.0.0.0", 4],
 ] as const)
   private4.addSubnet(network, prefix, "ipv4");
-// Global unicast only. Loopback, link-local, unique-local, mapped IPv4 and NAT64 all fall outside.
+// Global unicast only. Loopback, link-local, unique-local, multicast, mapped IPv4, NAT64 and SRv6
+// all fall outside 2000::/3; inside it, every block IANA's special-purpose registry lists as not
+// globally reachable, or reserved for documentation, is refused too.
 const global6 = new BlockList();
 global6.addSubnet("2000::", 3, "ipv6");
 const special6 = new BlockList();
 for (const [network, prefix] of [
+  // IETF protocol assignments: Teredo, benchmarking, ORCHID and the rest.
   ["2001::", 23],
   ["2001:db8::", 32],
+  // 6to4, which embeds an IPv4 address of any kind.
   ["2002::", 16],
+  // Documentation (RFC 9637).
+  ["3fff::", 20],
 ] as const)
   special6.addSubnet(network, prefix, "ipv6");
 
@@ -324,15 +348,40 @@ export const mediaCache = () => join(home(), "cache", "media");
 
 const cacheName = (url: string) => createHash("sha256").update(url).digest("hex");
 
-/** The cache directory, made private, or undefined when it's anything but a real directory. */
+/** A real, private directory, made when missing; never one reached through a symlink. */
+const realDirectory = async (path: string, make: boolean) => {
+  if (make) await mkdir(path, { mode: 0o700 }).catch(() => {});
+  const info = await lstat(path);
+  return info.isDirectory() && !info.isSymbolicLink();
+};
+
+/**
+ * The cache directory, or undefined unless open-dot's home, its cache and the media cache are
+ * each a real directory, the last one private: a symlink anywhere below home is refused.
+ */
 const cacheDirectory = async () => {
   const directory = mediaCache();
   try {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
+    if (!(await realDirectory(home(), false))) return undefined;
+    if (!(await realDirectory(dirname(directory), true))) return undefined;
+    if (!(await realDirectory(directory, true))) return undefined;
     const info = await lstat(directory);
-    return info.isDirectory() && (info.mode & 0o077) === 0 ? directory : undefined;
+    return (info.mode & 0o077) === 0 ? directory : undefined;
   } catch {
     return undefined;
+  }
+};
+
+/** A cached file's bytes, opened without following a symlink, or undefined. */
+const readCached = async (path: string, limit: number) => {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > limit || Date.now() - info.mtimeMs > cacheLife)
+      return undefined;
+    return await file.readFile();
+  } finally {
+    await file.close();
   }
 };
 
@@ -341,12 +390,11 @@ const cached = async (link: MediaLink): Promise<MediaResult | undefined> => {
   if (!directory) return undefined;
   const path = join(directory, cacheName(link.url));
   try {
-    const info = await lstat(path);
-    if (!info.isFile() || Date.now() - info.mtimeMs > cacheLife) {
+    const bytes = await readCached(path, limits[link.kind]);
+    if (!bytes) {
       await rm(path, { force: true });
       return undefined;
     }
-    const bytes = await readFile(path);
     const type = sniff(bytes);
     return type?.kind === link.kind ? { ok: true, bytes, mime: type.mime } : undefined;
   } catch {
@@ -354,9 +402,15 @@ const cached = async (link: MediaLink): Promise<MediaResult | undefined> => {
   }
 };
 
-/** Drops expired, odd and leftover temporary files, then the oldest past the size or count cap. */
-const evict = async (directory: string) => {
+/**
+ * Drops expired, odd and stale temporary files, then the oldest cached files until everything,
+ * temporary files being written and `reserve` bytes about to be included, fits the size and count
+ * caps.
+ */
+const evict = async (directory: string, reserve = 0) => {
   const entries = [];
+  let total = reserve;
+  let count = reserve ? 1 : 0;
   for (const name of await readdir(directory)) {
     const path = join(directory, name);
     const info = await lstat(path).catch(() => undefined);
@@ -367,13 +421,20 @@ const evict = async (directory: string) => {
       await rm(path, { force: true, recursive: false }).catch(() => {});
       continue;
     }
-    if (!temporary) entries.push({ path, size: info.size, time: info.mtimeMs });
+    if (temporary) {
+      total += info.size;
+      count++;
+    } else entries.push({ path, size: info.size, time: info.mtimeMs });
   }
   entries.sort((a, b) => b.time - a.time);
-  let total = 0;
-  for (const [index, entry] of entries.entries()) {
+  for (const entry of entries) {
     total += entry.size;
-    if (index >= cacheEntries || total > cacheBytes) await rm(entry.path, { force: true });
+    count++;
+    if (count > cacheEntries || total > cacheBytes) {
+      await rm(entry.path, { force: true });
+      total -= entry.size;
+      count--;
+    }
   }
 };
 
@@ -382,6 +443,8 @@ const store = async (link: MediaLink, bytes: Buffer) => {
   if (!directory) return;
   const temporary = join(directory, `.tmp-${randomBytes(8).toString("hex")}`);
   try {
+    // Room first, so the cache never holds more than its caps, even while writing.
+    await evict(directory, bytes.length);
     const file = await open(temporary, "wx", 0o600);
     try {
       await file.writeFile(bytes);

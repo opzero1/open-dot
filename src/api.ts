@@ -1343,6 +1343,7 @@ const mediaRead = (db: Db, dot: Dot, id: string, mediaID: string, request: Reque
         : undefined;
     if (!link) return error(404, "There's no such media.");
     const result = yield* Effect.promise(() => loadMedia(link));
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
     return result.ok
       ? new Response(new Uint8Array(result.bytes), {
           headers: {

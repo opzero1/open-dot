@@ -9,6 +9,8 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { api } from "../src/api";
@@ -111,12 +113,21 @@ test("a reply's images and bare media links are listed, never code, titled links
     ["https://example.com/clip.mp4", "video"],
     ["https://example.com/auto.webm", "video"],
   ]);
+  // Reference images resolve through their definitions, the first of a label winning.
+  expect(
+    mediaLinks(
+      "![chart][x] and [https://e.com/r.webm][v]\n\n[x]: https://e.com/ref.png\n[X]: https://e.com/dup.png\n[v]: https://e.com/r.webm",
+    ).map((entry) => [entry.url, entry.kind]),
+  ).toEqual([
+    ["https://e.com/ref.png", "image"],
+    ["https://e.com/r.webm", "video"],
+  ]);
   const many = Array.from({ length: 12 }, (_, index) => `![${index}](https://e.com/${index}.png)`);
   expect(mediaLinks(many.join(" "))).toHaveLength(8);
 });
 
 test("only public addresses pass, including in IPv6 and mapped forms", () => {
-  for (const address of ["8.8.8.8", "1.1.1.1", "2606:4700::1111"])
+  for (const address of ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "2400:cb00::1"])
     expect(isPublic(address)).toBe(true);
   for (const address of [
     "127.0.0.1",
@@ -136,6 +147,12 @@ test("only public addresses pass, including in IPv6 and mapped forms", () => {
     "64:ff9b::7f00:1",
     "2001:db8::1",
     "2002:7f00:1::",
+    "2001:2::1",
+    "2001:20::1",
+    "3fff::1",
+    "3fff:fff:ffff::1",
+    "ff02::1",
+    "5f00::1",
     "localhost",
   ])
     expect([address, isPublic(address)]).toEqual([address, false]);
@@ -179,6 +196,27 @@ test("private hosts are refused before any connection, and on every redirect", a
   expect(await loadMedia(link("/hop3.png"))).toMatchObject({ ok: false, status: 502 });
 });
 
+test("a host that turns private after it was checked is refused: at the peer and on each hop", async () => {
+  // The address check runs on each resolution and again on the connected peer. Here the host
+  // passes when resolved, then "rebinds" before the peer check.
+  let checks = 0;
+  mediaTesting.allow((address) => address === "127.0.0.1" && ++checks < 2);
+  expect(await loadMedia(link("/ok.png"))).toMatchObject({ ok: false, status: 403 });
+  expect(readdirSync(mediaCache())).toHaveLength(0);
+  // A redirect resolves its host again: once that turns private, the next hop is never fetched.
+  checks = 0;
+  mediaTesting.allow((address) => address === "127.0.0.1" && ++checks < 3);
+  expect(await loadMedia(link("/hop0.png"))).toMatchObject({ ok: false, status: 403 });
+  expect(hits.get("/ok-final.png")).toBeUndefined();
+  // Every address a name resolves to must pass, so one private answer among public ones refuses.
+  const both = `http://localhost:${port}/ok-both.png`;
+  mediaTesting.allow((address) => address === "127.0.0.1");
+  const answers = await lookup("localhost", { all: true, verbatim: true });
+  const answer = await loadMedia({ id: mediaID(both), url: both, kind: "image" });
+  expect(answer.ok).toBe(answers.every((entry) => entry.address === "127.0.0.1"));
+  if (!answer.ok) expect(hits.get("/ok-both.png")).toBeUndefined();
+});
+
 test("oversized, compressed, slow, mislabeled, SVG and HTML responses are refused", async () => {
   expect(await loadMedia(link("/huge.png"))).toMatchObject({ ok: false, status: 413 });
   expect(await loadMedia(link("/gzip.png"))).toMatchObject({ ok: false, status: 415 });
@@ -208,6 +246,47 @@ test("the cache drops leftovers, links and the oldest entries past its cap", asy
   expect(left).not.toContain("old000");
   expect(left).not.toContain(".tmp-left");
   expect(left).not.toContain("link");
+});
+
+test("temporary files count against the cache's caps", async () => {
+  const directory = mediaCache();
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const old = Date.now() / 1000 - 3600;
+  for (let index = 0; index < 98; index++) {
+    const path = join(directory, `old${String(index).padStart(3, "0")}`);
+    writeFileSync(path, png, { mode: 0o600 });
+    utimesSync(path, old + index, old + index);
+  }
+  // Two downloads still being written: fresh, so they stay, and they take room.
+  writeFileSync(join(directory, ".tmp-a"), png);
+  writeFileSync(join(directory, ".tmp-b"), png);
+  expect((await loadMedia(link("/ok-room.png"))).ok).toBe(true);
+  const left = readdirSync(directory);
+  expect(left).toHaveLength(100);
+  expect(left).toContain(".tmp-a");
+  expect(left).not.toContain("old000");
+});
+
+test("a cache reached through a symlink is never written or read", async () => {
+  const elsewhere = mkdtempSync(join(tmpdir(), "open-dot-elsewhere-"));
+  try {
+    symlinkSync(elsewhere, join(home, "cache"));
+    expect((await loadMedia(link("/ok-sym.png"))).ok).toBe(true);
+    expect(readdirSync(elsewhere)).toEqual([]);
+    expect((await loadMedia(link("/ok-sym.png"))).ok).toBe(true);
+    expect(hits.get("/ok-sym.png")).toBe(2);
+    // A cached entry that is a symlink is not followed.
+    rmSync(join(home, "cache"));
+    mkdirSync(mediaCache(), { recursive: true, mode: 0o700 });
+    const target = join(elsewhere, "secret.png");
+    writeFileSync(target, png);
+    const url = `${base}/ok-link.png`;
+    symlinkSync(target, join(mediaCache(), createHash("sha256").update(url).digest("hex")));
+    expect((await loadMedia(link("/ok-link.png"))).ok).toBe(true);
+    expect(hits.get("/ok-link.png")).toBe(1);
+  } finally {
+    rmSync(elsewhere, { recursive: true, force: true });
+  }
 });
 
 test("the daemon serves only media a shown reply lists now", async () => {
