@@ -112,6 +112,8 @@ function save(
   );
 }
 
+const ends = (item: HistoryItem) => item.type === "idle";
+
 /**
  * Whether `item` opens a new prompt, so a model step after it is a turn's first: the idle that
  * ends a turn, the owner's message that starts one, or a compaction that rewrites the prompt.
@@ -124,9 +126,11 @@ const opensTurn = (item: HistoryItem) =>
  * One pass of the usage walk over a dot's bound session, at most ten pages of its public history,
  * oldest first. A new or rebound session is first read to its end without counting, so only
  * steps from then on count. Each finished assistant message is a step, counted on the local day
- * it started; the walk stops before one OpenCode hasn't finished and reads it again next pass. A
- * page that no longer holds the last counted item is passed over uncounted, and a cursor whose item
- * is gone starts the walk afresh, so nothing is ever counted twice.
+ * it started. The walk stops before one OpenCode hasn't finished and reads it again next pass,
+ * unless an idle after it, on this page or a later one, says its turn ended: then it is counted
+ * as it is, once, and the walk goes on. A page that no longer holds the last counted item is
+ * passed over uncounted, and a cursor whose item is gone starts the walk afresh, so nothing is
+ * ever counted twice.
  */
 export const usageDot = (db: Db, name: string) =>
   Effect.gen(function* () {
@@ -135,6 +139,18 @@ export const usageDot = (db: Db, name: string) =>
     if (dot?.sessionState !== "ready") return;
     let row = stateFor(db, dot);
     const seen = new Set(row.cursor ? [row.cursor] : []);
+    /** Whether an idle follows: in `rest`, or on the pages from `next` this pass may still read. */
+    const ended = (rest: readonly HistoryItem[], next: string | undefined, read: number) =>
+      Effect.gen(function* () {
+        if (rest.some(ends)) return true;
+        for (let cursor = next, pages = read; cursor && pages < pagesPerPass; pages++) {
+          const ahead = yield* opencode.historyPage(dot.sessionID, pageLimit, cursor);
+          if (ahead.items.some(ends)) return true;
+          if (!ahead.items.length || ahead.next === cursor) return false;
+          cursor = ahead.next;
+        }
+        return false;
+      });
     for (let pages = 0; pages < pagesPerPass; pages++) {
       const page = yield* opencode.historyPage(dot.sessionID, pageLimit, row.cursor ?? undefined);
       if (!page.items.length) {
@@ -167,15 +183,15 @@ export const usageDot = (db: Db, name: string) =>
       let { last, stepped, streak, streakAt } = row;
       const steps: Step[] = [];
       let stopped = false;
-      for (const item of items) {
+      for (const [index, item] of items.entries()) {
         if (item.type === "assistant") {
           if (counted) {
-            if (!item.complete) {
+            if (!item.complete && !(yield* ended(items.slice(index + 1), page.next, pages + 1))) {
               stopped = true;
               break;
             }
             steps.push({ time: item.time, tokens: item.tokens });
-            if (stepped && item.tokens) {
+            if (stepped && item.complete && item.tokens) {
               const bad = heavy(item.tokens);
               streak = bad ? streak + 1 : 0;
               streakAt = bad ? item.time : null;

@@ -1,4 +1,7 @@
 import { beforeEach, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { api } from "../src/api";
@@ -113,6 +116,42 @@ test("a step OpenCode hasn't finished is counted once it finishes, never before"
   await pass();
   await pass();
   expect(today()).toMatchObject({ steps: 2, output: 107 });
+});
+
+test("an unfinished step whose turn ended, even a page later, is counted once and stops nothing after it, across a restart", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), "open-dot-usage-")), "open-dot.db");
+  const restart = () => {
+    const rows = db.select().from(dots).all();
+    db.$client.close();
+    db = openDatabase(file);
+    if (!db.select().from(dots).get()) db.insert(dots).values(rows).run();
+  };
+  restart();
+  await pass();
+  // The first page ends with a step OpenCode never finishes.
+  add("user");
+  add("assistant", healthy);
+  while (history().length < 199) add("other");
+  add("assistant", { output: 1 }, false);
+  await pass();
+  // Nothing says its turn ended yet, so it may still be running.
+  expect(today()).toMatchObject({ steps: 1, output: 100 });
+  restart();
+  await pass();
+  expect(today()).toMatchObject({ steps: 1, output: 100 });
+
+  // The idle that ends its turn opens the second page, and later turns follow.
+  add("idle");
+  turn(healthy, healthy);
+  turn(regressed, regressed, regressed, regressed);
+  restart();
+  await pass();
+  restart();
+  await pass();
+  await pass();
+  expect(today()).toMatchObject({ steps: 8, output: 100 + 1 + 6 * 100 });
+  expect(dotUsage(db, "jojo", now)).toMatchObject({ streak: 3, alarm: true });
+  db.$client.close();
 });
 
 test("system items inside a turn neither open it again nor hide its heavy steps", async () => {
