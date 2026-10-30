@@ -393,7 +393,14 @@ export interface RunView {
   attribution?: string | null;
   result?: { messageID: string; text: string } | null;
   turn?: { outcome?: string | null; error?: string | null; endedAt?: number | null } | null;
-  workers: { id: number; state: string; task: string; outcome?: string | null }[];
+  workers: {
+    id: number;
+    state: string;
+    task: string;
+    outcome?: string | null;
+    needs?: string[];
+    provisional?: boolean;
+  }[];
   withheldWorkers?: number;
 }
 
@@ -417,6 +424,7 @@ export interface RequestAudit {
   reason?: string | null;
   summary?: string | null;
   createdAt: number;
+  goneAt?: number | null;
 }
 
 export interface RequestPage {

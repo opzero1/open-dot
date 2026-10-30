@@ -7,6 +7,8 @@ import type {
   MemoryResponsibility,
   NoteSourceRead,
   Reply,
+  RequestAudit,
+  RunView,
   Schedule,
   Supervision,
 } from "./bridge";
@@ -211,6 +213,86 @@ export const nextRunLine = (row: MemoryResponsibility, now = Date.now()) => {
   if (row.status !== "active") return `${summary} · paused while ${row.status}`;
   if (row.nextRunAt === null) return `${summary} · next run unknown`;
   return `${summary} · next run ${row.nextRunAt <= now ? "due now" : when(row.nextRunAt)}`;
+};
+
+/** A run's state in words that never say a finished turn met the goal. */
+export const runTitle = (run: Pick<RunView, "state" | "delivery" | "turn">) => {
+  switch (run.state) {
+    case "queued":
+      return run.delivery === "sending" ? "sending, not confirmed" : "queued";
+    case "admitted":
+      return "admitted, not started";
+    case "needs-you":
+      return "needs you";
+    case "finished-turn":
+      return "turn finished, goal not checked";
+    case "failed":
+      return run.turn?.outcome === "interrupted" ? "interrupted" : "failed";
+    case "unknown":
+      return "outcome unknown";
+    default:
+      return run.state;
+  }
+};
+
+/** Still waiting on something, or never to be known. */
+export const runUnresolved = (run: Pick<RunView, "state">) =>
+  run.state !== "finished-turn" && run.state !== "failed";
+
+/** Why a turn that ended shows no reply as this run's result. */
+export const runAttribution = (run: Pick<RunView, "attribution">) =>
+  run.attribution === "shared"
+    ? "Its turn also handled other messages, so no reply is attributed to this run."
+    : run.attribution === "unknown"
+      ? "History didn't show what else its turn handled, so no reply is attributed to this run."
+      : undefined;
+
+export const runWorkerLine = (worker: RunView["workers"][number]) => {
+  const status = worker.needs?.length
+    ? `needs you: ${worker.needs.join(", ")}`
+    : worker.state === "done"
+      ? `finished (${worker.outcome ?? "unknown"})`
+      : worker.state;
+  return `Worker #${worker.id}: ${worker.task} · ${status}`;
+};
+
+/** How far a run's delegated workers are the run's own, and why some aren't shown. */
+export const runWorkersNotes = (run: Pick<RunView, "workers" | "withheldWorkers">) => {
+  const notes: string[] = [];
+  if (run.workers.length)
+    notes.push(
+      run.workers.some((worker) => worker.provisional)
+        ? "Delegated while this run's turn held only its prompt. The turn hasn't ended, so later input may still make these not the run's. A worker's report is evidence, not acceptance."
+        : "Delegated in this run's own turn. A worker's report is evidence, not acceptance.",
+    );
+  const withheld = run.withheldWorkers ?? 0;
+  if (withheld > 0)
+    notes.push(
+      `${withheld} worker${withheld === 1 ? "" : "s"} delegated in this turn ${withheld === 1 ? "isn't" : "aren't"} shown as the run's, because the turn also handled other input or its history was incomplete.`,
+    );
+  return notes;
+};
+
+/** A worker request's state in the audit, in the owner's words. */
+export const requestTitle = (request: Pick<RequestAudit, "state" | "goneAt">) => {
+  switch (request.state) {
+    case "open":
+      return request.goneAt ? "gone unanswered" : "dot handling";
+    case "queued":
+      return "answer queued";
+    case "answering":
+      return "sending";
+    case "answered":
+      return "confirmed";
+    case "unknown":
+      return "outcome unknown";
+    case "stale":
+      return "not sent";
+    case "escalated":
+      return "escalated to you";
+    default:
+      return request.state;
+  }
 };
 
 /**

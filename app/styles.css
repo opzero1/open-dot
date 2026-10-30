@@ -968,6 +968,10 @@ button:disabled {
   font-weight: 600;
 }
 
+.item-title.unresolved {
+  color: var(--warn, #b7791f);
+}
+
 .item-text {
   white-space: pre-wrap;
 }

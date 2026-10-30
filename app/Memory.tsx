@@ -29,6 +29,12 @@ import {
   memoryChange,
   memoryFailure,
   nextRunLine,
+  requestTitle,
+  runAttribution,
+  runTitle,
+  runUnresolved,
+  runWorkerLine,
+  runWorkersNotes,
   sourceSummary,
   supervisionTimes,
 } from "./surfaces";
@@ -351,26 +357,31 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
 
   const runRow = (run: RunView) => (
     <li key={run.id} className="item" data-run={run.id}>
-      <div className="item-title">
-        Run #{run.id} · {run.state}
+      <div className={`item-title${runUnresolved(run) ? " unresolved" : ""}`}>
+        Run #{run.id} · {runTitle(run)}
       </div>
       <div className="note">
         Due {when(run.dueAt)} · claimed {when(run.claimedAt)}
         {run.turn?.endedAt ? ` · ended ${when(run.turn.endedAt)}` : ""}
       </div>
       {run.turn?.error ? <div className="note">{run.turn.error}</div> : null}
+      {runAttribution(run) ? <div className="note">{runAttribution(run)}</div> : null}
       {run.result ? (
         <>
           <div className="note">The start of the dot's last reply in that turn, as its data:</div>
           <pre className="source">{run.result.text}</pre>
         </>
       ) : null}
-      {run.workers.length ? (
-        <div className="note">
-          Workers: {run.workers.map((worker) => `#${worker.id} ${worker.state}`).join(", ")}
-          {run.withheldWorkers ? ` and ${run.withheldWorkers} more` : ""}
+      {run.workers.map((worker) => (
+        <div key={worker.id} className="note">
+          {runWorkerLine(worker)}
         </div>
-      ) : null}
+      ))}
+      {runWorkersNotes(run).map((line) => (
+        <div key={line} className="note">
+          {line}
+        </div>
+      ))}
       <div className="item-actions">
         {[
           ["prompt", run.messageID] as const,
@@ -1355,7 +1366,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
                 {requests.rows.map((request) => (
                   <li key={request.id} className="item" data-request={request.id}>
                     <div className="item-title">
-                      {request.title} · {request.kind} · {request.state}
+                      {request.title} · {request.kind} · {requestTitle(request)}
                       {request.needsYou ? " · needs you" : ""}
                     </div>
                     {request.summary ? <div className="note">{request.summary}</div> : null}
