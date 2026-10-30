@@ -30,7 +30,7 @@ function stateFor(db: Db, dot: Dot): State {
     cursor: null,
     anchor: null,
     last: null,
-    previous: null,
+    stepped: false,
     counting: false,
     streak: 0,
     streakAt: null,
@@ -63,7 +63,7 @@ function save(
   from: State,
   change: Pick<
     State,
-    "cursor" | "anchor" | "last" | "previous" | "counting" | "streak" | "streakAt"
+    "cursor" | "anchor" | "last" | "stepped" | "counting" | "streak" | "streakAt"
   >,
   steps: readonly Step[],
 ) {
@@ -113,6 +113,14 @@ function save(
 }
 
 /**
+ * Whether `item` opens a new prompt, so a model step after it is a turn's first: the idle that
+ * ends a turn, the owner's message that starts one, or a compaction that rewrites the prompt.
+ * System and context announcements, OpenCode's other items, don't.
+ */
+const opensTurn = (item: HistoryItem) =>
+  item.type === "idle" || item.type === "user" || item.type === "compaction";
+
+/**
  * One pass of the usage walk over a dot's bound session, at most ten pages of its public history,
  * oldest first. A new or rebound session is first read to its end without counting, so only
  * steps from then on count. Each finished assistant message is a step, counted on the local day
@@ -143,7 +151,7 @@ export const usageDot = (db: Db, name: string) =>
               cursor: null,
               anchor: null,
               last: null,
-              previous: null,
+              stepped: false,
               counting: false,
             },
             [],
@@ -154,28 +162,32 @@ export const usageDot = (db: Db, name: string) =>
       }
       const at = row.last === null ? -1 : page.items.findIndex((item) => item.id === row.last);
       const passed = row.last !== null && at < 0;
-      let { last, previous, streak, streakAt } = row;
+      const counted = row.counting && !passed;
+      const items = passed ? page.items : page.items.slice(at + 1);
+      let { last, stepped, streak, streakAt } = row;
       const steps: Step[] = [];
       let stopped = false;
-      for (const item of passed ? page.items : page.items.slice(at + 1)) {
-        if (row.counting && !passed && item.type === "assistant") {
-          if (!item.complete) {
-            stopped = true;
-            break;
+      for (const item of items) {
+        if (item.type === "assistant") {
+          if (counted) {
+            if (!item.complete) {
+              stopped = true;
+              break;
+            }
+            steps.push({ time: item.time, tokens: item.tokens });
+            if (stepped && item.tokens) {
+              const bad = heavy(item.tokens);
+              streak = bad ? streak + 1 : 0;
+              streakAt = bad ? item.time : null;
+            }
           }
-          steps.push({ time: item.time, tokens: item.tokens });
-          if (previous === "assistant" && item.tokens) {
-            const bad = heavy(item.tokens);
-            streak = bad ? streak + 1 : 0;
-            streakAt = bad ? item.time : null;
-          }
-        }
+          stepped = true;
+        } else if (opensTurn(item)) stepped = false;
         last = item.id;
-        previous = item.type satisfies HistoryItem["type"];
       }
       const end = page.items.length < pageLimit;
       if (stopped || !page.next) {
-        save(db, row, { ...row, last, previous, streak, streakAt }, steps);
+        save(db, row, { ...row, last, stepped, streak, streakAt }, steps);
         return;
       }
       if (seen.has(page.next)) {
@@ -192,7 +204,7 @@ export const usageDot = (db: Db, name: string) =>
           cursor: page.next,
           anchor: page.items.at(-1)?.id ?? null,
           last: null,
-          previous,
+          stepped,
           counting: row.counting || end,
           streak,
           streakAt,

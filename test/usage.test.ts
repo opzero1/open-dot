@@ -115,6 +115,40 @@ test("a step OpenCode hasn't finished is counted once it finishes, never before"
   expect(today()).toMatchObject({ steps: 2, output: 107 });
 });
 
+test("system items inside a turn neither open it again nor hide its heavy steps", async () => {
+  await pass();
+  // A turn's first step, after system items, stays its first and doesn't count.
+  add("user");
+  add("other");
+  add("assistant", regressed);
+  for (let i = 0; i < 2; i++) {
+    add("other");
+    add("assistant", regressed);
+  }
+  add("idle");
+  await pass();
+  expect(dotUsage(db, "jojo", now)).toMatchObject({ streak: 2, alarm: false });
+});
+
+test("heavy steps each after a system update in one turn raise the alarm, and a compaction opens the prompt again", async () => {
+  await pass();
+  add("user");
+  add("assistant", healthy);
+  for (let i = 0; i < alarmSteps; i++) {
+    add("other");
+    add("assistant", regressed);
+  }
+  await pass();
+  expect(dotUsage(db, "jojo", now)).toMatchObject({ streak: alarmSteps, alarm: true });
+  expect(today()?.steps).toBe(4);
+
+  // A compaction makes the next step rewrite the prompt: it opens the prompt like a turn's first.
+  add("compaction");
+  add("assistant", regressed);
+  await pass();
+  expect(dotUsage(db, "jojo", now)).toMatchObject({ streak: alarmSteps });
+});
+
 test("several heavy steps after a turn's first raise the alarm; first steps neither raise nor clear it", async () => {
   await pass();
   // A turn's first step writes the new input, however much, and doesn't count toward the alarm.

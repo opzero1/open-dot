@@ -390,9 +390,9 @@ export const archiveCursors = sqliteTable("archive_cursors", {
 
 /**
  * How far the usage walk has read a dot's bound session: the cursor its current page starts at,
- * and the last item of that page already counted. `previous` is the type of that item, so the next
- * step knows whether it opens a turn. `streak` counts the latest steps after a turn's first that
- * wrote more to the prompt cache than they read.
+ * and the last item of that page already counted. `stepped` says whether the turn that item is in
+ * has had a model step yet, so the next step knows whether it opens the turn. `streak` counts the
+ * latest steps after a turn's first that wrote more to the prompt cache than they read.
  */
 export const usageState = sqliteTable("usage_state", {
   dot: text()
@@ -403,7 +403,7 @@ export const usageState = sqliteTable("usage_state", {
   // The item the cursor follows, to tell the history's end from a cursor whose item is gone.
   anchor: text(),
   last: text(),
-  previous: text(),
+  stepped: integer({ mode: "boolean" }).notNull().default(false),
   // False until the walk first reaches the end of the history; nothing before that is counted.
   counting: integer({ mode: "boolean" }).notNull().default(false),
   streak: integer().notNull().default(0),

@@ -17,7 +17,7 @@ CREATE TABLE `usage_state` (
 	`cursor` text,
 	`anchor` text,
 	`last` text,
-	`previous` text,
+	`stepped` integer DEFAULT false NOT NULL,
 	`counting` integer DEFAULT false NOT NULL,
 	`streak` integer DEFAULT 0 NOT NULL,
 	`streak_at` integer,
