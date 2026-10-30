@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { simulate, weighted } from "../measure/cache";
 import { arms, type Fixture, fixtureHash, measure, summarizeImport } from "../measure/run";
+import { heavy } from "../src/usage";
 
 const path = join(import.meta.dir, "..", "measure", "synthetic.json");
 const text = readFileSync(path, "utf8");
@@ -132,4 +134,34 @@ test("an import keeps every step's own counters and the plain change in cached t
   });
   // Nothing classifies a step as a cache break.
   expect(JSON.stringify(summary)).not.toMatch(/break|shortfall/i);
+});
+
+test("issue62: with the plugin's tail, every step after a turn's first reads the history and writes only what's new", () => {
+  const scenario = {
+    prefix: 20_000,
+    history: 36_600,
+    owner: 400,
+    tail: 1_500,
+    stepTokens: 3_000,
+    reply: 400,
+    steps: 4,
+  };
+  const steps = simulate(scenario, "before-owner");
+  for (const step of steps.filter((entry) => entry.step > 1)) {
+    expect(step.read).toBeGreaterThan(scenario.prefix + scenario.history);
+    expect(
+      heavy({
+        input: step.uncached,
+        output: 0,
+        reasoning: 0,
+        cacheRead: step.read,
+        cacheWrite: step.write,
+      }),
+    ).toBe(false);
+  }
+  // Putting the tail after the owner's message would save about 0.9 of its tokens a turn, at the
+  // price of the owner's message no longer ending the request.
+  const cost = (placement: "before-owner" | "after-owner") =>
+    simulate(scenario, placement).reduce((sum, step) => sum + weighted(step), 0) / 2;
+  expect(cost("before-owner") - cost("after-owner")).toBeCloseTo(0.9 * scenario.owner, 0);
 });
