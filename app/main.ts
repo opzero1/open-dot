@@ -1216,15 +1216,32 @@ interface Clipboard {
   clear(revision: number): Promise<void>;
 }
 
-const fakeClipboard = { revision: 0, text: "" as string | undefined, reads: 0, clears: 0 };
+const fakeClipboard = {
+  revision: 0,
+  text: "" as string | undefined,
+  reads: 0,
+  clears: 0,
+  // While set, a read or clear of that kind waits until the test lets it go, as a slow helper would.
+  hold: null as "text" | "clear" | null,
+  held: 0,
+};
+const releaseClipboard: (() => void)[] = [];
+const clipboardWait = async (kind: "text" | "clear") => {
+  if (fakeClipboard.hold !== kind) return;
+  fakeClipboard.held++;
+  await new Promise<void>((done) => releaseClipboard.push(done));
+};
 
 const smokeClipboard: Clipboard = {
   revision: async () => fakeClipboard.revision,
   text: async (revision) => {
     fakeClipboard.reads++;
-    return revision === fakeClipboard.revision ? fakeClipboard.text : null;
+    const text = revision === fakeClipboard.revision ? fakeClipboard.text : null;
+    await clipboardWait("text");
+    return text;
   },
   clear: async (revision) => {
+    await clipboardWait("clear");
     if (revision !== fakeClipboard.revision) return;
     fakeClipboard.text = undefined;
     fakeClipboard.revision++;
@@ -1354,6 +1371,8 @@ let held: Held | undefined;
 let pickupNotice: { dot: string; text: string } | undefined;
 let pickupTimer: ReturnType<typeof setInterval> | undefined;
 let pickupBusy = false;
+// Every stop, leave and new arm moves this on, so a look begun before it delivers nothing.
+let pickupGeneration = 0;
 let shownSlack: { dot: string; appID: string | null } | undefined;
 let pickupAvailable = true;
 
@@ -1380,6 +1399,7 @@ const dropHeld = () => {
 /** Ends the pickup and drops a held token, saying why to the dot's view. */
 const endPickup = (said?: string) => {
   const dot = armed?.dot ?? held?.dot;
+  pickupGeneration++;
   armed = undefined;
   dropHeld();
   if (pickupTimer) clearInterval(pickupTimer);
@@ -1429,10 +1449,19 @@ const checkPickup = async () => {
       `No ${pickupNames[pickup.step]} was copied within 2 minutes, so the pickup stopped. Nothing was kept.`,
     );
   pickupBusy = true;
+  const look = pickupGeneration;
+  // Whether this look still stands after an await: no stop, leave, new arm, app change or
+  // timeout came meanwhile. A secret read once it doesn't is dropped, never held or sent.
+  const stands = () =>
+    look === pickupGeneration &&
+    armed === pickup &&
+    shownSlack?.dot === pickup.dot &&
+    (!pickup.appID || shownSlack.appID === pickup.appID) &&
+    Date.now() < pickup.deadline;
   try {
     const board = clipboardFor();
     const revision = await board.revision();
-    if (armed !== pickup) return;
+    if (!stands()) return;
     if (revision === undefined) {
       pickupAvailable = false;
       return endPickup(
@@ -1442,13 +1471,14 @@ const checkPickup = async () => {
     if (revision === pickup.seen) return;
     pickup.seen = revision;
     const copied = await board.text(revision);
-    if (armed !== pickup || copied === null) return;
+    if (!stands() || copied === null) return;
     if (copied === undefined || !tokenMatches(pickup.step, copied, pickup.appID ?? undefined)) {
       pickup.mismatched = true;
       announce();
       return;
     }
     await board.clear(revision);
+    if (!stands()) return;
     armed = undefined;
     if (pickupTimer && !held && pickup.step !== "access" && pickup.step !== "linkBot") {
       clearInterval(pickupTimer);
@@ -1484,6 +1514,7 @@ const checkPickup = async () => {
         const first = held;
         if (!first || first.dot !== dot || first.step !== "linkBot") return endPickup();
         const view = await reply("GET", `/dots/${segment(dot)}/slack`);
+        if (look !== pickupGeneration || held !== first || shownSlack?.dot !== dot) return;
         const bound =
           view.ok && isRecord(view.value) && isRecord(view.value.app) ? view.value.app : undefined;
         const boundID =
@@ -1555,6 +1586,8 @@ const armPickup = async (dot: unknown, step: unknown, appID: unknown): Promise<P
     return pickupState();
   const chosen = step;
   if (shownSlack?.dot !== dot) return pickupState();
+  // Any look still out for an earlier arm delivers nothing.
+  const look = ++pickupGeneration;
   if ((chosen === "bot" || chosen === "app") && !appID) return pickupState();
   const after = pickupAfter(chosen);
   if (
@@ -1571,6 +1604,7 @@ const armPickup = async (dot: unknown, step: unknown, appID: unknown): Promise<P
   }
   if (!after) dropHeld();
   const revision = await clipboardFor().revision();
+  if (look !== pickupGeneration || shownSlack?.dot !== dot) return pickupState();
   if (revision === undefined) {
     pickupAvailable = false;
     endPickup("The app can't watch the clipboard here, so pickup is off. Use the secure fields.");
@@ -1623,7 +1657,19 @@ const confirmReplace = (dot: unknown, appID: unknown, replace: unknown): PickupS
 const slackShown = (dot: unknown, appID: unknown) => {
   shownSlack = isName(dot) && (appID === null || isSlackAppID(appID)) ? { dot, appID } : undefined;
   if (pickupNotice && pickupNotice.dot !== shownSlack?.dot) pickupNotice = undefined;
-  if (armed || held) void checkPickup();
+  // Leaving the view, or the dot's app changing, ends the pickup now, even while a look is out.
+  const left =
+    (armed &&
+      (shownSlack?.dot !== armed.dot ||
+        (armed.appID !== null && shownSlack.appID !== armed.appID))) ||
+    (held && shownSlack?.dot !== held.dot);
+  if (left)
+    endPickup(
+      armed && shownSlack?.dot === armed.dot
+        ? "The dot's app changed, so the pickup stopped. Nothing was kept."
+        : leftView,
+    );
+  else if (armed || held) void checkPickup();
 };
 
 // The Library: a file downloads by its ID, checks against the size and digest its listing gave,
@@ -1980,6 +2026,12 @@ const smokeDriver = () => {
       if (typeof command.clipboard === "string") {
         fakeClipboard.text = command.clipboard;
         fakeClipboard.revision++;
+      }
+      if (command.clipboardHold === "text" || command.clipboardHold === "clear")
+        fakeClipboard.hold = command.clipboardHold;
+      if (command.clipboardRelease === true) {
+        fakeClipboard.hold = null;
+        for (const done of releaseClipboard.splice(0)) done();
       }
       const value =
         typeof command.eval === "string"
