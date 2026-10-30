@@ -73,6 +73,7 @@ import {
   OpenCode,
   type Entry,
   OpenCodeError,
+  jsonBytes,
   type ToolCall,
   type WorkItem,
 } from "./opencode";
@@ -849,7 +850,7 @@ const encodeCursor = (token: string, dot: Dot, cursor: string) => {
 };
 
 const decodeCursor = (token: string, value: string): string[] | undefined => {
-  if (value.length > 8192 || !/^[\w-]+\.[\w-]{43}$/.test(value)) return undefined;
+  if (value.length > 12_000 || !/^[\w-]+\.[\w-]{43}$/.test(value)) return undefined;
   const [body, signature] = value.split(".");
   if (
     !body ||
@@ -883,94 +884,156 @@ export interface WorkCounts {
   total: number;
 }
 
+/**
+ * Where a turn's unlisted calls continue, older than every call listed so far: first the calls
+ * still left in some messages, read one by one, then the pages upstream of them, back to the idle
+ * before the turn. Signed before it leaves the daemon.
+ */
+export interface WorkPosition {
+  /** Each message still holding unlisted calls, newest first, with how many of its first calls. */
+  q: [string, number][];
+  /** OpenCode's cursor to the pages older than those messages, or null when the turn starts there. */
+  c: string | null;
+  /** True once the turn is known to be partial, as when OpenCode compacted history inside it. */
+  p: boolean;
+}
+
 export interface WorkLog {
   /** The message the log goes beneath, or null for a running turn with no reply yet. */
   anchor: string | null;
-  /** The newest calls, oldest first, at most `workCallLimit`. */
+  /** The turn's newest calls, oldest first, as many as the response's budget holds. */
   calls: ToolCall[];
-  omitted: number;
+  /** Counts of every call the read saw, listed or not. */
   counts: WorkCounts;
-  /** False when the turn's start is out of sight, so the counts are a lower bound. */
+  /** False when the turn's start is out of sight or history was compacted inside it. */
   complete: boolean;
   /** True while no idle has ended the turn. */
   open: boolean;
-  /** An upstream cursor that continues to the turn's older calls; signed before it leaves. */
-  more: string | null;
+  /** Where the older calls continue; null when every call is listed. */
+  more: WorkPosition | null;
 }
 
-export const workCallLimit = 100;
+/** A response lists at most this many calls of one turn, in at most this many bytes in all. */
+export const workCallLimit = 50;
+export const workByteLimit = 256 * 1024;
 const workPageLimit = 20;
+/** The most messages one work read fetches one by one. */
+const workMessageReads = 10;
 
 const callKey = (call: ToolCall) => `${call.messageID}\0${call.callID}`;
 
-/** Counts of every call, not only the listed ones. */
-export const workCounts = (calls: readonly ToolCall[]): WorkCounts => {
-  const edited = new Set<string>();
-  for (const call of calls)
-    if (call.status === "done" && editTools.has(call.name))
-      for (const file of call.files) edited.add(file.path);
-  return {
-    commands: calls.filter((call) => commandTools.has(call.name)).length,
-    edits: calls.filter((call) => editTools.has(call.name)).length,
-    edited: edited.size,
-    failed: calls.filter((call) => call.status === "error").length,
-    total: calls.length,
+/** Room for calls in one response: each listed call's JSON counts against `workByteLimit`. */
+const callBudget = () => {
+  let bytes = workByteLimit;
+  return (call: ToolCall, listed: number) => {
+    const size = jsonBytes(call);
+    if (listed >= workCallLimit || size > bytes) return false;
+    bytes -= size;
+    return true;
   };
 };
 
-const uniqueCalls = (items: readonly WorkItem[]) => {
+/** Counts of the calls given, each counted once, and each edited path once. */
+export const workCounts = (calls: readonly ToolCall[]): WorkCounts => {
   const seen = new Set<string>();
-  return items
-    .flatMap((item) => (item.type === "message" ? item.calls : []))
-    .filter((call) => !seen.has(callKey(call)) && seen.add(callKey(call)));
+  const unique = calls.filter((call) => !seen.has(callKey(call)) && seen.add(callKey(call)));
+  const edited = new Set<string>();
+  for (const call of unique)
+    if (call.status === "done" && editTools.has(call.name))
+      for (const file of call.files) edited.add(file.path);
+  return {
+    commands: unique.filter((call) => commandTools.has(call.name)).length,
+    edits: unique.filter((call) => editTools.has(call.name)).length,
+    edited: edited.size,
+    failed: unique.filter((call) => call.status === "error").length,
+    total: unique.length,
+  };
 };
 
+/** One page of history as a read traversed it: its items, oldest first, and OpenCode's next cursor. */
+export interface Traversed {
+  items: readonly WorkItem[];
+  next: string | undefined;
+}
+
+type Message = Extract<WorkItem, { type: "message" }>;
+
 /**
- * The logs of the turns whose end the items show, in order: a turn ends at an idle, or, on the
+ * The logs of the turns whose end the pages show, in order: a turn ends at an idle, or, on the
  * latest page, is still open. A turn whose end lies on a newer page is that page's to show.
- * `startKnown` says whether the first item begins a turn.
+ * `pages` run oldest first; `startKnown` says whether the first item begins a turn. Each log lists
+ * its newest calls within one shared budget, newest turn first, and says where the rest continue.
  */
 export const groupWork = (
-  items: readonly WorkItem[],
+  pages: readonly Traversed[],
   { startKnown, latest }: { startKnown: boolean; latest: boolean },
 ): WorkLog[] => {
-  const turns: { items: WorkItem[]; start: boolean; end: boolean }[] = [];
-  let current: WorkItem[] = [];
+  const turns: { items: { item: WorkItem; page: number }[]; start: boolean; end: boolean }[] = [];
+  let current: { item: WorkItem; page: number }[] = [];
   let start = startKnown;
-  for (const item of items) {
-    if (item.type !== "idle") {
-      current.push(item);
-      continue;
+  for (const [page, { items }] of pages.entries())
+    for (const item of items) {
+      if (item.type !== "idle") {
+        current.push({ item, page });
+        continue;
+      }
+      turns.push({ items: current, start, end: true });
+      current = [];
+      start = true;
     }
-    turns.push({ items: current, start, end: true });
-    current = [];
-    start = true;
-  }
   if (current.length) turns.push({ items: current, start, end: false });
-  return turns.flatMap((turn) => {
+  const fits = callBudget();
+  const logs = turns.toReversed().flatMap((turn): WorkLog[] => {
     if (!turn.end && !latest) return [];
-    const calls = uniqueCalls(turn.items);
-    if (!calls.length) return [];
-    const shown = turn.items.filter(
-      (item): item is Extract<WorkItem, { type: "message" }> =>
-        item.type === "message" && item.shown,
+    const messages = turn.items.filter(
+      (entry): entry is { item: Message; page: number } => entry.item.type === "message",
     );
-    const anchor =
-      shown.findLast((item) => item.role === "assistant")?.id ?? shown.at(-1)?.id ?? null;
+    const seen = new Set<string>();
+    const calls = messages.flatMap(({ item }) =>
+      item.calls.filter((call) => !seen.has(callKey(call)) && seen.add(callKey(call))),
+    );
+    const shown = messages.filter(({ item }) => item.shown).map(({ item }) => item);
+    const reply = shown.findLast((item) => item.role === "assistant");
+    const anchor = reply?.id ?? shown.at(-1)?.id ?? null;
+    const first = turn.items[0];
+    // A cut turn's reply may follow calls on older pages, so it gets a log to load them by.
+    if (!calls.length && (turn.start || !reply || !first)) return [];
     if (!anchor && turn.end) return [];
-    const listed = calls.slice(-workCallLimit);
+    const partial = turn.items.some(({ item }) => item.type === "compaction");
+    let from = calls.length;
+    while (from > 0) {
+      const call = calls[from - 1];
+      if (!call || !fits(call, calls.length - from)) break;
+      from--;
+    }
+    const listed = new Set(calls.slice(from).map(callKey));
+    const unlisted = calls[from - 1];
+    let more: WorkPosition | null = null;
+    if (unlisted) {
+      // The rest start in the page of the newest unlisted call: its messages there, then upstream.
+      const at = messages.find(({ item }) => item.id === unlisted.messageID)?.page ?? 0;
+      const q: [string, number][] = [];
+      for (const { item, page } of messages.toReversed()) {
+        if (page !== at || q.some(([id]) => id === item.id)) continue;
+        const shownFrom = item.calls.findIndex((call) => listed.has(callKey(call)));
+        const left = shownFrom < 0 ? item.calls.length : shownFrom;
+        if (left > 0) q.push([item.id, left]);
+      }
+      const upstream = turn.start && first?.page === at ? null : (pages[at]?.next ?? null);
+      more = { q, c: upstream, p: partial };
+    } else if (!turn.start) more = { q: [], c: pages[0]?.next ?? null, p: partial };
     return [
       {
         anchor,
-        calls: listed,
-        omitted: calls.length - listed.length,
+        calls: calls.slice(from),
         counts: workCounts(calls),
-        complete: turn.start,
+        complete: turn.start && !partial,
         open: !turn.end,
-        more: null,
+        more: more && (more.q.length || more.c) ? more : null,
       },
     ];
   });
+  return logs.toReversed();
 };
 
 /** Items after the page's last idle, and whether it had one: the tail of a turn read backwards. */
@@ -991,13 +1054,14 @@ const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
     let next = cursor;
     let visible = 0;
     const entries: Entry[] = [];
-    let work: WorkItem[] = [];
+    // Newest page first while reading; the work log takes them oldest first.
+    const pages: Traversed[] = [];
     const visited = new Set<string>();
     for (let reads = 0; reads < 10; reads++) {
       if (next) visited.add(next);
       const page = yield* oc.messagePage(dot.sessionID, limit - visible, next);
       if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
-      work = [...(page.work ?? []), ...work];
+      pages.push({ items: page.work ?? [], next: page.next });
       // Attachments are loaded separately; never retain their base64 bytes in the latest cache.
       entries.unshift(
         ...page.entries.map((entry) => ({
@@ -1010,24 +1074,33 @@ const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
       if (next && visited.has(next)) return error(502, "History cursor did not advance.");
       if (!next || visible >= limit) break;
     }
-    // A turn cut by the page's start: read back at most two more pages to find where it began.
+    // A turn cut by the page's start: read back at most two more pages to find where it began,
+    // when its part in sight has calls or a reply that their log would go beneath.
     let startKnown = !next;
     let more: string | undefined = next;
-    const firstIdle = work.findIndex((item) => item.type === "idle");
-    if (more && uniqueCalls(firstIdle < 0 ? work : work.slice(0, firstIdle)).length)
+    const window = pages.toReversed().flatMap((page) => page.items);
+    const firstIdle = window.findIndex((item) => item.type === "idle");
+    const cut = firstIdle < 0 ? window : window.slice(0, firstIdle);
+    if (
+      more &&
+      cut.some(
+        (item) =>
+          item.type === "message" &&
+          (item.calls.length > 0 || (item.role === "assistant" && item.shown)),
+      )
+    )
       for (let reads = 0; reads < 2 && more && !startKnown; reads++) {
         const earlier: { work?: readonly WorkItem[]; next: string | undefined } =
           yield* oc.messagePage(dot.sessionID, workPageLimit, more);
         if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+        if (earlier.next && earlier.next === more)
+          return error(502, "History cursor did not advance.");
         const tail = afterIdle(earlier.work ?? []);
-        work = [...tail.items, ...work];
+        pages.push({ items: tail.items, next: earlier.next });
         startKnown = tail.found || !earlier.next;
         more = earlier.next;
       }
-    const logs = groupWork(work, { startKnown, latest: cursor === undefined });
-    const first = logs[0];
-    // Only the first turn can start out of sight.
-    if (first && !first.complete) first.more = more ?? null;
+    const logs = groupWork(pages.toReversed(), { startKnown, latest: cursor === undefined });
     return { entries, next, work: logs };
   });
 
@@ -1071,10 +1144,11 @@ const conversation = (
     return Response.json({
       messages: visibleMessages(db, dot, entries),
       // Each turn's tool calls, beneath the message named by `anchor`.
-      work: page.work.map((log) => ({
-        ...log,
-        more: log.more ? encodeCursor(token, dot, `${workScope}${log.more}`) : null,
-      })),
+      work: page.work.map((log) => {
+        const more = log.more && encodeWork(token, dot, log.more);
+        // A position too long to carry is withheld, and the log says it is partial.
+        return { ...log, more, complete: log.complete && (more !== null || log.more === null) };
+      }),
       sessionID: dot.sessionID,
       next: next ? encodeCursor(token, dot, next) : null,
       pending: pendingSends(db, dot, entries),
@@ -1088,6 +1162,39 @@ const conversation = (
 
 /** A work cursor's upstream value starts with this, so no conversation read accepts one. */
 const workScope = "work:";
+/** A work cursor longer than this is withheld, and its log says it is partial instead. */
+const workCursorLimit = 12_000;
+
+const encodeWork = (token: string, dot: Dot, position: WorkPosition) => {
+  const value = encodeCursor(token, dot, `${workScope}${JSON.stringify(position)}`);
+  return value.length <= workCursorLimit ? value : null;
+};
+
+const isQueued = (entry: unknown): entry is [string, number] =>
+  Array.isArray(entry) &&
+  entry.length === 2 &&
+  typeof entry[0] === "string" &&
+  entry[0].length > 0 &&
+  entry[0].length <= 255 &&
+  typeof entry[1] === "number" &&
+  Number.isSafeInteger(entry[1]) &&
+  entry[1] > 0;
+
+/** A signed work cursor's position, checked field by field. */
+const decodeWork = (value: string): WorkPosition | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(value.slice(workScope.length));
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    if (!("q" in parsed) || !("c" in parsed) || !("p" in parsed)) return undefined;
+    const { q, c, p } = parsed;
+    if (!Array.isArray(q) || q.length > 200 || typeof p !== "boolean") return undefined;
+    if (c !== null && (typeof c !== "string" || !c)) return undefined;
+    const queued = q.filter(isQueued);
+    return queued.length === q.length ? { q: queued, c, p } : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 /** The one `sessionID` parameter a read takes, or undefined when the query has anything else. */
 const onlySession = (request: Request, extra: readonly string[] = []) => {
@@ -1103,8 +1210,9 @@ const onlySession = (request: Request, extra: readonly string[] = []) => {
 };
 
 /**
- * Earlier calls of a turn whose start the conversation's log didn't reach, read back at most two
- * pages from a signed work cursor and stopping at the idle before the turn.
+ * A turn's older calls from a signed work cursor: the calls left in the messages it names, read
+ * one by one, then at most two upstream pages, stopping at the idle before the turn. As many as
+ * one response's budget holds, with a cursor to the rest, so every call is reachable.
  */
 const workContinuation = (db: Db, dot: Dot, request: Request, token: string) =>
   Effect.gen(function* () {
@@ -1112,35 +1220,91 @@ const workContinuation = (db: Db, dot: Dot, request: Request, token: string) =>
     const raw = new URL(request.url).searchParams.get("cursor");
     if (!sessionID || !raw) return error(400, "Use the log's sessionID and cursor.");
     const cursor = decodeCursor(token, raw);
-    if (!cursor || cursor[0] !== dot.name || !cursor[2]?.startsWith(workScope))
-      return error(400, "Invalid work cursor. Refresh.");
+    const position =
+      cursor && cursor[0] === dot.name && cursor[2]?.startsWith(workScope)
+        ? decodeWork(cursor[2])
+        : undefined;
+    if (!cursor || !position) return error(400, "Invalid work cursor. Refresh.");
     if (dot.sessionState !== "ready" || sessionID !== dot.sessionID || cursor[1] !== dot.sessionID)
       return error(409, "The dot's conversation changed. Refresh.");
     const oc = yield* OpenCode;
-    let more: string | undefined = cursor[2].slice(workScope.length);
-    let items: WorkItem[] = [];
-    let complete = false;
-    for (let reads = 0; reads < 2 && more && !complete; reads++) {
-      const page: { work?: readonly WorkItem[]; next: string | undefined } = yield* oc.messagePage(
-        dot.sessionID,
-        workPageLimit,
-        more,
-      );
+    const fits = callBudget();
+    // Newest first while reading.
+    const listed: ToolCall[] = [];
+    const seen = new Set<string>();
+    const budget = { full: false };
+    let partial = position.p;
+    // Lists a message's calls newest first while they fit, and says how many are left.
+    const take = (calls: readonly ToolCall[]) => {
+      let left = calls.length;
+      for (; left > 0; left--) {
+        const call = calls[left - 1];
+        if (!call || seen.has(callKey(call))) continue;
+        if (!fits(call, listed.length)) {
+          budget.full = true;
+          break;
+        }
+        seen.add(callKey(call));
+        listed.push(call);
+      }
+      return left;
+    };
+    const queue = position.q.map(([id, left]): [string, number] => [id, left]);
+    for (let reads = 0; queue.length && !budget.full && reads < workMessageReads; reads++) {
+      const [id, end] = queue[0] ?? ["", 0];
+      const item = yield* oc.workItem({ sessionID, messageID: id });
       if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
-      const tail = afterIdle(page.work ?? []);
-      items = [...tail.items, ...items];
-      complete = tail.found || !page.next;
-      more = page.next;
+      // A message gone or shorter than before: history changed, so the log can't be whole.
+      if (item?.type !== "message" || item.calls.length < end) {
+        partial = true;
+        queue.shift();
+        continue;
+      }
+      const left = take(item.calls.slice(0, end));
+      if (left) queue[0] = [id, left];
+      else queue.shift();
     }
-    const calls = uniqueCalls(items);
-    const listed = calls.slice(-50);
-    return Response.json({
-      calls: listed,
-      omitted: calls.length - listed.length,
-      counts: workCounts(calls),
-      complete,
-      more: !complete && more ? encodeCursor(token, dot, `${workScope}${more}`) : null,
-    });
+    let next = position.c;
+    let started = next === null;
+    for (let reads = 0; !queue.length && !budget.full && next && reads < 2; reads++) {
+      const page = yield* oc.messagePage(sessionID, workPageLimit, next);
+      if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+      if (page.next && page.next === next) return error(502, "History cursor did not advance.");
+      const items = (page.work ?? []).toReversed();
+      const idle = items.findIndex((item) => item.type === "idle");
+      const turn = idle < 0 ? items : items.slice(0, idle);
+      if (turn.some((item) => item.type === "compaction")) partial = true;
+      started = idle >= 0 || !page.next;
+      next = started ? null : (page.next ?? null);
+      for (const [index, item] of turn.entries()) {
+        if (item.type !== "message" || !item.calls.length) continue;
+        const left = take(item.calls);
+        if (!left) continue;
+        queue.push(
+          [item.id, left],
+          ...turn
+            .slice(index + 1)
+            .flatMap((rest): [string, number][] =>
+              rest.type === "message" && rest.calls.length ? [[rest.id, rest.calls.length]] : [],
+            ),
+        );
+        break;
+      }
+    }
+    const more =
+      queue.length || next ? encodeWork(token, dot, { q: queue, c: next, p: partial }) : null;
+    const withheld = (queue.length > 0 || next !== null) && more === null;
+    const calls = listed.toReversed();
+    return Response.json(
+      {
+        calls,
+        // These calls' own counts; the app counts the whole turn from every call it holds.
+        counts: workCounts(calls),
+        complete: !more && !withheld && started && !partial,
+        more,
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
   });
 
 /** One tool call in full: redacted and bounded in the daemon, shown as text by the app. */

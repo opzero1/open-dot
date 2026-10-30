@@ -149,6 +149,59 @@ export const connect = ({ url, auth }: Endpoint) =>
     ),
   );
 
+/** Refused when OpenCode's answer to a bounded read grows past its byte limit. */
+class TooLarge extends Error {}
+
+/** The client's fetch, refusing an answer over `limit` bytes, counted as it arrives. */
+const cappedFetch = (inner: typeof globalThis.fetch, limit: number): typeof globalThis.fetch =>
+  Object.assign(
+    async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const response = await inner(input, init);
+      if (Number(response.headers.get("content-length") ?? 0) > limit) {
+        await response.body?.cancel();
+        throw new TooLarge(`OpenCode's answer is over ${limit} bytes`);
+      }
+      if (!response.body) return response;
+      let seen = 0;
+      const body = response.body.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            seen += chunk.byteLength;
+            if (seen > limit)
+              controller.error(new TooLarge(`OpenCode's answer is over ${limit} bytes`));
+            else controller.enqueue(chunk);
+          },
+        }),
+      );
+      return new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    },
+    { preconnect: inner.preconnect },
+  );
+
+/**
+ * Bounds one read of OpenCode: its answer to `bytes` and the whole read, connecting included, to
+ * `seconds`. The work log, a call's detail and live activity read this way.
+ */
+export const boundRead =
+  (bytes: number, seconds: number) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const inner = yield* FetchHttpClient.Fetch;
+      return yield* effect.pipe(
+        Effect.provideService(FetchHttpClient.Fetch, cappedFetch(inner, bytes)),
+        Effect.timeout(`${seconds} seconds`),
+      );
+    });
+
+/** The bounds of a page of history, of one message, and of the short read live activity takes. */
+export const pageBounds = boundRead(64 * 1024 * 1024, 20);
+export const messageBounds = boundRead(16 * 1024 * 1024, 10);
+export const activityBounds = boundRead(8 * 1024 * 1024, 5);
+
 export interface SessionInput {
   readonly id: string;
   readonly directory: string;
@@ -476,6 +529,8 @@ export interface ToolDetail extends ToolCall {
  */
 export type WorkItem =
   | { readonly type: "idle"; readonly id: string }
+  /** OpenCode summarized history here, so a turn holding it may be missing calls. */
+  | { readonly type: "compaction"; readonly id: string }
   | { readonly type: "other"; readonly id: string }
   | {
       readonly type: "message";
@@ -494,7 +549,11 @@ export interface Activity {
 }
 
 export const labelLimit = 160;
+/** The most bytes of one call's input or output, as JSON, that a detail read returns. */
 export const detailLimit = 64 * 1024;
+/** A path is cut to this many characters, and a call lists at most this many files. */
+const pathLimit = 256;
+const fileLimit = 50;
 // A field larger than this is left out whole rather than redacted and cut: a cut could split a
 // secret so that redaction misses it.
 const sourceLimit = 1024 * 1024;
@@ -502,11 +561,31 @@ const sourceLimit = 1024 * 1024;
 const cut = (text: string, limit: number) =>
   text.length > limit ? { text: `${text.slice(0, limit)}…`, cut: true } : { text, cut: false };
 
+/** The bytes a string takes inside a JSON response, quotes and escapes included. */
+export const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+
+/**
+ * The longest start of `text` whose JSON form, with a closing ellipsis, fits `limit` bytes; never
+ * splitting a surrogate pair.
+ */
+const fitBytes = (text: string, limit: number) => {
+  if (jsonBytes(text) <= limit) return { text, cut: false };
+  let low = 0;
+  let high = Math.min(text.length, limit);
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (jsonBytes(`${text.slice(0, mid)}…`) <= limit) low = mid;
+    else high = mid - 1;
+  }
+  const end = /[\uD800-\uDBFF]/.test(text.charAt(low - 1)) ? low - 1 : low;
+  return { text: `${text.slice(0, end)}…`, cut: true };
+};
+
 /** A short, redacted, single-line label. */
-const short = (value: unknown) => {
+const short = (value: unknown, limit = labelLimit) => {
   if (typeof value !== "string" || value.length > sourceLimit) return "";
   const line = redact(value).trim().split("\n")[0] ?? "";
-  return cut(line, labelLimit).text;
+  return cut(line, limit).text;
 };
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -551,11 +630,14 @@ type ToolPart = Extract<
   { type: "tool" }
 >;
 
-/** The file diffs OpenCode reported for an edit, checked field by field; anything else is none. */
+/**
+ * The file diffs OpenCode reported for an edit, checked field by field and at most `fileLimit` of
+ * them; anything else is none.
+ */
 const reportedFiles = (metadata: unknown) => {
   const files = isObject(metadata) ? metadata.files : undefined;
   if (!Array.isArray(files)) return [];
-  return files.flatMap((file) =>
+  return files.slice(0, fileLimit).flatMap((file) =>
     isObject(file) &&
     typeof file.file === "string" &&
     file.file.length <= 4096 &&
@@ -563,7 +645,7 @@ const reportedFiles = (metadata: unknown) => {
     typeof file.deletions === "number"
       ? [
           {
-            path: redact(file.file),
+            path: short(file.file, pathLimit),
             additions: file.additions,
             deletions: file.deletions,
             patch: typeof file.patch === "string" ? file.patch : null,
@@ -575,9 +657,9 @@ const reportedFiles = (metadata: unknown) => {
 
 const patchPaths = (patch: unknown) =>
   typeof patch === "string" && patch.length <= sourceLimit
-    ? [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].flatMap((match) =>
-        match[1] ? [redact(match[1].trim())] : [],
-      )
+    ? [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)]
+        .slice(0, fileLimit)
+        .flatMap((match) => (match[1] ? [short(match[1], pathLimit)] : []))
     : [];
 
 /** The tools that change files, whose paths the work log counts as edits. */
@@ -606,9 +688,11 @@ export const toolCall = (messageID: string, part: ToolPart): ToolCall => {
             input.query ??
             input.description,
         );
+  // OpenCode's edit and write name their file as `filePath`; other tools may say `path`.
+  const target = input?.filePath ?? input?.path;
   const named =
-    input && typeof input.path === "string"
-      ? [{ path: short(input.path), additions: null, deletions: null }]
+    typeof target === "string"
+      ? [{ path: short(target, pathLimit), additions: null, deletions: null }]
       : input
         ? patchPaths(input.patchText).map((path) => ({ path, additions: null, deletions: null }))
         : [];
@@ -632,7 +716,7 @@ export const toolCall = (messageID: string, part: ToolPart): ToolCall => {
     startedAt: millis(part.time.ran ?? part.time.created),
     endedAt: millis(part.time.completed),
     label: label || (files.length > 1 ? `${files.length} files` : ""),
-    files: files.slice(0, 50),
+    files: files.slice(0, fileLimit),
   };
 };
 
@@ -640,13 +724,14 @@ export const toolDetail = (messageID: string, part: ToolPart): ToolDetail => {
   const call = toolCall(messageID, part);
   const state = part.state;
   let truncated = false;
+  // Redacted whole, then cut to a byte budget as the JSON response counts it.
   const bounded = (text: string | undefined, limit = detailLimit) => {
     if (text === undefined) return null;
     if (text.length > sourceLimit) {
       truncated = true;
       return "[omitted: too large]";
     }
-    const done = cut(redact(text), limit);
+    const done = fitBytes(redact(text), limit);
     truncated ||= done.cut;
     return done.text;
   };
@@ -664,8 +749,9 @@ export const toolDetail = (messageID: string, part: ToolPart): ToolDetail => {
     const patch =
       file.patch === null || file.patch.length > sourceLimit ? null : redact(file.patch);
     // A cut diff would be wrong, so one that doesn't fit is left out whole.
-    const fits = patch !== null && patch.length <= budget;
-    if (fits) budget -= patch.length;
+    const size = patch === null ? 0 : jsonBytes(patch);
+    const fits = patch !== null && size <= budget;
+    if (fits) budget -= size;
     else if (patch !== null) truncated = true;
     return { ...file, patch: fits ? patch : null };
   });
@@ -683,6 +769,7 @@ const workItem = (item: SessionMessage.Info): WorkItem => {
   if (item.type === "idle") return { type: "idle", id: item.id };
   if (item.type === "user")
     return { type: "message", id: item.id, role: "user", shown: true, calls: [] };
+  if (item.type === "compaction") return { type: "compaction", id: item.id };
   if (item.type !== "assistant") return { type: "other", id: item.id };
   const text = item.content.some((part) => part.type === "text" && part.text.trim());
   const calls = item.content.flatMap((part) =>
@@ -874,6 +961,8 @@ export class OpenCode extends Context.Service<
       { entries: readonly Entry[]; work?: readonly WorkItem[]; next: string | undefined },
       OpenCodeError
     >;
+    /** One history item as the work log reads it, or undefined once OpenCode doesn't have it. */
+    readonly workItem: (ref: MessageRef) => Effect.Effect<WorkItem | undefined, OpenCodeError>;
     /** One tool call of one message in full, redacted and bounded, or undefined when absent. */
     readonly toolDetail: (
       ref: MessageRef,
@@ -1261,10 +1350,12 @@ export class OpenCode extends Context.Service<
               ...(cursor ? { cursor } : { order: "desc" as const }),
             })
             .pipe(
+              pageBounds,
               Effect.map((page) => ({
                 entries: page.data.flatMap(entry).toReversed(),
                 work: page.data.map(workItem).toReversed(),
-                next: page.data.length === limit ? page.cursor?.next : undefined,
+                // A short page needn't be the last: only a page without a next cursor ends.
+                next: page.cursor?.next,
               })),
               Effect.mapError(failed(`Could not read session ${sessionID}`)),
             ),
@@ -1279,6 +1370,18 @@ export class OpenCode extends Context.Service<
               Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
               Effect.mapError(failed(`Could not read message ${messageID}`)),
             ),
+        workItem: ({ sessionID, messageID }) =>
+          client.session.message
+            .get({
+              sessionID: Session.ID.make(sessionID),
+              messageID: SessionMessage.ID.make(messageID),
+            })
+            .pipe(
+              messageBounds,
+              Effect.map(workItem),
+              Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
+              Effect.mapError(failed(`Could not read message ${messageID}`)),
+            ),
         toolDetail: ({ sessionID, messageID }, callID) =>
           client.session.message
             .get({
@@ -1286,6 +1389,7 @@ export class OpenCode extends Context.Service<
               messageID: SessionMessage.ID.make(messageID),
             })
             .pipe(
+              messageBounds,
               Effect.map((item) => {
                 if (item.type !== "assistant") return undefined;
                 const part = item.content.find(
@@ -1299,13 +1403,11 @@ export class OpenCode extends Context.Service<
             ),
         activity: (sessionID) =>
           Effect.gen(function* () {
-            const active = yield* client.session.active();
+            const active = yield* client.session.active().pipe(activityBounds);
             if (!(sessionID in active)) return { active: false, running: [], since: null };
-            const page = yield* client.message.list({
-              sessionID: Session.ID.make(sessionID),
-              order: "desc",
-              limit: 5,
-            });
+            const page = yield* client.message
+              .list({ sessionID: Session.ID.make(sessionID), order: "desc", limit: 5 })
+              .pipe(activityBounds);
             // The newest assistant message, unless an input arrived after it.
             const newest = page.data[0];
             const reply = newest?.type === "assistant" ? newest : undefined;

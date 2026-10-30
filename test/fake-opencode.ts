@@ -101,6 +101,9 @@ export function fakeOpenCode() {
     // detail by "message/call", and each session's activity.
     calls: new Map<string, ToolCall[]>(),
     idles: new Set<string>(),
+    // The entries a compaction follows.
+    compactions: new Set<string>(),
+    workItemReads: [] as string[],
     details: new Map<string, ToolDetail>(),
     activity: new Map<string, Activity>(),
     activityReads: 0,
@@ -271,9 +274,26 @@ export function fakeOpenCode() {
               entry.tools.some((tool) => tool.startsWith("dot_")),
             calls: state.calls.get(entry.id) ?? [],
           },
+          ...(state.compactions.has(entry.id)
+            ? [{ type: "compaction" as const, id: `compaction_${entry.id}` }]
+            : []),
           ...(state.idles.has(entry.id) ? [{ type: "idle" as const, id: `idle_${entry.id}` }] : []),
         ]);
         return { entries, work, next: start > 0 ? String(start) : undefined };
+      }),
+    workItem: ({ sessionID, messageID }) =>
+      Effect.sync((): WorkItem | undefined => {
+        state.workItemReads.push(messageID);
+        const entry = state.history.get(sessionID)?.find((item) => item.id === messageID);
+        return entry
+          ? {
+              type: "message",
+              id: entry.id,
+              role: entry.role,
+              shown: entry.role === "user" || entry.text !== "",
+              calls: state.calls.get(entry.id) ?? [],
+            }
+          : undefined;
       }),
     toolDetail: ({ messageID }, callID) =>
       Effect.suspend(() =>

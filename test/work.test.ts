@@ -206,7 +206,7 @@ test("work groups by turn between idles, under the turn's last reply, with share
     message("msg_u3", "user", true),
     message("msg_a4", "assistant", false, [call("msg_a4", "c5", "bash", "running")]),
   ];
-  const latest = groupWork(items, { startKnown: true, latest: true });
+  const latest = groupWork([{ items, next: undefined }], { startKnown: true, latest: true });
   expect(latest).toHaveLength(2);
   expect(latest[0]).toMatchObject({
     anchor: "msg_a3",
@@ -218,15 +218,22 @@ test("work groups by turn between idles, under the turn's last reply, with share
   // The running turn has no reply yet: it goes under the owner's message.
   expect(latest[1]).toMatchObject({ anchor: "msg_u3", open: true, complete: true });
   // An older page leaves the turn its newer neighbor ends to that page.
-  expect(groupWork(items, { startKnown: false, latest: false })).toHaveLength(1);
-  expect(groupWork(items, { startKnown: false, latest: false })[0]?.complete).toBe(false);
+  expect(groupWork([{ items, next: "c" }], { startKnown: false, latest: false })).toHaveLength(1);
+  expect(groupWork([{ items, next: "c" }], { startKnown: false, latest: false })[0]?.complete).toBe(
+    false,
+  );
   // The same call twice counts once.
   expect(workCounts([call("m", "x"), call("m", "y")]).total).toBe(2);
   expect(
     groupWork(
       [
-        message("m", "assistant", true, [call("m", "x")]),
-        message("m", "assistant", true, [call("m", "x")]),
+        {
+          items: [
+            message("m", "assistant", true, [call("m", "x")]),
+            message("m", "assistant", true, [call("m", "x")]),
+          ],
+          next: undefined,
+        },
       ],
       {
         startKnown: true,
@@ -385,4 +392,155 @@ test("tool detail and activity reads check the dot's binding and report what Ope
     observedAt: expect.any(Number),
   });
   expect((await get("/dots/jojo/activity?sessionID=ses_old")).status).toBe(409);
+});
+
+/** Every call a log leads to: its own, then each continuation's, until none is left. */
+const drain = async (log: { calls: ToolCall[]; more: string | null; complete: boolean }) => {
+  const keys = log.calls.map((item) => `${item.messageID}/${item.callID}`);
+  let more = log.more;
+  let complete = log.complete;
+  let reads = 0;
+  for (; more && reads < 50; reads++) {
+    const next = await get(`/dots/jojo/work?sessionID=ses_jojo&cursor=${encodeURIComponent(more)}`);
+    expect(next.status).toBe(200);
+    expect(JSON.stringify(next.body).length).toBeLessThan(256 * 1024 + 16 * 1024);
+    const calls = next.body.calls as ToolCall[];
+    expect(calls.length).toBeLessThanOrEqual(50);
+    keys.unshift(...calls.map((item) => `${item.messageID}/${item.callID}`));
+    more = next.body.more as string | null;
+    complete = next.body.complete as boolean;
+  }
+  return { keys, complete, reads };
+};
+
+type Log = { anchor: string; calls: ToolCall[]; more: string | null; complete: boolean };
+const logs = (body: Record<string, unknown>) => body.work as Log[];
+
+test("every call of a long turn is reachable: one message's 101 calls, then a 51-call page", async () => {
+  const many = Array.from({ length: 101 }, (_, index) => call("msg_t", `c${index}`));
+  fake.state.calls.set("msg_t", many);
+  fake.state.idles.add("msg_a");
+  fake.state.history.set("ses_jojo", [
+    entry("msg_u", "user", "go"),
+    entry("msg_t", "assistant", ""),
+    entry("msg_a", "assistant", "Done"),
+  ]);
+  const page = await get("/dots/jojo/messages?limit=5");
+  const log = logs(page.body)[0];
+  expect(log).toMatchObject({ anchor: "msg_a", complete: true, counts: { total: 101 } });
+  expect(log?.calls).toHaveLength(50);
+  expect(log?.more).toBeString();
+  const all = await drain(log as Log);
+  expect(all.keys).toEqual(many.map((item) => `msg_t/${item.callID}`));
+  expect(all.complete).toBe(true);
+
+  // A turn begun beyond the conversation's reach, whose older page holds a 51-call message.
+  const history = [entry("msg_u0", "user", "go"), entry("msg_big", "assistant", "")];
+  const big = Array.from({ length: 51 }, (_, index) => call("msg_big", `b${index}`));
+  fake.state.calls.set("msg_big", big);
+  for (let index = 0; index < 45; index++) {
+    history.push(entry(`msg_s${index}`, "assistant", ""));
+    fake.state.calls.set(`msg_s${index}`, [call(`msg_s${index}`, `s${index}`)]);
+  }
+  history.push(entry("msg_end", "assistant", "All done"));
+  fake.state.idles.clear();
+  fake.state.idles.add("msg_end");
+  fake.state.history.set("ses_jojo", history);
+  const long = logs((await get("/dots/jojo/messages?limit=1")).body)[0] as Log;
+  expect(long.complete).toBe(false);
+  const drained = await drain(long);
+  expect(new Set(drained.keys).size).toBe(drained.keys.length);
+  expect(drained.keys).toHaveLength(96);
+  expect(drained.keys.slice(0, 51)).toEqual(big.map((item) => `msg_big/${item.callID}`));
+  expect(drained.complete).toBe(true);
+});
+
+test("a window of replies only still reads back for the turn's calls", async () => {
+  const history = [entry("msg_u1", "user", "go")];
+  for (let index = 0; index < 6; index++) {
+    history.push(entry(`msg_t${index}`, "assistant", ""));
+    fake.state.calls.set(`msg_t${index}`, [call(`msg_t${index}`, `c${index}`)]);
+  }
+  history.push(entry("msg_a1", "assistant", "First"), entry("msg_a2", "assistant", "Second"));
+  fake.state.idles.add("msg_a2");
+  fake.state.history.set("ses_jojo", history);
+  const log = logs((await get("/dots/jojo/messages?limit=1")).body)[0];
+  expect(log).toMatchObject({ anchor: "msg_a2", complete: true, counts: { total: 6 } });
+});
+
+test("a compacted turn says it is partial, here and through its continuation", async () => {
+  fake.state.history.set("ses_jojo", [
+    entry("msg_u1", "user", "go"),
+    entry("msg_t1", "assistant", ""),
+    entry("msg_a1", "assistant", "Done"),
+  ]);
+  fake.state.calls.set("msg_t1", [call("msg_t1", "c1")]);
+  fake.state.compactions.add("msg_u1");
+  fake.state.idles.add("msg_a1");
+  const log = logs((await get("/dots/jojo/messages?limit=5")).body)[0];
+  expect(log).toMatchObject({ anchor: "msg_a1", complete: false, more: null });
+
+  const history = [entry("msg_u2", "user", "again")];
+  fake.state.compactions.clear();
+  fake.state.compactions.add("msg_u2");
+  for (let index = 0; index < 30; index++) {
+    history.push(entry(`msg_r${index}`, "assistant", ""));
+    fake.state.calls.set(`msg_r${index}`, [call(`msg_r${index}`, `r${index}`)]);
+  }
+  history.push(entry("msg_a2", "assistant", "Again done"));
+  fake.state.idles.clear();
+  fake.state.idles.add("msg_a2");
+  fake.state.history.set("ses_jojo", history);
+  const cut = logs((await get("/dots/jojo/messages?limit=1")).body)[0] as Log;
+  const drained = await drain(cut);
+  expect(drained.keys).toHaveLength(30);
+  expect(drained.complete).toBe(false);
+});
+
+const wide = (index: number) => ({
+  ...call("msg_t", `w${index}`, "apply_patch", "done"),
+  files: [
+    { path: `${"a".repeat(4096)}${index}`, additions: 1, deletions: 0 },
+    { path: `${"b".repeat(4096)}${index}`, additions: 1, deletions: 0 },
+  ],
+});
+
+test("large calls page within the byte budget instead of being dropped", async () => {
+  const calls = Array.from({ length: 50 }, (_, index) => wide(index));
+  fake.state.calls.set("msg_t", calls);
+  fake.state.idles.add("msg_a");
+  fake.state.history.set("ses_jojo", [
+    entry("msg_u", "user", "go"),
+    entry("msg_t", "assistant", ""),
+    entry("msg_a", "assistant", "Done"),
+  ]);
+  const page = await get("/dots/jojo/messages?limit=5");
+  const log = logs(page.body)[0] as Log;
+  expect(JSON.stringify(log.calls).length).toBeLessThanOrEqual(256 * 1024);
+  expect(log.calls.length).toBeLessThan(50);
+  expect((await drain(log)).keys).toHaveLength(50);
+});
+
+test("a projected call cuts long paths and lists a bounded number of files", () => {
+  const patch = Array.from(
+    { length: 80 },
+    (_, index) => `*** Update File: ${"p".repeat(5000)}${index}`,
+  ).join("\n");
+  const projected = toolCall(
+    "msg_1",
+    part({
+      name: "apply_patch",
+      state: { status: "running", input: { patchText: patch }, metadata: {} },
+    }),
+  );
+  expect(projected.files).toHaveLength(50);
+  expect(projected.files.every((file) => file.path.length <= 257)).toBe(true);
+  const edit = toolCall(
+    "msg_1",
+    part({
+      name: "edit",
+      state: { status: "running", input: { filePath: "src/x.ts" }, metadata: {} },
+    }),
+  );
+  expect(edit.files).toEqual([{ path: "src/x.ts", additions: null, deletions: null }]);
 });
