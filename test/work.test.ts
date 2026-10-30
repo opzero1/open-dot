@@ -130,6 +130,27 @@ test("tool detail is redacted whole before it is cut, and missing patches stay u
   );
   expect(JSON.stringify(structured)).not.toContain("ghp_");
   expect(structured.input).toContain('"api_key": "[redacted]"');
+  // A one-time code, a numeric one and everything beneath a credential's key are dropped too.
+  const codes = toolDetail(
+    "msg_1",
+    part({
+      name: "login",
+      done: true,
+      state: {
+        status: "completed",
+        input: {
+          otp: "123456",
+          step: { totp: 654321, user: "afif" },
+          credentials: { value: "s3cret-value", list: ["hunter2"] },
+          headers: [{ name: "x", passcode: "4242" }],
+        },
+        content: [{ type: "text", text: "ok" }],
+      },
+    }),
+  );
+  for (const secret of ["123456", "654321", "s3cret-value", "hunter2", "4242"])
+    expect(codes.input).not.toContain(secret);
+  expect(codes.input).toContain('"user": "afif"');
   expect(structured.error).toContain("[redacted]");
   // A malformed record is dropped, never guessed.
   expect(structured.patches).toEqual([

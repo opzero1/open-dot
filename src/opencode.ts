@@ -513,20 +513,32 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const secretKey =
-  /pass(word|phrase)?|secret|token|api[_-]?key|auth|credential|cookie|private[_-]?key/i;
+  /pass(word|phrase|code)?|secret|token|api[_-]?key|auth|credential|cookie|private[_-]?key|otp|mfa|(?:^|[_-])pin$/i;
 
-/** Structured input with each string redacted in its key's context, before any of it is cut. */
-export const redactInput = (value: unknown, key = ""): unknown => {
+/**
+ * Whether a key names a secret: by the list above, or by the shared redaction, which drops the
+ * value of a labelled secret such as `otp: …` and so recognizes the same labels it does.
+ */
+const secretName = (key: string) =>
+  secretKey.test(key) || redact(`${key}: value`) !== `${key}: value`;
+
+/**
+ * Structured input with each string redacted in its key's context, before any of it is cut or
+ * formatted: a value under a secret's key is dropped whole, and so is everything beneath one.
+ */
+export const redactInput = (value: unknown, key = "", secret = false): unknown => {
+  const hidden = secret || (key !== "" && secretName(key));
   if (typeof value === "string")
     return value.length > sourceLimit
       ? "[omitted: too large]"
-      : secretKey.test(key)
+      : hidden
         ? "[redacted]"
         : redact(value);
-  if (Array.isArray(value)) return value.map((item) => redactInput(item, key));
+  if (typeof value === "number" || typeof value === "boolean") return hidden ? "[redacted]" : value;
+  if (Array.isArray(value)) return value.map((item) => redactInput(item, key, hidden));
   if (isObject(value))
     return Object.fromEntries(
-      Object.entries(value).map(([name, item]) => [name, redactInput(item, name)]),
+      Object.entries(value).map(([name, item]) => [redact(name), redactInput(item, name, hidden)]),
     );
   return value;
 };
