@@ -33,6 +33,7 @@ import {
   backoff,
   canReact,
   capture,
+  continues,
   type Captured,
   type Conversation,
   deliveredID,
@@ -47,6 +48,7 @@ import {
   keepSent,
   mergeLatest,
   mergeOlder,
+  olderRead,
   pendingActions,
   pendingLabel,
   reactionOf,
@@ -301,6 +303,8 @@ const App = () => {
 
   // Per dot, when each settled change was confirmed: reads that began earlier can't replace it.
   const fences = useRef(new Map<string, Map<string, number>>());
+  // Per dot, bumped by Back to latest: a latest read that began before it is dropped.
+  const epochs = useRef(new Map<string, number>());
 
   /** Drops intents once nothing can change their message or a read settled them, and fences them. */
   const dropIntents = useCallback(
@@ -368,7 +372,9 @@ const App = () => {
 
   const readChat = useCallback(
     async (name: string) => {
+      const epoch = epochs.current.get(name) ?? 0;
       const result = await bridge.messages(name);
+      if (epoch !== (epochs.current.get(name) ?? 0)) return;
       const count = failures.current.get(name) ?? 0;
       if (result.ok) {
         failures.current.set(name, 0);
@@ -805,8 +811,11 @@ const App = () => {
   const loadOlder = async () => {
     const name = selectedRef.current;
     const known = name ? conversationsRef.current.get(name) : undefined;
-    if (!name || !known?.next) return;
-    const result = await bridge.messages(name, known.next, known.generation);
+    const read = known && olderRead(known);
+    if (!name || !known || !read) return;
+    const result = await bridge.messages(name, read.cursor, known.generation);
+    // Whatever replaced the window meanwhile, the answer belongs to the old one: drop it.
+    if (!continues(conversationsRef.current.get(name), read)) return;
     if (!result.ok) {
       setOlderErrors((current) => new Map(current).set(name, result.error));
       return;
@@ -815,13 +824,15 @@ const App = () => {
     updateConversations((current) => {
       const latest = current.get(name);
       return latest
-        ? new Map(current).set(name, mergeOlder(latest, result.value, selectionKeep.current))
+        ? new Map(current).set(name, mergeOlder(latest, result.value, read, selectionKeep.current))
         : current;
     });
   };
 
   const backToLatest = () => {
     if (!selected) return;
+    // Reads already out answer for the window being left, so none of them may rebuild it.
+    epochs.current.set(selected, (epochs.current.get(selected) ?? 0) + 1);
     updateConversations((current) => without(current, selected));
     setOlderErrors((current) => without(current, selected));
     due.current.set(selected, 0);

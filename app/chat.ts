@@ -395,9 +395,15 @@ export interface Conversation {
   // True once older pages pushed the newest messages out: polls refresh what's loaded in place,
   // and Back to latest returns.
   detached: boolean;
+  // Which run of contiguous history this is: every start-over gets a new one, so an older page
+  // read for a window that's gone can't be joined to the new one.
+  revision: number;
 }
 
+let revisions = 0;
+
 const fresh = (page: PageView): Conversation => ({
+  revision: ++revisions,
   sessionID: page.sessionID,
   generation: page.generation,
   messages: page.messages,
@@ -464,16 +470,38 @@ export const mergeLatest = (
   };
 };
 
+/** An older-page read: the window it continues and the cursor it was read from. */
+export interface OlderRead {
+  revision: number;
+  cursor: string;
+}
+
+export const olderRead = (current: Conversation): OlderRead | undefined =>
+  current.next === null ? undefined : { revision: current.revision, cursor: current.next };
+
 /**
- * Prepends an older page from the same session and daemon. Past the limit the newest messages go,
- * except any in `keep`, and polls then wait for Back to latest.
+ * Whether an older read still continues what's shown: a start-over, Back to latest or any other
+ * cursor change since it began voids its answer, success or error.
+ */
+export const continues = (current: Conversation | undefined, read: OlderRead) =>
+  current?.revision === read.revision && current.next === read.cursor;
+
+/**
+ * Prepends an older page read from `read`, if it still continues what's shown, from the same session
+ * and daemon. Past the limit the newest messages go, except any in `keep`, and polls then wait for
+ * Back to latest.
  */
 export const mergeOlder = (
   current: Conversation,
   page: PageView,
+  read: OlderRead,
   keep: ReadonlySet<string> = new Set(),
 ): Conversation => {
-  if (page.sessionID !== current.sessionID || page.generation !== current.generation)
+  if (
+    !continues(current, read) ||
+    page.sessionID !== current.sessionID ||
+    page.generation !== current.generation
+  )
     return current;
   const known = new Set(current.messages.map((message) => message.id));
   const messages = [

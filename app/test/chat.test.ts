@@ -5,6 +5,8 @@ import {
   applyIntents,
   canReact,
   capture,
+  type Conversation,
+  continues,
   deliveredID,
   editDraft,
   emptyDraft,
@@ -17,6 +19,7 @@ import {
   loopbackEndpoint,
   mergeLatest,
   mergeOlder,
+  olderRead,
   pendingActions,
   recentTapbacks,
   redoDraft,
@@ -305,9 +308,45 @@ const page = (ids: string[], fields: Partial<PageView> = {}): PageView => ({
 const ids = (conversation: { messages: MessageView[] }) =>
   conversation.messages.map((item) => item.id);
 
+/** Prepends an older page read from the conversation's own cursor. */
+const prepend = (current: Conversation, older: PageView, keep?: ReadonlySet<string>) => {
+  const read = olderRead(current);
+  if (!read) throw new Error("No older cursor.");
+  return mergeOlder(current, older, read, keep);
+};
+
+const range = (from: number, to: number) =>
+  Array.from({ length: to - from + 1 }, (_, index) => `m${from + index}`);
+
+test("an older page read for a window that's since started over is dropped, so no gap is hidden", () => {
+  const shown = mergeLatest(undefined, page(range(80, 99), { next: "c80" }));
+  const read = olderRead(shown);
+  if (!read) throw new Error("No older cursor.");
+  // A latest poll that doesn't overlap starts over while the older read is out.
+  const latest = mergeLatest(shown, page(range(100, 119), { next: "c100" }));
+  expect(ids(latest)).toEqual(range(100, 119));
+  expect(continues(latest, read)).toBe(false);
+  // The older page arrives late: nothing is joined, and the cursor stays at the new window.
+  const late = mergeOlder(latest, page(range(60, 79), { next: "c60" }), read);
+  expect(late).toBe(latest);
+  expect(late.next).toBe("c100");
+  // Back to latest starting over with the same cursor is still another window.
+  const again = mergeLatest(undefined, page(range(80, 99), { next: "c80" }));
+  expect(again.next).toBe(read.cursor);
+  expect(continues(again, read)).toBe(false);
+  expect(mergeOlder(again, page(range(60, 79), { next: "c60" }), read)).toBe(again);
+  // A trim that moved the cursor voids it too; a read from the current window still joins.
+  const fresh = olderRead(again);
+  if (!fresh) throw new Error("No older cursor.");
+  expect(ids(mergeOlder(again, page(range(60, 79), { next: "c60" }), fresh))).toEqual(
+    range(60, 99),
+  );
+  expect(continues({ ...again, next: "moved" }, fresh)).toBe(false);
+});
+
 test("latest pages keep loaded history, a new session starts over, and a detached view survives polls", () => {
   const start = mergeLatest(undefined, page(["b", "c"]));
-  const older = mergeOlder(start, page(["a"], { next: null }));
+  const older = prepend(start, page(["a"], { next: null }));
   expect(ids(older)).toEqual(["a", "b", "c"]);
   const polled = mergeLatest(older, page(["c", "d"]));
   expect(ids(polled)).toEqual(["a", "b", "c", "d"]);
@@ -315,7 +354,7 @@ test("latest pages keep loaded history, a new session starts over, and a detache
   expect(ids(mergeLatest(polled, page(["x"], { sessionID: "ses_b" })))).toEqual(["x"]);
   const many = Array.from({ length: historyLimit }, (_, index) => `m${index}`);
   const full = mergeLatest(undefined, page(many));
-  const detached = mergeOlder(full, page(["older"], { next: "older-cursor" }));
+  const detached = prepend(full, page(["older"], { next: "older-cursor" }));
   expect(detached.detached).toBe(true);
   expect(detached.messages).toHaveLength(historyLimit);
   expect(detached.messages[0]?.id).toBe("older");
@@ -329,14 +368,14 @@ test("latest pages keep loaded history, a new session starts over, and a detache
   expect(kept.next).toBe("older-cursor");
   // Pushing past the limit keeps selected messages instead of cutting them.
   const selected = new Set([`m${historyLimit - 1}`]);
-  const wide = mergeOlder(full, page(["older"]), selected);
+  const wide = prepend(full, page(["older"]), selected);
   expect(wide.messages).toHaveLength(historyLimit + 1);
   expect(wide.detached).toBe(false);
 });
 
 test("an empty latest page with a continuation keeps older pages until its cursor moves", () => {
   const empty = page([], { next: "head" });
-  const older = mergeOlder(mergeLatest(undefined, empty), page(["a"], { next: "older" }));
+  const older = prepend(mergeLatest(undefined, empty), page(["a"], { next: "older" }));
   expect(ids(older)).toEqual(["a"]);
   const polled = mergeLatest(older, empty);
   expect(ids(polled)).toEqual(["a"]);
@@ -348,14 +387,14 @@ test("an empty latest page with a continuation keeps older pages until its curso
 });
 
 test("a restarted daemon voids old cursors, and older pages from another daemon are ignored", () => {
-  const start = mergeOlder(mergeLatest(undefined, page(["b", "c"])), page(["a"]));
+  const start = prepend(mergeLatest(undefined, page(["b", "c"])), page(["a"]));
   // Same session, new daemon: the old cursor can't be read, so the view starts from its latest page.
   const restarted = mergeLatest(start, page(["c", "d"], { generation: 2, next: "new-cursor" }));
   expect(ids(restarted)).toEqual(["c", "d"]);
   expect(restarted).toMatchObject({ generation: 2, next: "new-cursor" });
   // A late page from the old daemon changes nothing.
   expect(mergeLatest(restarted, page(["z"], { generation: 1 }))).toBe(restarted);
-  expect(mergeOlder(restarted, page(["y"], { generation: 1 }))).toBe(restarted);
+  expect(prepend(restarted, page(["y"], { generation: 1 }))).toBe(restarted);
   // While reading older messages, the window stays but the dead cursor goes.
   const detached = { ...start, detached: true };
   const kept = mergeLatest(detached, page(["c", "d"], { generation: 2 }));
@@ -364,7 +403,7 @@ test("a restarted daemon voids old cursors, and older pages from another daemon 
 });
 
 test("a pinned read replaces an older loaded message, in its own session only", () => {
-  const start = mergeOlder(mergeLatest(undefined, page(["b"])), page(["a"]));
+  const start = prepend(mergeLatest(undefined, page(["b"])), page(["a"]));
   const updated = replaceMessage(start, message("a", { hidden: true }));
   expect(updated.messages[0]?.hidden).toBe(true);
   expect(replaceMessage(start, message("a", { sessionID: "ses_b", hidden: true }))).toBe(start);

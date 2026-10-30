@@ -178,14 +178,18 @@ class FakeDaemon {
       let empty = this.emptyPages;
       if (before !== null) {
         const cursor = /^c\.(\d+)\.(\d+)(?:\.(\d+))?$/.exec(before);
-        if (!cursor || Number(cursor[1]) !== index || this.failOlder) {
-          if (cursor && Number(cursor[1]) !== index) this.log.staleCursors++;
+        if (!cursor || Number(cursor[1]) !== index) {
+          if (cursor) this.log.staleCursors++;
           return Response.json({ error: "Invalid conversation cursor. Refresh." }, { status: 400 });
         }
         end = Number(cursor[2]);
         empty = Number(cursor[3] ?? 0);
         this.log.olderReads++;
+        // Whether it fails is decided when it arrives, and answered after the delay.
+        const failing = this.failOlder;
         await delay(this.olderDelay);
+        if (failing)
+          return Response.json({ error: "Invalid conversation cursor. Refresh." }, { status: 400 });
       }
       if (empty > 0)
         return Response.json({
@@ -1066,6 +1070,52 @@ test("a send saved behind an unreadable answer stays to reconcile by its ID, and
       await until(`t.box().value === ""`, "the next send");
       expect(fake.log.posts.map((post) => post.text)).toEqual(["Empty", "Garbled", "Next"]);
       expect(new Set(fake.log.posts.map((post) => post.messageID)).size).toBe(3);
+    },
+  );
+}, 170_000);
+
+test("an older page or error read for a window that's gone is dropped, so history never skips", async () => {
+  await scenario(
+    "older-race",
+    (fake) => {
+      fake.messages = many(100);
+      fake.olderDelay = 3000;
+    },
+    async ({ fake, js, until }) => {
+      await until(`t.count() === 50 && !!t.msg("m99")`, "the latest page");
+      // A slow older read for m0–m49 is out when the latest page moves past everything shown.
+      await js(`t.scroll(0), true`);
+      for (let tick = 0; tick < 50 && fake.log.olderReads === 0; tick++) await delay(100);
+      expect(fake.log.olderReads).toBe(1);
+      fake.messages.push(...many(160).slice(100));
+      await until(`t.list().dataset.first === "m110"`, "the latest page to start over");
+      await delay(3500);
+      // The late page joined nothing: whatever is shown runs without a gap up to m159.
+      const contiguous = `t.list().dataset.first === "m" + (160 - t.count())`;
+      expect(await js(contiguous)).toBe(true);
+      expect(await js(`t.count() <= 100`)).toBe(true);
+      await js(`t.scroll(0), true`);
+      await until(`t.list().dataset.first === "m60" && t.count() === 100`, "m60–m109", 15);
+      expect(await js(contiguous)).toBe(true);
+
+      // An older read whose error arrives after Back to latest shows nothing.
+      fake.olderDelay = 0;
+      fake.failOlder = true;
+      await js(`t.scroll(0), true`);
+      await until(`!!document.querySelector("[data-older-error]")`, "the older-page error");
+      fake.olderDelay = 3000;
+      const reads = fake.log.olderReads;
+      await js(`t.click("Try again", document.querySelector("[data-older-error]"))`);
+      for (let tick = 0; tick < 50 && fake.log.olderReads === reads; tick++) await delay(100);
+      await js(`t.click("Back to latest", document.querySelector("[data-older-error]"))`);
+      fake.failOlder = false;
+      await until(
+        `t.count() === 50 && !document.querySelector("[data-older-error]")`,
+        "the latest page again",
+      );
+      await delay(3500);
+      expect(await js(`!!document.querySelector("[data-older-error]")`)).toBe(false);
+      expect(await js(contiguous)).toBe(true);
     },
   );
 }, 170_000);
