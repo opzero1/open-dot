@@ -17,6 +17,7 @@ import { type Db, openDatabase } from "./db";
 import { composeTurn, latestCompaction, recallResults, textMode } from "./compose";
 import { headFor, zoomObservation } from "./ledger";
 import { observerOutputTokens } from "./observer";
+import { factTextLimit, ownerKey, ownerSection, proposeFact } from "./owner";
 import { unreadFeed } from "./feed";
 import {
   databasePath,
@@ -699,6 +700,54 @@ export default Plugin.define({
         },
       });
       editor.add({
+        name: "dot_propose_owner_fact",
+        description: `Suggest one short fact about your owner, such as a preference or how they like to work, for every dot to know. It is only a proposal: your owner sees it in the app with this message as its source and approves, edits or rejects it, and no dot sees it before they approve it. Never include a password, token or other secret: open-dot refuses one. At most ${factTextLimit} characters. A fact your owner rejected or deleted, or another one from the same message, isn't taken again.`,
+        input: Schema.Struct({
+          text: text("The fact about your owner, in one or two plain sentences"),
+        }),
+        options: { codemode: false },
+        execute: async (input, call) => {
+          // Its origin comes only from this call, confirmed in public context, never from the model.
+          if (!bound(call.sessionID))
+            throw new Error(`Only ${name}'s exact bound conversation can propose facts.`);
+          const history = await context.session
+            .context({ sessionID: call.sessionID })
+            .catch(() => undefined);
+          if (!bound(call.sessionID))
+            throw new Error("The dot's conversation changed, so nothing was proposed.");
+          if (!history)
+            throw new Error(
+              "Couldn't read this conversation to confirm where the proposal comes from, so nothing was proposed.",
+            );
+          if (!history.some((item) => item.id === call.messageID && item.type === "assistant"))
+            throw new Error(
+              "This message isn't in the conversation's public context, so nothing was proposed.",
+            );
+          const result = proposeFact(
+            db,
+            { dot: name, sessionID: call.sessionID, messageID: call.messageID },
+            input.text,
+            () => bound(call.sessionID) !== undefined,
+          );
+          if ("invalid" in result) throw new Error(result.invalid);
+          if ("full" in result) throw new Error(`${result.full} Nothing was proposed.`);
+          if ("unbound" in result)
+            throw new Error("The dot's conversation changed, so nothing was proposed.");
+          if ("suppressed" in result)
+            return {
+              content:
+                "Not proposed: your owner rejected or deleted this fact, or one from this message, before.",
+            };
+          if ("existing" in result)
+            return {
+              content: `Not proposed again: your owner already has this fact, ${result.existing.id}, ${result.existing.state === "approved" ? "approved" : "waiting for their review"}.`,
+            };
+          return {
+            content: `Proposed fact ${result.proposed.id}. It waits for your owner's review; no dot sees it until they approve it.`,
+          };
+        },
+      });
+      editor.add({
         name: "dot_search_notes",
         description: `Search your saved notes for every word given, ignoring case, most recently changed first. Each result has the note's number, when it last changed, a snippet and its source: the message whose dot_note saved it, or unknown for older notes and ones your owner added. A source shows only where a note was saved, never that it's true; one marked edited shows only where it was first saved, not where its current text came from. At most ${searchResultLimit} results.`,
         input: Schema.Struct({
@@ -1374,7 +1423,14 @@ ${dataJSON(part)}
      * Puts each memory section that changed into the session's instruction entries and returns
      * the changed ones, or undefined when OpenCode has no entries API or a call fails.
      */
-    const syncEntries = async (
+    // One synchronization at a time, so a slow put never lands over a newer one's value.
+    let syncing: Promise<unknown> = Promise.resolve();
+    const syncEntries = (sessionID: string, sections: readonly { key: string; text: string }[]) => {
+      const run = syncing.then(() => putEntries(sessionID, sections));
+      syncing = run.catch(() => undefined);
+      return run;
+    };
+    const putEntries = async (
       sessionID: string,
       sections: readonly { key: string; text: string }[],
     ) => {
@@ -1407,6 +1463,22 @@ ${dataJSON(part)}
         entries = undefined;
         return undefined;
       }
+    };
+
+    /**
+     * The changed sections after a synchronization, with the owner entry checked again: when the
+     * approved facts changed during its awaits, the current value replaces the one just put in the
+     * tail, and the next request puts it, so a superseded value is never taken as current.
+     */
+    const ownerSince = (
+      sections: readonly { key: string; text: string }[],
+      changed: readonly { key: string; text: string }[],
+    ) => {
+      const put = sections.find((section) => section.key === ownerKey);
+      const now = ownerSection(db);
+      if (!put || put.text === now.text) return changed;
+      entries?.values.delete(ownerKey);
+      return [...changed.filter((section) => section.key !== ownerKey), now];
     };
 
     // Memory lives in instruction entries, which OpenCode keeps in the cached system prompt and
@@ -1461,9 +1533,11 @@ Owner IDs cover only user messages among the last 100 public session context ite
 ${snapshot}
 </notch-reactions>`;
       }
-      const sections = memory(db, name, notesShown);
-      const changed = await syncEntries(event.sessionID, sections);
+      // The owner's approved facts go to every ready dot, never to an unready binding.
+      const sections = [...memory(db, name, notesShown), ...(current ? [ownerSection(db)] : [])];
+      const synced = await syncEntries(event.sessionID, sections);
       if (current && !bound(event.sessionID)) return;
+      const changed = synced && current ? ownerSince(sections, synced) : synced;
       placeTail(event.messages, {
         role: "user",
         content: [
@@ -1486,6 +1560,19 @@ ${snapshot}
       const head = headFor(db, current, latestCompaction(items));
       if (head)
         event.messages.unshift({ role: "user", content: [{ type: "text", text: head.text }] });
+      // OpenCode loaded the entries before this hook, so a changed owner entry, or one that
+      // couldn't be put, goes at the end of this request too; otherwise nothing is added.
+      // Without the entries API no memory is in the compaction request, so none is added.
+      if (!context.session.instructions?.entry) return;
+      const owner = ownerSection(db);
+      const synced = await syncEntries(event.sessionID, [owner]);
+      if (!bound(event.sessionID)) return;
+      const changed = synced ? ownerSince([owner], synced) : [ownerSection(db)];
+      if (changed.length)
+        event.messages.push({
+          role: "user",
+          content: [{ type: "text", text: entriesTail(changed) }],
+        });
     });
 
     return () => db.$client.close();

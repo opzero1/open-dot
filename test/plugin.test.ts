@@ -9,6 +9,7 @@ import { autoRecallBytes, saveArchiveSettings, settingsOf } from "../src/archive
 import { openDatabase } from "../src/db";
 import { forgetObservation, settleHead } from "../src/ledger";
 import { observerOutputTokens } from "../src/observer";
+import { changeFact, ownerMemory, readFact, secretRefusal } from "../src/owner";
 import { OpenCode, OpenCodeError } from "../src/opencode";
 import { createDot, findDot } from "../src/dots";
 import { databasePath, home, observerDirectory, outputDirectory } from "../src/home";
@@ -22,6 +23,7 @@ import {
   ledger,
   ledgerState,
   observerJobs,
+  ownerFacts,
   feed,
   grants,
   hiddenMessages,
@@ -489,20 +491,21 @@ test("memory goes into instruction entries, one per section, put only when it ch
       "open-dot.dots",
       "open-dot.supervised",
       "open-dot.requests",
+      "open-dot.owner",
     ]);
     expect(first).toContain('<context key="open-dot.notes">');
     expect(first).toContain("Current time:");
 
     // Nothing changed: nothing is put, and the tail is only the time.
     const quiet = await loaded.injected(dot.sessionID);
-    expect(entries.puts).toHaveLength(7);
+    expect(entries.puts).toHaveLength(8);
     expect(quiet).not.toContain("## Notes");
     expect(quiet).toContain("Current time:");
 
     // A new note changes one section only.
     await loaded.call("dot_note", { text: "Prefers short answers." });
     const noted = await loaded.injected(dot.sessionID);
-    expect(entries.puts.slice(7)).toEqual(["open-dot.notes"]);
+    expect(entries.puts.slice(8)).toEqual(["open-dot.notes"]);
     expect(entries.values.get("open-dot.notes")).toContain("Prefers short answers.");
     expect(noted).toContain("Prefers short answers.");
     expect(noted).not.toContain("## Responsibilities");
@@ -2603,4 +2606,195 @@ test("issue62: a message that already has a breakpoint, or none to mark, is left
   placeTail(first, tailMessage());
   expect(first.map((message) => message.content[0]?.text)).toEqual(["tail", "hello"]);
   expect(breakpoints(first)).toEqual([]);
+});
+
+const mutation = () => crypto.randomUUID();
+const ownerEntry = (entries: FakeEntries) => String(entries.values.get("open-dot.owner"));
+
+test("M10: dot_propose_owner_fact saves only a pending proposal with the call's confirmed origin", async () => {
+  const db = openDatabase(databasePath());
+  const loaded = await load(dot.directory);
+  try {
+    // Only the exact ready bound conversation, and only a message public context lists.
+    expect(
+      await fails(loaded.call("dot_propose_owner_fact", { text: "Elsewhere." }, "ses_other")),
+    ).toBe(true);
+    expect(
+      await fails(
+        loaded.call("dot_propose_owner_fact", { text: "Unknown." }, dot.sessionID, "msg_unknown"),
+      ),
+    ).toBe(true);
+    expect(
+      await fails(
+        loaded.call("dot_propose_owner_fact", { text: "A user ID." }, dot.sessionID, "msg_native"),
+      ),
+    ).toBe(true);
+    // A detected credential refuses the whole text, in fixed words, and saves nothing.
+    const secret = await loaded
+      .call("dot_propose_owner_fact", { text: "Their token: ghp_abcdefghijklmnop1234" })
+      .catch((cause: Error) => cause.message);
+    expect(secret).toBe(secretRefusal);
+    expect(db.select().from(ownerFacts).all()).toEqual([]);
+
+    const proposed = await loaded.call("dot_propose_owner_fact", {
+      text: "Prefers tea to coffee.",
+      // The model can't name a provenance; extra arguments are ignored.
+      dot: "polnareff",
+      messageID: "msg_forged",
+    });
+    expect(String(proposed.content)).toContain("waits for your owner's review");
+    expect(db.select().from(ownerFacts).all()).toMatchObject([
+      {
+        state: "pending",
+        text: "Prefers tea to coffee.",
+        originDot: "jojo",
+        originSession: dot.sessionID,
+        originMessage: "msg_invocation",
+      },
+    ]);
+    // A pending proposal reaches no dot's context.
+    expect(await loaded.injected(dot.sessionID)).not.toContain("Prefers tea");
+    // The same fact, however written, gives the existing receipt and changes nothing.
+    const again = await loaded.call("dot_propose_owner_fact", { text: "prefers TEA, to coffee" });
+    expect(String(again.content)).toContain("already has this fact");
+    expect(String(again.content)).not.toContain("Prefers tea");
+    expect(db.select().from(ownerFacts).all()).toHaveLength(1);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("M10: a failed context read or a rebinding refuses a proposal, unlike a note", async () => {
+  const unreadable = await load(dot.directory, undefined, () => {
+    throw new Error("context unavailable");
+  });
+  expect(await fails(unreadable.call("dot_propose_owner_fact", { text: "Likes jazz." }))).toBe(
+    true,
+  );
+  await unreadable.cleanup?.();
+  let db = openDatabase(databasePath());
+  const rebinding = await load(dot.directory, undefined, () => {
+    db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  });
+  expect(await fails(rebinding.call("dot_propose_owner_fact", { text: "Likes jazz." }))).toBe(true);
+  await rebinding.cleanup?.();
+  expect(db.select().from(ownerFacts).all()).toEqual([]);
+  db.$client.close();
+  db = openDatabase(databasePath());
+  db.update(dots).set({ sessionState: "creating" }).where(eq(dots.name, "jojo")).run();
+  const unready = await load(dot.directory);
+  expect(await fails(unready.call("dot_propose_owner_fact", { text: "Likes jazz." }))).toBe(true);
+  await unready.cleanup?.();
+  db.$client.close();
+});
+
+test("M10: approved facts reach every dot as one entry with identical bytes, put only when they change", async () => {
+  const db = openDatabase(databasePath());
+  const other = Effect.runSync(createDot(db, "polnareff", "Travel."));
+  db.update(dots).set({ sessionState: "ready" }).where(eq(dots.name, "polnareff")).run();
+  const jojoEntries = fakeEntries();
+  const otherEntries = fakeEntries();
+  let loaded = await load(dot.directory, undefined, undefined, jojoEntries);
+  const second = await load(other.directory, undefined, undefined, otherEntries);
+  const id = crypto.randomUUID();
+  try {
+    expect(
+      changeFact(db, id, 0, mutation(), { action: "create", text: "Lives in Lisbon." }),
+    ).toMatchObject({
+      saved: { state: "approved", version: 1 },
+    });
+    const first = await loaded.injected(dot.sessionID);
+    expect(first).toContain('<context key="open-dot.owner">');
+    expect(first).toContain('- "Lives in Lisbon."');
+    await second.injected(other.sessionID);
+    expect(ownerEntry(otherEntries)).toBe(ownerEntry(jojoEntries));
+    expect(ownerEntry(jojoEntries)).toContain("owner-approved standing context");
+    expect(ownerEntry(jojoEntries)).not.toContain(id);
+
+    // Unchanged: no put; after a restart the entries are listed and still not put again.
+    const puts = jojoEntries.puts.length;
+    await loaded.injected(dot.sessionID);
+    await loaded.cleanup?.();
+    loaded = await load(dot.directory, undefined, undefined, jojoEntries);
+    expect(await loaded.injected(dot.sessionID)).not.toContain("open-dot.owner");
+    expect(jojoEntries.puts).toHaveLength(puts);
+
+    // A change made while the entries can't be put goes in the fallback, then is put once they work.
+    expect(
+      changeFact(db, crypto.randomUUID(), 0, mutation(), {
+        action: "create",
+        text: "Ánimo: <b>tea</b>.",
+      }),
+    ).toHaveProperty("saved");
+    jojoEntries.fail(true);
+    const fallback = await loaded.injected(dot.sessionID);
+    expect(fallback).toContain("\\u003cb\\u003etea");
+    expect(fallback).not.toContain("<b>");
+    jojoEntries.fail(false);
+    const recovered = await loaded.injected(dot.sessionID);
+    expect(recovered).toContain('<context key="open-dot.owner">');
+    expect(ownerEntry(jojoEntries)).toContain("Lives in Lisbon.");
+    // Sorted by code point, whatever order they were approved in.
+    expect(ownerEntry(jojoEntries).indexOf("Lives")).toBeLessThan(
+      ownerEntry(jojoEntries).indexOf("Ánimo"),
+    );
+
+    // The compaction request carries a change OpenCode loaded too late, and nothing otherwise.
+    const fact = readFact(db, id);
+    if (!fact) throw new Error("no fact");
+    changeFact(db, id, fact.version, mutation(), { action: "delete" });
+    const prompt: FakeMessage = { role: "user", content: [{ text: "Hi" }] };
+    const compacting = await loaded.compacting(dot.sessionID, [prompt]);
+    expect(compacting).toHaveLength(2);
+    expect(compacting[1]?.content[0]?.text).toContain('<context key="open-dot.owner">');
+    expect(ownerEntry(jojoEntries)).not.toContain("Lisbon");
+    expect(await loaded.compacting(dot.sessionID, [prompt])).toEqual([prompt]);
+    // Deleting the last one leaves the fixed empty value, the same for every dot.
+    const last = ownerMemory(db).approved[0];
+    if (!last) throw new Error("no approved fact");
+    changeFact(db, last.id, last.version, mutation(), { action: "delete" });
+    await loaded.injected(dot.sessionID);
+    await second.injected(other.sessionID);
+    expect(ownerEntry(jojoEntries)).toEndWith("No approved facts.");
+    expect(ownerEntry(otherEntries)).toBe(ownerEntry(jojoEntries));
+  } finally {
+    await loaded.cleanup?.();
+    await second.cleanup?.();
+    db.$client.close();
+  }
+});
+
+test("M10: a change landing while an entry is put is told in the tail and put next request", async () => {
+  const db = openDatabase(databasePath());
+  const entries = fakeEntries();
+  const put = entries.api.put;
+  let racing = false;
+  entries.api.put = async (input) => {
+    await put(input);
+    if (racing && input.key === "open-dot.owner") {
+      racing = false;
+      changeFact(db, crypto.randomUUID(), 0, crypto.randomUUID(), {
+        action: "create",
+        text: "Arrived during the put.",
+      });
+    }
+  };
+  const loaded = await load(dot.directory, undefined, undefined, entries);
+  try {
+    await loaded.injected(dot.sessionID);
+    changeFact(db, crypto.randomUUID(), 0, crypto.randomUUID(), {
+      action: "create",
+      text: "First.",
+    });
+    racing = true;
+    const tail = await loaded.injected(dot.sessionID);
+    expect(tail).toContain("Arrived during the put.");
+    expect(ownerEntry(entries)).not.toContain("Arrived during the put.");
+    await loaded.injected(dot.sessionID);
+    expect(ownerEntry(entries)).toContain("Arrived during the put.");
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
 });
