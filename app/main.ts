@@ -879,6 +879,7 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
       };
     const query = typeof before === "string" ? `?before=${segment(before)}` : "";
     return coalesce(`messages:${read}:${dot}:${query}`, async () => {
+      const startedAt = Date.now();
       const page = await json(
         "GET",
         `/dots/${segment(dot)}/messages${query}`,
@@ -890,23 +891,22 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
       if (target) takesClientIDs(target, page);
       if (!isRecord(page.value))
         return { ok: false, error: "The daemon's answer wasn't understood." };
-      return { ok: true, value: { ...page.value, generation: read } };
+      return { ok: true, value: { ...page.value, generation: read, startedAt } };
     });
   },
-  message: (dot, id, sessionID) => {
+  // Never shared with a read already out: a pinned read must begin after the change it checks.
+  message: async (dot, id, sessionID) => {
     if (!isName(dot) || !isName(id) || !isName(sessionID)) return { ok: false, error: "Bad read." };
-    return coalesce(`message:${dot}:${sessionID}:${id}`, async () => {
-      const read = await json(
-        "GET",
-        `/dots/${segment(dot)}/messages/${segment(id)}?sessionID=${segment(sessionID)}`,
-      );
-      if (
-        read.ok &&
-        (!isRecord(read.value) || read.value.id !== id || read.value.sessionID !== sessionID)
-      )
-        return { ok: false, error: "The daemon's message wasn't understood." };
-      return read;
-    });
+    const read = await json(
+      "GET",
+      `/dots/${segment(dot)}/messages/${segment(id)}?sessionID=${segment(sessionID)}`,
+    );
+    if (
+      read.ok &&
+      (!isRecord(read.value) || read.value.id !== id || read.value.sessionID !== sessionID)
+    )
+      return { ok: false, error: "The daemon's message wasn't understood." };
+    return read;
   },
   send,
   attempts: unresolved,

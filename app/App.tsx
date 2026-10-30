@@ -38,6 +38,8 @@ import {
   type Draft,
   editDraft,
   emptyDraft,
+  fenced,
+  fencePage,
   imageLimits,
   type Intent,
   isImageType,
@@ -293,27 +295,43 @@ const App = () => {
   const dotsRef = useRef(dots);
   dotsRef.current = dots;
 
+  // Per dot, when each settled change was confirmed: reads that began earlier can't replace it.
+  const fences = useRef(new Map<string, Map<string, number>>());
+
+  /** Drops intents once nothing can change their message or a read settled them, and fences them. */
+  const dropIntents = useCallback(
+    (name: string, ids: readonly string[]) => {
+      if (!ids.length) return;
+      const at = Date.now();
+      const fence = fences.current.get(name) ?? new Map<string, number>();
+      for (const id of ids) fence.set(id, at);
+      fences.current.set(name, fence);
+      updateIntents((all) => {
+        const next = new Map(all.get(name));
+        for (const id of ids) next.delete(id);
+        return new Map(all).set(name, next);
+      });
+    },
+    [updateIntents],
+  );
+
   /** Drops the intents a read that started at `startedAt` settles. */
   const settle = useCallback(
     (name: string, messages: readonly MessageView[], startedAt: number) => {
       const mine = intentsRef.current.get(name);
-      if (!mine?.size) return;
-      const done = settledBy(messages, mine, startedAt);
-      if (!done.length) return;
-      updateIntents((all) => {
-        const next = new Map(all.get(name));
-        for (const id of done) next.delete(id);
-        return new Map(all).set(name, next);
-      });
+      if (mine?.size) dropIntents(name, settledBy(messages, mine, startedAt));
     },
-    [intentsRef, updateIntents],
+    [dropIntents, intentsRef],
   );
 
   const applyPage = useCallback(
-    (name: string, page: PageView, startedAt: number) => {
+    (name: string, read: PageView) => {
       const previous = conversationsRef.current.get(name);
+      const { startedAt } = read;
+      const page = fencePage(read, previous, fences.current.get(name), startedAt);
       if (previous && previous.sessionID !== page.sessionID) {
         // A new session: old actions, quotes and intents no longer apply; the draft text stays.
+        fences.current.delete(name);
         updateIntents((all) => without(all, name));
         updateDrafts((all) => {
           const kept = all.get(name);
@@ -346,12 +364,11 @@ const App = () => {
 
   const readChat = useCallback(
     async (name: string) => {
-      const startedAt = Date.now();
       const result = await bridge.messages(name);
       const count = failures.current.get(name) ?? 0;
       if (result.ok) {
         failures.current.set(name, 0);
-        applyPage(name, result.value, startedAt);
+        applyPage(name, result.value);
       } else {
         failures.current.set(name, count + 1);
         due.current.set(name, Date.now() + backoff(count + 1) * 1000);
@@ -366,6 +383,8 @@ const App = () => {
     async (name: string, id: string, sessionID: string) => {
       const startedAt = Date.now();
       const result = await bridge.message(name, id, sessionID);
+      // A change confirmed since this read began may be missing from it.
+      if (fenced(fences.current.get(name), id, startedAt)) return;
       if (result.ok) {
         updateConversations((current) => {
           const known = current.get(name);
@@ -374,16 +393,12 @@ const App = () => {
         settle(name, [result.value], startedAt);
       } else if (result.status === 404 || result.status === 409) {
         // Gone, or its session moved on: nothing more can change it, so it blocks nothing.
-        updateIntents((all) => {
-          const intent = all.get(name)?.get(id);
-          if (intent?.settledAt === undefined || startedAt < intent.settledAt) return all;
-          const next = new Map(all.get(name));
-          next.delete(id);
-          return new Map(all).set(name, next);
-        });
+        const intent = intentsRef.current.get(name)?.get(id);
+        if (intent?.settledAt !== undefined && startedAt >= intent.settledAt)
+          dropIntents(name, [id]);
       }
     },
-    [settle, updateConversations, updateIntents],
+    [dropIntents, intentsRef, settle, updateConversations],
   );
 
   /** What an attempt's receipt says about the draft it was captured from. */
@@ -531,6 +546,11 @@ const App = () => {
   );
 
   const blocked = (id: string) => intents.get(selected ?? "")?.has(id) ?? false;
+  // A change whose answer was lost and that no read has shown yet: the owner may ask again.
+  const unconfirmed = (id: string) => {
+    const intent = intents.get(selected ?? "")?.get(id);
+    return intent?.uncertain === true && intent.settledAt !== undefined;
+  };
 
   /** The message as it's shown now, with any change the owner made, rather than as captured. */
   const currentMessage = (name: string, id: string) => {
@@ -539,39 +559,56 @@ const App = () => {
   };
 
   /**
-   * One change to one message at a time: a refused one is dropped; one that returned, or whose
-   * outcome is lost, stays shown and blocks other changes until a read of that message settles it.
+   * Makes the intended change's call. A refused one is dropped (a refused retry leaves the lost
+   * call before it as it was); one that returned, or whose answer was lost, stays shown and blocks
+   * other changes until a read of that message settles it.
    */
-  const mutate = async (
-    name: string,
-    message: MessageView,
-    intent: Omit<Intent, "sessionID" | "settledAt">,
-    call: () => Promise<Result<true>>,
-  ) => {
-    if (intentsRef.current.get(name)?.has(message.id)) {
-      showToast({ text: "Waiting for saved message state before another change." });
-      return false;
-    }
+  const commit = async (name: string, id: string, intent: Intent) => {
     const setIntent = (value: Intent | undefined) =>
       updateIntents((all) => {
         const next = new Map(all.get(name));
-        if (value) next.set(message.id, value);
-        else next.delete(message.id);
+        if (value) next.set(id, value);
+        else next.delete(id);
         return new Map(all).set(name, next);
       });
-    setIntent({ ...intent, sessionID: message.sessionID });
-    const result = await call();
+    setIntent({ ...intent, settledAt: undefined });
+    const result =
+      intent.emoji !== undefined
+        ? await bridge.react(name, id, intent.sessionID, intent.emoji)
+        : await bridge.hide(name, id, intent.sessionID, intent.hidden ?? false);
     if (!result.ok && !result.lost) {
-      setIntent(undefined);
+      setIntent(intent.uncertain ? intent : undefined);
       showToast({ text: result.error });
       return false;
     }
     if (!result.ok)
-      showToast({ text: "Couldn't confirm that change. The app shows what open-dot saved." });
-    setIntent({ ...intent, sessionID: message.sessionID, settledAt: Date.now() });
-    void refreshMessage(name, message.id, message.sessionID);
+      showToast({
+        text: "Couldn't confirm that change. It stays shown until open-dot shows it saved.",
+      });
+    setIntent({ ...intent, settledAt: Date.now(), uncertain: intent.uncertain || !result.ok });
+    void refreshMessage(name, id, intent.sessionID);
     due.current.set(name, 0);
     return result.ok;
+  };
+
+  /** One change to one message at a time. */
+  const mutate = (
+    name: string,
+    message: MessageView,
+    change: Pick<Intent, "emoji" | "hidden">,
+  ): Promise<boolean> => {
+    if (intentsRef.current.get(name)?.has(message.id)) {
+      showToast({ text: "Waiting for saved message state before another change." });
+      return Promise.resolve(false);
+    }
+    return commit(name, message.id, { ...change, sessionID: message.sessionID });
+  };
+
+  /** The owner asks again for a change whose answer was lost: the same value, never another. */
+  const retry = (name: string, id: string) => {
+    setMenu(undefined);
+    const intent = intentsRef.current.get(name)?.get(id);
+    if (intent?.uncertain && intent.settledAt !== undefined) void commit(name, id, intent);
   };
 
   const react = (name: string, target: MessageView, emoji: string) => {
@@ -579,15 +616,11 @@ const App = () => {
     const message = currentMessage(name, target.id) ?? target;
     if (message.sessionID !== target.sessionID) return;
     const next = reactionOf(message, "owner") === emoji ? null : emoji;
-    void mutate(name, message, { emoji: next }, () =>
-      bridge.react(name, message.id, message.sessionID, next),
-    );
+    void mutate(name, message, { emoji: next });
   };
 
   const hide = (name: string, message: MessageView, hidden: boolean) => {
-    void mutate(name, message, { hidden }, () =>
-      bridge.hide(name, message.id, message.sessionID, hidden),
-    ).then((done) => {
+    void mutate(name, message, { hidden }).then((done) => {
       if (done && hidden)
         showToast({
           text: "Message deleted from the app.",
@@ -887,6 +920,8 @@ const App = () => {
               onOlder={loadOlder}
               onLatest={backToLatest}
               onRestore={(message) => hide(dot.name, message, false)}
+              unconfirmed={unconfirmed}
+              onRetry={(message) => retry(dot.name, message.id)}
               onPending={(pending, change) => changePending(dot.name, pending, change)}
               onCopyText={(text) => void bridge.copyText(text)}
               onShareText={(text) => void bridge.shareText(text)}
@@ -1149,6 +1184,8 @@ const MessageList = ({
   onOlder,
   onLatest,
   onRestore,
+  unconfirmed,
+  onRetry,
   onPending,
   onCopyText,
   onShareText,
@@ -1168,6 +1205,8 @@ const MessageList = ({
   onOlder: () => Promise<void>;
   onLatest: () => void;
   onRestore: (message: MessageView) => void;
+  unconfirmed: (id: string) => boolean;
+  onRetry: (message: MessageView) => void;
   onPending: (pending: PendingView, change: "steer" | "cancel") => void;
   onCopyText: (text: string) => void;
   onShareText: (text: string) => void;
@@ -1300,6 +1339,7 @@ const MessageList = ({
                   onMenu={onMenu}
                   onOpenImage={onOpenImage}
                   onRestore={onRestore}
+                  onRetry={unconfirmed(row.message.id) ? () => onRetry(row.message) : undefined}
                 />
               ) : row.kind === "pending" ? (
                 <PendingRow
@@ -1416,6 +1456,7 @@ const MessageRow = ({
   onMenu,
   onOpenImage,
   onRestore,
+  onRetry,
 }: {
   dot: string;
   message: MessageView;
@@ -1424,6 +1465,8 @@ const MessageRow = ({
   onMenu: (menu: Menu) => void;
   onOpenImage: (url: string) => void;
   onRestore: (message: MessageView) => void;
+  // Only while the answer to the owner's last change was lost.
+  onRetry?: (() => void) | undefined;
 }) => {
   const open = (x: number, y: number) => {
     if (!blocked && !message.hidden) onMenu({ message, x, y });
@@ -1508,6 +1551,18 @@ const MessageRow = ({
       <div className="meta">
         <span>{time(message.time)}</span>
         {delivered ? <span className="delivered">Delivered</span> : null}
+        {onRetry ? (
+          <span className="unconfirmed" data-unconfirmed>
+            Not confirmed yet{" "}
+            <button
+              type="button"
+              title="open-dot didn't answer your last change to this message. Ask again for the same change."
+              onClick={onRetry}
+            >
+              Try again
+            </button>
+          </span>
+        ) : null}
         {message.hidden ? (
           <button type="button" disabled={blocked} onClick={() => onRestore(message)}>
             Restore

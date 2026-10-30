@@ -421,7 +421,8 @@ button:disabled {
   border-color: var(--accent);
 }
 
-.delivered {
+.delivered,
+.unconfirmed {
   color: var(--muted);
 }
 

@@ -8,6 +8,7 @@ import {
   deliveredID,
   editDraft,
   emptyDraft,
+  fencePage,
   historyLimit,
   imageInfo,
   isImageType,
@@ -236,14 +237,56 @@ test("a change stays shown over stale reads until a read that started after its 
   const returned = new Map([["a", { ...pendingIntent, settledAt: 50 }]]);
   // A read that started before the call returned and shows the old state can't settle it...
   expect(settledBy([message("a")], returned, 40)).toEqual([]);
-  // ...but one that shows the change, or that started after the call returned, does: the second is
-  // the daemon's word even when the change didn't take.
+  // ...but one that shows the change, or that started after the daemon answered, does: the second
+  // is the daemon's word even when the change didn't take.
   expect(settledBy([showing], returned, 40)).toEqual(["a"]);
   expect(settledBy([message("a")], returned, 50)).toEqual(["a"]);
   // An intent from another session never paints or settles this one.
   const other = message("a", { sessionID: "ses_b" });
   expect(applyIntents([other], returned)[0]?.hidden).toBe(false);
   expect(settledBy([other], returned, 99)).toEqual([]);
+});
+
+test("a change whose answer was lost waits for a read that shows it, however late", () => {
+  const lost = new Map([
+    ["a", { sessionID: "ses_a", emoji: "👍", settledAt: 50, uncertain: true }],
+  ]);
+  // The PUT may still be on its way: reads after the timeout that show the old state settle nothing.
+  expect(settledBy([message("a")], lost, 60)).toEqual([]);
+  expect(settledBy([message("a")], lost, 10_000)).toEqual([]);
+  expect(applyIntents([message("a")], lost)[0]?.reactions).toMatchObject([
+    { actor: "owner", emoji: "👍" },
+  ]);
+  // Once a read shows it landed, even one that began before, it settles.
+  const landed = message("a", { reactions: [{ actor: "owner", emoji: "👍", updatedAt: 70 }] });
+  expect(settledBy([landed], lost, 10_000)).toEqual(["a"]);
+  const restore = new Map([
+    ["a", { sessionID: "ses_a", hidden: false, settledAt: 50, uncertain: true }],
+  ]);
+  expect(settledBy([message("a", { hidden: true })], restore, 99)).toEqual([]);
+  expect(settledBy([message("a")], restore, 99)).toEqual(["a"]);
+});
+
+test("a latest page can't replace a message with a state from before its change was confirmed", () => {
+  const current = mergeLatest(undefined, page(["a", "b"]));
+  const confirmed = replaceMessage(
+    current,
+    message("a", { hidden: true, reactions: [{ actor: "owner", emoji: "👍", updatedAt: 1 }] }),
+  );
+  const fences = new Map([["a", 100]]);
+  // A page that began before the change was confirmed keeps the confirmed message, and only it.
+  const stale = page(["a", "b"]);
+  stale.messages[1] = message("b", { text: "edited" });
+  const kept = fencePage(stale, confirmed, fences, 99);
+  expect(kept.messages[0]).toBe(confirmed.messages[0]);
+  expect(kept.messages[1]?.text).toBe("edited");
+  expect(mergeLatest(confirmed, kept).messages[0]).toMatchObject({ hidden: true });
+  // One that began after it is the daemon's word.
+  const later = fencePage(stale, confirmed, fences, 100);
+  expect(later.messages[0]).toBe(stale.messages[0]);
+  // Another session's page starts over untouched.
+  const moved = page(["a"], { sessionID: "ses_b" });
+  expect(fencePage(moved, confirmed, fences, 0)).toBe(moved);
 });
 
 const page = (ids: string[], fields: Partial<PageView> = {}): PageView => ({
@@ -253,6 +296,7 @@ const page = (ids: string[], fields: Partial<PageView> = {}): PageView => ({
   pending: [],
   recentEmojis: [],
   generation: 1,
+  startedAt: 0,
   ...fields,
 });
 

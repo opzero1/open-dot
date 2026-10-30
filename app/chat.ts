@@ -293,14 +293,16 @@ export const reactionOf = (message: MessageView, actor: "owner" | "dot") =>
 
 /**
  * A change the owner made to one message, a reaction or whether it's hidden, shown over what reads
- * return until a read settles it. `settledAt` is when its call returned; until then, and whenever
- * its outcome is unknown, it blocks any other change to that message.
+ * return until a read settles it, and blocking any other change to that message meanwhile.
+ * `settledAt` is when its call returned. `uncertain` means a call's answer was lost, so the change
+ * may still land at any time: only a read that shows it settles it.
  */
 export interface Intent {
   sessionID: string;
   emoji?: string | null;
   hidden?: boolean;
-  settledAt?: number;
+  settledAt?: number | undefined;
+  uncertain?: boolean;
 }
 
 const showsIntent = (message: MessageView, intent: Intent) =>
@@ -330,9 +332,10 @@ export const applyIntents = (
   });
 
 /**
- * The intents a read settles: its call has returned, and the read either started after that or
- * already shows the change. A read that started earlier can't flicker the change back, and a read
- * that started later is the daemon's word, even when the change didn't take.
+ * The intents a read settles: its call has returned, and the read already shows the change or, for
+ * a change the daemon answered, started after that answer. A read that started earlier can't
+ * flicker the change back; a later one is the daemon's word, even when the change didn't take. A
+ * change whose answer was lost waits for a read that shows it, since it may still land.
  */
 export const settledBy = (
   messages: readonly MessageView[],
@@ -343,10 +346,36 @@ export const settledBy = (
     const intent = intents.get(message.id);
     return intent?.settledAt !== undefined &&
       intent.sessionID === message.sessionID &&
-      (startedAt >= intent.settledAt || showsIntent(message, intent))
+      (showsIntent(message, intent) || (!intent.uncertain && startedAt >= intent.settledAt))
       ? [message.id]
       : [];
   });
+
+/**
+ * When each settled change was confirmed, by message ID: a read that started before then may
+ * carry the old state, so it never replaces that message.
+ */
+export type Fences = ReadonlyMap<string, number>;
+
+export const fenced = (fences: Fences | undefined, id: string, startedAt: number) =>
+  startedAt < (fences?.get(id) ?? -Infinity);
+
+/** A latest page with every message a fence covers kept as it's already loaded. */
+export const fencePage = (
+  page: PageView,
+  current: Conversation | undefined,
+  fences: Fences | undefined,
+  startedAt: number,
+): PageView => {
+  if (!current || current.sessionID !== page.sessionID || !fences?.size) return page;
+  const loaded = new Map([...current.latest, ...current.messages].map((item) => [item.id, item]));
+  return {
+    ...page,
+    messages: page.messages.map((message) =>
+      fenced(fences, message.id, startedAt) ? (loaded.get(message.id) ?? message) : message,
+    ),
+  };
+};
 
 export const historyLimit = 600;
 

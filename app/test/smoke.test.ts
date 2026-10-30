@@ -75,7 +75,12 @@ class FakeDaemon {
   stallNext = false;
   stalled = 0;
   stalledDone = 0;
+  // Answers the stalled read, with the state it had when it arrived.
+  release: (() => void) | undefined;
+  // While set, every other message read waits for it.
+  hold: Promise<void> | undefined;
   onPost: ((body: Post) => Response | Promise<Response> | undefined) | undefined;
+  onPut: ((id: string, part: string) => Response | Promise<Response> | undefined) | undefined;
   index = 0;
   server: ReturnType<typeof Bun.serve> | undefined;
   log = {
@@ -180,9 +185,14 @@ class FakeDaemon {
         // A read that started before the owner's change answers after it, with the old state.
         this.stallNext = false;
         this.stalled++;
-        await delay(2000);
+        await new Promise<void>((done) => {
+          this.release = done;
+        });
         this.stalledDone++;
-      } else if (before === null) await delay(this.pageDelay);
+      } else if (before === null) {
+        await this.hold;
+        await delay(this.pageDelay);
+      }
       return Response.json(page);
     }
     if (path === "/dots/jojo/messages" && method === "POST") {
@@ -217,10 +227,15 @@ class FakeDaemon {
     const at = id ? this.messages.findIndex((item) => item.id === id) : -1;
     const found = this.messages[at];
     if (id && !found) return Response.json({ error: "No such message." }, { status: 404 });
-    if (id && found && !single?.[2] && method === "GET") return Response.json(this.view(found, at));
+    if (id && found && !single?.[2] && method === "GET") {
+      await this.hold;
+      return Response.json(this.view(found, at));
+    }
     if (id && single?.[2] && method === "PUT") {
       const body = (await request.json()) as Record<string, unknown>;
       this.log.puts.push({ id, part: single[2], body });
+      const hook = this.onPut?.(id, single[2]);
+      if (hook) return hook;
       if (single[2] === "reaction") {
         if (typeof body.emoji === "string") this.reactions.set(id, body.emoji);
         else this.reactions.delete(id);
@@ -771,15 +786,41 @@ test("changes to older messages settle by their own reads, stale reads can't und
         null,
       ]);
 
-      // A latest-page read that started before a reaction answers after it with the old state.
+      // A latest-page read that started before a reaction and a delete answers after both are
+      // confirmed, with the old state. Every later read is held meanwhile, so none can hide an
+      // overwrite.
       await js(`t.scroll(t.list().scrollHeight), true`);
-      await until(`!!t.msg("m95")`, "a recent message");
+      await until(`!!t.msg("m95") && !!t.msg("m94")`, "recent messages");
       fake.stallNext = true;
       for (let tick = 0; tick < 50 && fake.stalled === 0; tick++) await delay(100);
       expect(fake.stalled).toBe(1);
       await menu("m95", "👍");
+      await until(
+        `t.msg("m95").querySelector(".reaction.owner")?.textContent === "👍" && !t.msg("m95").dataset.blocked`,
+        "the confirmed reaction",
+      );
+      await menu("m94", "Delete");
+      await press(".modal", "Delete");
+      // Show deleted is still on, so the deleted message stays listed, marked hidden.
+      await until(
+        `!!t.msg("m94")?.classList.contains("hidden") && !t.msg("m94").dataset.blocked`,
+        "the confirmed delete",
+      );
+      const { promise: held, resolve: unhold } = Promise.withResolvers<void>();
+      fake.hold = held;
+      fake.release?.();
       for (let tick = 0; tick < 50 && fake.stalledDone === 0; tick++) await delay(100);
-      await delay(400);
+      expect(fake.stalledDone).toBe(1);
+      await delay(1000);
+      expect(
+        await js(`({
+          reaction: t.msg("m95").querySelector(".reaction.owner")?.textContent ?? null,
+          deleted: t.msg("m94")?.classList.contains("hidden") ?? null,
+        })`),
+      ).toEqual({ reaction: "👍", deleted: true });
+      fake.hold = undefined;
+      unhold();
+      await delay(1500);
       expect(await js(`t.msg("m95").querySelector(".reaction.owner")?.textContent`)).toBe("👍");
 
       // The menu keeps keyboard focus and its checked state through polls.
@@ -854,6 +895,61 @@ test("a send whose receipt the daemon has before its POST answers settles when t
       await js(`t.type("Next"), t.enter(), true`);
       await until(`t.box().value === ""`, "the next send");
       expect(fake.log.posts.map((post) => post.text)).toEqual(["Lost", "Next"]);
+    },
+  );
+}, 170_000);
+
+test("a change whose answer was lost stays blocked until a read shows it, and Try again asks for the same change", async () => {
+  await scenario(
+    "uncertain",
+    (fake) => {
+      fake.messages = many(100).map((item) => ({ ...item, kind: "dot" as const }));
+    },
+    async ({ fake, js, until, menu, press }) => {
+      await until(`!!t.msg("m95") && !!t.msg("m96")`, "the latest page");
+      // The daemon takes the first PUT to each message and dies before answering; it hasn't
+      // applied it yet when it comes back.
+      const lost = new Set<string>();
+      fake.onPut = (id) => {
+        if (lost.has(id)) return undefined;
+        lost.add(id);
+        setTimeout(() => fake.restart(), 50);
+        return new Promise<Response>(() => {});
+      };
+      await menu("m95", "👍");
+      await until(`!!t.msg("m95")?.querySelector("[data-unconfirmed]")`, "the unconfirmed change");
+      // Pinned reads of the old state settle nothing, and no other change can be made.
+      await delay(4000);
+      expect(
+        await js(`({
+          blocked: t.msg("m95").dataset.blocked === "",
+          shown: t.msg("m95").querySelector(".reaction.owner")?.textContent ?? null,
+          actions: t.msg("m95").querySelector("button.more").disabled,
+        })`),
+      ).toEqual({ blocked: true, shown: "👍", actions: true });
+      // The original PUT lands late: a read shows it, and the message is free again.
+      fake.reactions.set("m95", "👍");
+      await until(
+        `!t.msg("m95").dataset.blocked && !t.msg("m95").querySelector("[data-unconfirmed]")`,
+        "the late change to settle",
+      );
+      expect(fake.log.puts.filter((put) => put.id === "m95").map((put) => put.body.emoji)).toEqual([
+        "👍",
+      ]);
+
+      // Another lost change, asked again by the owner: the same value, once more, never another.
+      await menu("m96", "❤️");
+      await until(`!!t.msg("m96")?.querySelector("[data-unconfirmed]")`, "the second unconfirmed");
+      await delay(1500);
+      await press('[data-message="m96"] [data-unconfirmed]', "Try again");
+      await until(
+        `!t.msg("m96").dataset.blocked && t.msg("m96").querySelector(".reaction.owner")?.textContent === "❤️"`,
+        "the retried change to settle",
+      );
+      expect(fake.log.puts.filter((put) => put.id === "m96").map((put) => put.body.emoji)).toEqual([
+        "❤️",
+        "❤️",
+      ]);
     },
   );
 }, 170_000);

@@ -92,6 +92,8 @@ export interface PageView {
   refreshError?: string;
   /** Added by main: which discovered daemon answered. A new one can't read the old one's cursors. */
   generation: number;
+  /** Added by main: when the request behind this page began, even for a read that joined it. */
+  startedAt: number;
 }
 
 /** Where a send the app made stands, by the daemon's receipt; `unknown` means no row there. */
