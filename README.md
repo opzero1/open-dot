@@ -202,6 +202,46 @@ How it stays safe:
 
 The app's manifest asks for these bot scopes: `app_mentions:read`, `assistant:write`, `channels:history`, `chat:write`, `groups:history`, `im:history`, `im:read`, `im:write`, `metadata.message:read` and `users:read`, which `bots.info` needs. It subscribes to `app_mention`, `message.im`, `assistant_thread_started`, `assistant_thread_context_changed` and `app_home_opened` over Socket Mode. The thread's context Slack sends is never kept. Not yet checked live: whether Slack shows the AGENT badge, whether your workspace lets you install your own apps, whether Slack keeps a streamed message's marker block for the lookup, and whether `chat.update` with a markdown block replaces a streamed message as expected.
 
+## Use the app
+
+The open-dot app is a desktop chat app built with Electron. It talks only to the running daemon, as the notch does, and will replace the notch. This first version has the chat: pick a dot, read and scroll back through its conversation, type to it with pasted or dropped images, reply, react, copy, share and delete messages, and open or stop its workers. The notch still has Memory, Instructions, Library, Health and the feed until the app gets them.
+
+Build and start it from the checkout:
+
+```sh
+bun run app:build     # build into app/build
+bun run app:start     # build, then start it
+bun run app:test      # its tests, against a fake daemon in a hidden window
+bun run app:package   # build app/dist/mac-arm64/open-dot.app, signed ad hoc
+```
+
+It finds the daemon from `api.json`, so it follows `OPEN_DOT_HOME`. Closing the window hides it; Control-Option-Space or the menu bar icon shows it again. The menu bar icon shows when a dot is busy and how many messages you haven't read. If another app has Control-Option-Space, the icon's menu says so. Quit from that menu.
+
+A message you send gets its ID before it leaves the app, and the app saves only that ID until the daemon answers. If the answer is lost, the app asks the daemon about that ID and shows what it says. It never sends the message again on its own.
+
+To start the packaged app at login, hidden, save `~/Library/LaunchAgents/com.opzero1.open-dot.app.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.opzero1.open-dot.app</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/open-dot/app/dist/mac-arm64/open-dot.app/Contents/MacOS/open-dot</string>
+    <string>--hidden</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>
+```
+
+Start it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.opzero1.open-dot.app.plist`. It restarts the app if it crashes, but not after you quit it. After `bun run app:package`, restart it with `launchctl kickstart -k gui/$(id -u)/com.opzero1.open-dot.app`. To go back to the notch, run `launchctl bootout gui/$(id -u)/com.opzero1.open-dot.app` and delete the file; the notch's own launch agent is separate and keeps running.
+
 ## Talk from the notch
 
 The notch app is a small native macOS app (macOS 14 or later) that talks to the running daemon. Build and start it:

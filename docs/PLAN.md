@@ -10,7 +10,7 @@ This project is a fresh, small rebuild of [open-bot](https://github.com/affddn/o
 
 ## Principles
 
-- **Reuse OpenCode.** Don't add a second chat UI, agent loop, permission system or config language. Use only `@opencode/client` and `@opencode/plugin`, and never read or write OpenCode's database.
+- **Reuse OpenCode.** Don't add a second agent loop, permission system or config language. The open-dot app is the one chat client open-dot adds, and it only shows and sends through the daemon what OpenCode keeps. Use only `@opencode/client` and `@opencode/plugin`, and never read or write OpenCode's database.
 - **Attach, don't manage.** Connect with `Service.discover()`. Never start, stop or replace the user's service. Never call `location.reload()`, because it cancels work in other sessions.
 - **Persist intent before acting.** Assign each `ses_` and `msg_` ID before the call that uses it. When an outcome is lost, reconcile it by that ID; never blindly send it again.
 - **Report reality.** An admitted prompt has not completed, and an idle session has not succeeded. A state of _unknown_ is a real state, not an error to hide.
@@ -41,7 +41,8 @@ One `plugins` entry in the OpenCode config loads both plugins. The server plugin
 | Server plugin | OpenCode service     | Provides the tools a dot calls, such as `dot_remind`, `dot_track`, `dot_delegate` and `dot_message`. It writes only to open-dot's DB.  |
 | Daemon        | `open-dot daemon`    | The single owner of timers, workers and the feed. It starts worker sessions, watches them, and sends every message through the outbox. |
 | TUI plugin    | OpenCode terminal UI | Shows each dot and its recent workers in the sidebar and provides `/dot` and palette commands. It reads the DB read-only.              |
-| Notch app     | `mac/`, a macOS app  | Sits at the notch. Hover to pick a dot, read and type to it, and see its workers. It talks only to the daemon's local API.             |
+| App           | `app/`, Electron     | The desktop chat app that replaces the notch. Pick a dot, read and type to it, and see its workers. It talks only to the daemon's API. |
+| Notch app     | `mac/`, a macOS app  | Sits at the notch, until the app has its views. It talks only to the daemon's local API.                                               |
 
 The daemon, not the plugin, owns timers for two reasons. A plugin runs only while its location is loaded, while the daemon can wake a dot whenever the OpenCode service is up. The daemon is also the host for the notch app and connectors, which is how you'll talk to a dot from anywhere.
 
@@ -281,6 +282,14 @@ The background loop checks each second without waiting for another dot's read. A
 
 The notch serializes latest-page reads per dot, coalescing overlapping triggers into one follow-up read instead of discarding every slow answer. It shows loading before the first page and an error with Retry on failure, keeping any messages already shown. A non-visible dot is swept every 30 seconds independently of the five-second feed poll. Decode failures log only the response type, field path and failure kind, not payload values. Mutation and per-message reconciliation guards still apply.
 
+## The open-dot app
+
+The open-dot app in `app/` is an Electron desktop app that replaces the notch. It is a client of the daemon's local API, like the notch, and finds the daemon the same way, from `api.json`, sending its token only to plain `http` on `127.0.0.1` or `[::1]` and never following a redirect. Milestone A1 is its shell and chat: the window, the menu bar icon with busy and unread marks, the Control-Option-Space shortcut, the dot list, the conversation with Markdown, code, math and diffs, older pages, images, replies, Tapbacks, copy, share, delete and restore, and workers' Open and Stop and requests' Open. A2 ports Memory, Instructions, Library, Health, Connectors and the feed, then retires the notch. Until then both run, and the notch keeps every view it has.
+
+The renderer is untrusted. It runs sandboxed with context isolation and no Node, from the app's own `app://open-dot` origin under a strict CSP, with no remote content, navigation, new windows, webviews or permissions. Its preload exposes a fixed set of operations, never `ipcRenderer`, and main accepts each call only from that page's main frame and checks every argument. Only main holds the daemon's token or talks to the daemon. Markdown is sanitized, with no raw HTML and no style from messages; a link opens in the browser only as `http`, `https` or `mailto` with no credentials, controls or hidden characters, and anything else stays text. Pasted and dropped images cross as bytes, never paths, and main checks their type, size and dimensions from the bytes, converting a TIFF to PNG, before they reach the daemon.
+
+A send follows the plan's principle: the app makes the `msg_` ID and, before the call, saves only `{ dot, sessionID, messageID, createdAt }` to `sends.json` in its own data directory, never the text or images. It posts with that ID, as the API section above describes, and drops the record once the daemon answers 202 or refuses the send. A lost answer, a timeout, 401 or 5xx leaves the message unknown, and the app asks `GET …/pending/<id>` about that ID, after a restart of either side too, until the daemon reports it; it never sends it again on its own, and Stop tracking only forgets the record. The draft, a dot's quote and unread counts live only in the app.
+
 ## Verified OpenCode behavior
 
 These were checked live against OpenCode 2.1.1 and shape the code:
@@ -301,7 +310,7 @@ Each milestone is a shippable vertical slice, tracked as a GitHub issue. Verify 
 2. **It follows up.** Add the `dot_remind` and `dot_note` tools and the daemon. Due reminders are queued into the dot's session with deterministic `msg_` IDs. Reminders survive a restart, and an unknown delivery is reconciled by ID, never duplicated.
 3. **It delegates.** Add responsibilities, each with a goal, a next action and a status. The dot hands substantial work to worker sessions, tracks them, and brings a linked summary back into its conversation. It also gets a simple recurring schedule.
 4. **Dots talk to each other.** Several specialist dots can message each other, and replies are treated as untrusted data.
-5. **Talk to it from the notch.** The daemon serves a small local API, and a thin native macOS app talks to it. Hovering over the notch opens a panel where you pick a dot, read its conversation, type to it, and see worker results arrive.
+5. **Talk to it from the notch.** The daemon serves a small local API, and a thin native macOS app talks to it; the open-dot app later replaces it (see Decisions). Hovering over the notch opens a panel where you pick a dot, read its conversation, type to it, and see worker results arrive.
 6. **A feed in the notch.** The daemon collects what needs your attention from GitHub and Linear, such as review requests, mentions and assigned issues, and the notch shows it as a live, Twitch-style stream you can act on. Feed items reach a dot only as data.
 7. **Slack.** DM an internal Slack app to talk to a dot, and it replies there under its own name. Only the owner's messages instruct a dot there. Your Slack mentions and DMs join the notch feed as untrusted data. Each dot can also get its own Slack app that you mention in any channel.
 
@@ -312,7 +321,10 @@ Each milestone is a shippable vertical slice, tracked as a GitHub issue. Verify 
 
 ## Decisions
 
-- **The client is a thin native macOS app in the notch,** not a web client. It holds no state of its own and talks only to the daemon. It comes before Slack.
+- **The client was first a thin native macOS app in the notch,** not a web client. It holds no state of its own and talks only to the daemon. It came before Slack.
+- **The Electron open-dot app replaces the notch** (2026-10-30). The notch's panel was too small for long conversations, code and diffs, and a desktop window with web rendering does those better. Like the notch it keeps no state but its unconfirmed send IDs, drafts and unread counts, and talks only to the daemon. A1 adds the app's shell and chat; A2 ports the rest and retires the notch.
+- **Dictation (#35) is deferred past 1.0.**
+- **Homebrew and `open-dot install` build the app locally from source,** signed ad hoc. There's no Developer ID signing or notarization, so nothing is downloaded prebuilt.
 - **The first notch version shows the notification feed as well as dot chat.** The feed shows things that need your attention, not every event.
 - **Slack does two jobs:** it's a way to talk to your dots, and a source the dots watch for you.
 - **Dots run only on this Mac for now.** An always-on host can come later.
