@@ -1036,7 +1036,8 @@ const smokeAnswer = (value: unknown) => process.stdout.write(`SMOKE ${JSON.strin
 
 /**
  * The hidden smoke test's driver, only with OPEN_DOT_APP_SMOKE=1: each stdin line is a JSON
- * command, `{id, eval}` to run in the page or `{id}` for what main recorded, answered on stdout.
+ * command, `{id, eval}` to run in the page or `{id}` for what main recorded, answered on stdout;
+ * `emit: "shown"` first tells the page the window was shown.
  */
 const smokeDriver = () => {
   if (!window) return;
@@ -1054,6 +1055,8 @@ const smokeDriver = () => {
       const command: unknown = JSON.parse(line);
       if (!isRecord(command)) return;
       id = command.id;
+      // What showing the window tells the page, without showing it.
+      if (command.emit === "shown") emit({ kind: "shown" });
       const value =
         typeof command.eval === "string"
           ? await contents.executeJavaScript(command.eval, true)

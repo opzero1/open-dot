@@ -295,7 +295,10 @@ const App = () => {
   // Reads: the selected chat every second, dots every two, other chats every thirty.
 
   const failures = useRef(new Map<string, number>());
+  // Per dot, when its conversation is next read: 0 asks for a read as soon as none is out.
   const due = useRef(new Map<string, number>());
+  // Dots whose conversation task (latest page and pinned reads) is out. Only its end clears it.
+  const reading = useRef(new Set<string>());
   // The dot list's and each send receipt's clocks, kept while the scheduler restarts.
   const clocks = useRef({
     dots: 0,
@@ -408,7 +411,9 @@ const App = () => {
         applyPage(name, result.value);
       } else {
         failures.current.set(name, count + 1);
-        due.current.set(name, Date.now() + backoff(count + 1) * 1000);
+        // A read asked for meanwhile still runs next; otherwise wait out the backoff.
+        if (due.current.get(name) !== 0)
+          due.current.set(name, Date.now() + backoff(count + 1) * 1000);
         setReadErrors((current) => new Map(current).set(name, result.error));
       }
     },
@@ -476,7 +481,9 @@ const App = () => {
   useEffect(() => {
     const run = { stopped: false };
     // The dot list, each conversation and each send's receipt are read on their own clocks. A
-    // key's due time is Infinity while its read is out, so a slow read delays only its own key.
+    // key's due time is Infinity while its read is out, so a slow read delays only its own key; a
+    // conversation is also marked reading until its task ends, so a refresh asked for meanwhile
+    // (due set to 0) waits to run once, after it.
     const clock = clocks.current;
     const { receipts: receiptDue, receiptFailures } = clock;
     const start = (task: () => Promise<void>) => void task().catch(() => {});
@@ -546,6 +553,7 @@ const App = () => {
         for (const [id, intent] of intentsRef.current.get(name) ?? [])
           if (intent.settledAt !== undefined) await refreshMessage(name, id, intent.sessionID);
       } finally {
+        reading.current.delete(name);
         // A read asked for while this one was out (due set to 0) runs next instead of waiting.
         if (due.current.get(name) === Infinity)
           due.current.set(name, Date.now() + (name === selectedRef.current ? 1000 : 30_000));
@@ -578,7 +586,9 @@ const App = () => {
         selectedRef.current,
         ...dotsRef.current.map((item) => item.name),
       ])) {
-        if (!name || now < (due.current.get(name) ?? 0)) continue;
+        // Asking for a read sets due to 0 but never starts a second task beside one still out.
+        if (!name || reading.current.has(name) || now < (due.current.get(name) ?? 0)) continue;
+        reading.current.add(name);
         due.current.set(name, Infinity);
         start(() => readConversation(name));
       }

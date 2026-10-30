@@ -91,6 +91,13 @@ class FakeDaemon {
   hold: Promise<void> | undefined;
   // While set, every receipt read waits for it.
   receiptHold: Promise<void> | undefined;
+  // While set, each latest-page read waits for its own release, in `gated`.
+  gate = false;
+  gated: (() => void)[] = [];
+  // While set, every read of one message waits for it; `pinnedOut` counts those out now.
+  pinnedHold: Promise<void> | undefined;
+  pinnedOut = 0;
+  maxPinnedOut = 0;
   // Other dots, listed after jojo, whose latest page waits for their own hold.
   others = new Map<
     string,
@@ -106,6 +113,7 @@ class FakeDaemon {
     stops: [] as number[],
     staleCursors: 0,
     olderReads: 0,
+    latestReads: 0,
     receipts: 0,
     dotReads: 0,
     // Requests each server instance got, by its number.
@@ -253,6 +261,8 @@ class FakeDaemon {
         });
         this.stalledDone++;
       } else if (before === null) {
+        this.log.latestReads++;
+        if (this.gate) await new Promise<void>((done) => this.gated.push(done));
         await this.hold;
         await delay(this.pageDelay);
       }
@@ -293,6 +303,11 @@ class FakeDaemon {
     const found = this.messages[at];
     if (id && !found) return Response.json({ error: "No such message." }, { status: 404 });
     if (id && found && !single?.[2] && method === "GET") {
+      if (this.pinnedHold) {
+        this.maxPinnedOut = Math.max(this.maxPinnedOut, ++this.pinnedOut);
+        await this.pinnedHold;
+        this.pinnedOut--;
+      }
       await this.hold;
       return Response.json(this.view(found, at));
     }
@@ -488,7 +503,9 @@ const launch = async (name: string, setup: (fake: FakeDaemon) => void) => {
     clearTimeout(killer);
     fake.stop();
   };
-  return { fake, js, until, state, press, menu, found, close, temporary };
+  /** Tells the page its window was shown, as the tray and shortcut do, without showing it. */
+  const shown = () => call({ emit: "shown" });
+  return { fake, js, until, state, press, menu, found, close, temporary, shown };
 };
 
 type App = Awaited<ReturnType<typeof launch>>;
@@ -1318,6 +1335,80 @@ test("Back to latest keeps a same-session quote, and drops it when the dot rebin
       await until(`t.box().value === ""`, "the send");
       expect(fake.log.posts).toEqual([expect.objectContaining({ text: "Draft text", files: 1 })]);
       expect(fake.log.posts[0]?.replyTo).toBeUndefined();
+    },
+  );
+}, 170_000);
+
+test("a refresh asked for while a chat's read is out runs once after it: a held page can't rebuild a cleared window, and a held pinned read isn't joined by another task", async () => {
+  await scenario(
+    "one-task",
+    (fake) => {
+      fake.messages = many(100);
+      fake.others.set("kiki", {
+        messages: [{ id: "k1", kind: "dot", text: "From kiki" }],
+        hold: undefined,
+        reads: 0,
+      });
+    },
+    async ({ fake, js, until, menu, shown }) => {
+      const waitFor = async (done: () => boolean, label: string) => {
+        for (let tick = 0; tick < 100 && !done(); tick++) await delay(100);
+        if (!done()) throw new Error(`Timed out waiting for ${label}.`);
+      };
+      await until(`t.count() === 50 && t.list().dataset.first === "m50"`, "the latest page");
+      fake.failOlder = true;
+      await js(`t.scroll(0), true`);
+      await until(`!!document.querySelector("[data-older-error]")`, "the older-page error");
+      fake.failOlder = false;
+
+      // A latest read of m50–m99 is held; the daemon moves on, so later reads answer m60–m109.
+      fake.gate = true;
+      await waitFor(() => fake.gated.length === 1, "a held latest read");
+      fake.messages.push(...many(110).slice(100));
+      await js(`t.click("Back to latest", document.querySelector("[data-older-error]"))`);
+      // Several scheduler ticks pass while it's held: nothing reads beside it.
+      await delay(1500);
+      expect(fake.gated.length).toBe(1);
+      // Released, it answers for the window that's gone. The one follow-up read waits in turn, and
+      // across more ticks the cleared window stays empty rather than showing the old page.
+      fake.gated.shift()?.();
+      await waitFor(() => fake.gated.length === 1, "the follow-up latest read");
+      await delay(1500);
+      expect(fake.gated.length).toBe(1);
+      expect(await js(`t.count() === 0 && t.list()?.dataset.first !== "m50"`)).toBe(true);
+      fake.gate = false;
+      for (const done of fake.gated.splice(0)) done();
+      await until(
+        `t.list().dataset.first === "m60" && t.count() === 50`,
+        "the daemon's latest page",
+      );
+
+      // A reaction to an older message, off the latest page, settles only by reads of that
+      // message: its own and the scheduled task's are held. Selecting the chat again and showing
+      // the window ask for reads, but no task starts beside the one still out.
+      await js(`t.scroll(0), true`);
+      await until(`t.count() === 100`, "the older page");
+      await js(`t.scroll(0), true`);
+      await until(`!!t.msg("m12")`, "an older message");
+      const { promise: held, resolve: unhold } = Promise.withResolvers<void>();
+      fake.pinnedHold = held;
+      await menu("m12", "❤️");
+      await waitFor(() => fake.pinnedOut === 2, "the reaction's held reads");
+      const latest = fake.log.latestReads;
+      await js(`document.querySelector('[data-dot="kiki"]').click(), true`);
+      await until(`!!t.msg("k1")`, "kiki's chat");
+      await js(`document.querySelector('[data-dot="jojo"]').click(), true`);
+      await shown();
+      await delay(2500);
+      expect(fake.log.latestReads).toBe(latest);
+      expect(fake.maxPinnedOut).toBe(2);
+      fake.pinnedHold = undefined;
+      unhold();
+      // Released, the asked-for read runs once, after the held task, and nothing is sent again.
+      await waitFor(() => fake.log.latestReads > latest && fake.pinnedOut === 0, "the follow-up");
+      expect(fake.log.puts.filter((put) => put.id === "m12").map((put) => put.body.emoji)).toEqual([
+        "❤️",
+      ]);
     },
   );
 }, 170_000);
