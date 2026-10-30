@@ -1071,6 +1071,7 @@ const changePending = (db: Db, dot: Dot, id: string, request: Request) =>
  * Orders the owner's writes to one message's reaction or hidden marker by when each request
  * arrived. A request that waited on OpenCode, perhaps after its caller gave up and retried, can't
  * commit over a write from a request that arrived after it, so the owner's newer choice stands.
+ * `write` connects to OpenCode itself, so a request takes its place before waiting on a connection.
  * `commit` is called just before the synchronous write, after every check. A key is forgotten once
  * no request holds it; numbers only grow, so a later request never loses to an earlier one.
  */
@@ -2078,11 +2079,15 @@ const route = (
   db: Db,
   request: Request,
   path: string[],
-): Effect.Effect<Response, OpenCodeError, OpenCode> => {
+  layer: Layer.Layer<OpenCode, OpenCodeError>,
+): Effect.Effect<Response, OpenCodeError> => {
+  const connect = <A, E>(effect: Effect.Effect<A, E, OpenCode>) => Effect.provide(effect, layer);
   const [root, name, rest, ...extra] = path;
   if (root !== "dots") return Effect.succeed(error(404, "Not found"));
   if (name === undefined)
-    return request.method === "GET" ? listAll(db) : Effect.succeed(error(404, "Not found"));
+    return request.method === "GET"
+      ? connect(listAll(db))
+      : Effect.succeed(error(404, "Not found"));
   const decoded = (() => {
     try {
       return decodeURIComponent(name);
@@ -2094,10 +2099,10 @@ const route = (
   const dot = findDot(db, decoded);
   if (!dot) return Effect.succeed(error(404, `There's no dot named "${name}".`));
   if (rest === "messages" && extra.length === 0) {
-    if (request.method === "POST") return send(db, dot, request);
+    if (request.method === "POST") return connect(send(db, dot, request));
   }
   if (rest === "fresh" && extra.length === 0 && request.method === "POST")
-    return freshRoute(db, dot, request);
+    return connect(freshRoute(db, dot, request));
   const [id, part, index, ...more] = extra;
   if (rest === "memory")
     return id === "notes" &&
@@ -2105,19 +2110,19 @@ const route = (
       index === "source" &&
       more.length === 0 &&
       request.method === "GET"
-      ? noteSourceRead(db, dot, part)
+      ? connect(noteSourceRead(db, dot, part))
       : Effect.succeed(error(404, "Not found"));
   if (rest === "messages" && id !== undefined && extra.length === 1 && request.method === "GET")
-    return conversationMessage(db, dot, id, request);
+    return connect(conversationMessage(db, dot, id, request));
   if (rest === "pending" && id !== undefined && extra.length === 1 && request.method === "GET")
-    return receipt(db, dot, id, request);
+    return connect(receipt(db, dot, id, request));
   if (
     rest === "pending" &&
     id !== undefined &&
     extra.length === 1 &&
     (request.method === "PATCH" || request.method === "DELETE")
   )
-    return changePending(db, dot, id, request);
+    return connect(changePending(db, dot, id, request));
   if (
     rest === "messages" &&
     part === "reaction" &&
@@ -2126,7 +2131,7 @@ const route = (
     request.method === "PUT"
   )
     return inOrder(`reaction\0${dot.name}\0${dot.sessionID}\0${id}`, (commit) =>
-      react(db, dot, id, request, commit),
+      connect(react(db, dot, id, request, commit)),
     );
   if (
     rest === "messages" &&
@@ -2136,7 +2141,7 @@ const route = (
     request.method === "PUT"
   )
     return inOrder(`hidden\0${dot.name}\0${dot.sessionID}\0${id}`, (commit) =>
-      hide(db, dot, id, request, commit),
+      connect(hide(db, dot, id, request, commit)),
     );
   if (
     rest === "messages" &&
@@ -2146,7 +2151,9 @@ const route = (
     more.length === 0 &&
     request.method === "GET"
   )
-    return attachment(db, dot, id, index, new URL(request.url).searchParams.get("sessionID"));
+    return connect(
+      attachment(db, dot, id, index, new URL(request.url).searchParams.get("sessionID")),
+    );
   return Effect.succeed(error(404, "Not found"));
 };
 
@@ -2597,8 +2604,8 @@ export const api = (
       );
     }
     return Effect.runPromise(
-      route(db, request, path).pipe(
-        Effect.provide(sharedLayer),
+      // Each route connects to OpenCode itself, so an ordered write takes its place on arrival.
+      route(db, request, path, sharedLayer).pipe(
         Effect.catch((failure) => Effect.succeed(error(503, failure.message))),
       ),
     );

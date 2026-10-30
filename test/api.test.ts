@@ -2020,3 +2020,85 @@ test("a write the app gave up on can't land over a retry and the owner's newer c
   expect((await slow).status).toBe(200);
   expect((await pinned()).reactions).toMatchObject([{ actor: "owner", emoji: null }]);
 });
+
+test("a write still connecting to OpenCode can't land over a retry and the owner's newer choice", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "answer")]);
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  // The next connection waits on `connecting`; reads of a session in `stall` wait, then fail.
+  let connecting: Promise<void> | undefined;
+  const stall = new Map<string, Promise<void>>();
+  const layer = Layer.effect(
+    OpenCode,
+    Effect.promise(async () => {
+      const wait = connecting;
+      connecting = undefined;
+      await wait;
+      return {
+        ...oc,
+        messagePage: (sessionID: string, limit: number, cursor?: string) =>
+          stall.has(sessionID)
+            ? Effect.promise(async () => stall.get(sessionID)).pipe(
+                Effect.andThen(Effect.fail(new OpenCodeError({ message: "Timed out" }))),
+              )
+            : oc.messagePage(sessionID, limit, cursor),
+      };
+    }),
+  );
+  let clock = 0;
+  const handler = api(db, "secret", layer, undefined, () => clock);
+  const put = (part: string, body: unknown) =>
+    handler(
+      new Request(`http://127.0.0.1/dots/jojo/messages/msg_answer/${part}`, {
+        method: "PUT",
+        headers: { authorization: "Bearer secret" },
+        body: JSON.stringify(body),
+      }),
+    );
+  const saved = () => ({
+    reactions: db.select().from(reactions).all(),
+    hidden: db.select().from(hiddenMessages).all(),
+  });
+
+  // An earlier write waits on a new connection while a refresh that started before it fails and
+  // drops the connection, so the retry and the newer choice connect afresh and commit first.
+  const race = async (original: () => Promise<Response>, then: () => Promise<void>) => {
+    clock += 60_000;
+    const failing = Promise.withResolvers<void>();
+    stall.set("ses_polnareff", failing.promise);
+    stall.set("ses_jojo", Promise.resolve());
+    const refreshing = handler.refresh();
+    await Bun.sleep(10);
+    stall.delete("ses_jojo");
+    const connected = Promise.withResolvers<void>();
+    connecting = connected.promise;
+    const first = original();
+    await Bun.sleep(10);
+    failing.resolve();
+    await refreshing;
+    stall.delete("ses_polnareff");
+    await then();
+    connected.resolve();
+    return first;
+  };
+
+  const reacting = await race(
+    () => put("reaction", { emoji: "❤️", sessionID: "ses_jojo" }),
+    async () => {
+      expect((await put("reaction", { emoji: "❤️", sessionID: "ses_jojo" })).status).toBe(200);
+      expect((await put("reaction", { emoji: "👍", sessionID: "ses_jojo" })).status).toBe(200);
+    },
+  );
+  expect(reacting.status).toBe(409);
+  expect(saved().reactions).toMatchObject([{ actor: "owner", emoji: "👍" }]);
+
+  const hiding = await race(
+    () => put("hidden", { sessionID: "ses_jojo", hidden: true }),
+    async () => {
+      expect((await put("hidden", { sessionID: "ses_jojo", hidden: true })).status).toBe(200);
+      expect(saved().hidden).toHaveLength(1);
+      expect((await put("hidden", { sessionID: "ses_jojo", hidden: false })).status).toBe(200);
+    },
+  );
+  expect(hiding.status).toBe(409);
+  expect(saved().hidden).toEqual([]);
+});
