@@ -14,6 +14,7 @@ import {
   feed,
   hiddenMessages,
   outbox,
+  ownerFacts,
   reactions,
   recentReactions,
   requests,
@@ -2210,4 +2211,27 @@ test("M10: the owner's fact routes create, review and delete with versions, and 
     fake.layer,
   )(new Request("http://127.0.0.1/owner/memory"));
   expect(anonymous.status).toBe(401);
+});
+
+test("M10: approving a stored proposal the current checks refuse is a 422 that changes nothing", async () => {
+  const id = crypto.randomUUID();
+  db.insert(ownerFacts)
+    .values({
+      id,
+      state: "pending",
+      text: "password: hunter2",
+      version: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    .run();
+  const refused = await call(`/owner/facts/${id}`, {
+    method: "PATCH",
+    ...json({ action: "approve", version: 1, mutationID: crypto.randomUUID() }),
+  });
+  expect(refused.status).toBe(422);
+  expect(JSON.stringify(await refused.json())).not.toContain("hunter2");
+  expect(await (await call(`/owner/facts/${id}`)).json()).toMatchObject({
+    fact: { state: "pending", version: 1, lastMutationID: null },
+  });
 });

@@ -17,7 +17,7 @@ import {
   renderOwner,
   secretRefusal,
 } from "../src/owner";
-import { ownerFactKeys } from "../src/schema";
+import { ownerFactKeys, ownerFacts } from "../src/schema";
 
 let directory: string;
 let path: string;
@@ -126,6 +126,56 @@ test("detected credentials are refused in fixed words before anything is stored"
   expect(
     parsePatch({ action: "edit", version: 1, mutationID: crypto.randomUUID(), text: "pass: x1" }),
   ).toEqual({ invalid: secretRefusal });
+});
+
+test("approval checks the stored proposal again, and every direct change is checked before it's written", () => {
+  // A proposal saved before the checks refused its kind of text, seeded as an older daemon would.
+  const id = crypto.randomUUID();
+  db.insert(ownerFacts)
+    .values({
+      id,
+      state: "pending",
+      text: "password: hunter2",
+      version: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      originDot: "jojo",
+      originSession: "ses_jojo",
+      originMessage: "msg_old",
+    })
+    .run();
+  const keys = () => db.select().from(ownerFactKeys).all();
+  const before = readFact(db, id);
+  expect(changeFact(db, id, 1, mutation(), { action: "approve" })).toEqual({
+    refused: secretRefusal,
+  });
+  expect(readFact(db, id)).toEqual(before);
+  expect(keys()).toEqual([]);
+  expect(ownerSection(db).text).not.toContain("hunter2");
+  // Approving the owner's own edit of it instead goes through.
+  expect(
+    changeFact(db, id, 1, mutation(), { action: "approve", text: "Uses a password manager." }),
+  ).toMatchObject({ saved: { state: "approved", version: 2 } });
+
+  // Unchecked strings handed straight to changeFact are refused the same way, saving nothing.
+  const fresh = crypto.randomUUID();
+  for (const text of ["key ghp_abcdefghijklmnop1234 here", "x".repeat(501), "?!", "bad \ud800"])
+    expect(changeFact(db, fresh, 0, mutation(), { action: "create", text })).toHaveProperty(
+      "refused",
+    );
+  expect(readFact(db, fresh)).toBeUndefined();
+  expect(changeFact(db, id, 2, mutation(), { action: "edit", text: "pass: x1" })).toEqual({
+    refused: secretRefusal,
+  });
+  changeFact(db, id, 2, mutation(), { action: "delete" });
+  expect(changeFact(db, id, 3, mutation(), { action: "restore", text: "   " })).toHaveProperty(
+    "refused",
+  );
+  expect(readFact(db, id)).toMatchObject({ state: "deleted", version: 3, text: null });
+  // An accepted direct text is stored as checked: trimmed.
+  expect(
+    changeFact(db, fresh, 0, mutation(), { action: "create", text: "  Lives in Lisbon.  " }),
+  ).toMatchObject({ saved: { text: "Lives in Lisbon." } });
 });
 
 test("the approved set stays within its UTF-8 budget, refused whole and rolled back", () => {

@@ -244,7 +244,7 @@ export type Change =
 /**
  * Where an owner's change landed. `conflict` is the fact as it is now, when it changed since the
  * version given, or can't take this change in its state; `existing` is another fact that already
- * has this text. `refused` is a whole approved set over the budget.
+ * has this text. `refused` is a text the checks refuse or a whole approved set over the budget.
  */
 export type FactOutcome =
   | { readonly saved: FactView }
@@ -262,6 +262,7 @@ const allowed: Record<Exclude<Change["action"], "create">, readonly OwnerFact["s
 
 /**
  * The owner's change to one fact, in one immediate transaction: the version and state are checked,
+ * the candidate text checked with `factText` (a refusal is `refused`, in its fixed words),
  * the text deduplicated against every alias and the approved set kept within its budget, and the
  * aliases and the row written together. The same mutation ID again answers the fact as it is.
  */
@@ -293,15 +294,17 @@ export function changeFact(
       if (change.action === "create") {
         if (row) return { conflict: factView(row), reason: "A fact with this ID already exists." };
         if (version !== 0) return { missing: true };
-        const taken = duplicate(change.text);
+        const text = factText(change.text);
+        if (typeof text !== "string") return { refused: text.invalid };
+        const taken = duplicate(text);
         if (taken) return taken;
-        if (!fits([...approvedTexts(tx), change.text])) return { refused: budgetRefusal };
+        if (!fits([...approvedTexts(tx), text])) return { refused: budgetRefusal };
         const saved = tx
           .insert(ownerFacts)
           .values({
             id,
             state: "approved",
-            text: change.text,
+            text,
             version: 1,
             createdAt: now,
             updatedAt: now,
@@ -309,7 +312,7 @@ export function changeFact(
           })
           .returning()
           .get();
-        alias(tx, "text", textKey(change.text), id);
+        alias(tx, "text", textKey(text), id);
         return { saved: factView(saved) };
       }
       if (!row) return { missing: true };
@@ -317,10 +320,15 @@ export function changeFact(
         return { conflict: factView(row), reason: "This fact changed since you loaded it." };
       if (!allowed[change.action].includes(row.state))
         return { conflict: factView(row), reason: `This fact is ${row.state} now.` };
-      const text =
+      // The whole candidate, the stored text too when approving it as proposed, passes the
+      // current checks before it's hashed or written; a refusal changes nothing.
+      const candidate =
         change.action === "reject" || change.action === "delete"
           ? null
-          : (("text" in change ? change.text : undefined) ?? row.text);
+          : factText(("text" in change ? change.text : undefined) ?? row.text);
+      if (candidate !== null && typeof candidate !== "string")
+        return { refused: candidate.invalid };
+      const text = candidate;
       if (change.action === "edit" && text === row.text) return { saved: factView(row) };
       if (text !== null) {
         const taken = duplicate(text);
