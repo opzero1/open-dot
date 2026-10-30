@@ -215,7 +215,7 @@ bun run app:test      # its tests, against a fake daemon in a hidden window
 bun run app:package   # build app/dist/mac-arm64/open-dot.app, signed ad hoc
 ```
 
-It finds the daemon from `api.json`, so it follows `OPEN_DOT_HOME`. Closing the window hides it; Control-Option-Space or the menu bar icon shows it again. The menu bar icon shows when a dot is busy and how many messages you haven't read. If another app has Control-Option-Space, the icon's menu says so. Quit from that menu.
+It finds the daemon from `api.json`, so it follows `OPEN_DOT_HOME`. It stays in the Dock while it runs, even started hidden at login. Closing the window only hides it; the Dock icon, Control-Option-Space or the menu bar icon shows it again. The menu bar icon shows when a dot is busy and how many messages you haven't read. If another app has Control-Option-Space, the icon's menu says so. Quit from that menu.
 
 Command-1 shows the selected dot's chat, Command-2 its Memory and Command-3 its Instructions. Escape returns to the chat and keeps every draft, including a new note, observation or feed trigger in Memory, except while you're composing with an input method or a dialog is open. Clicking another dot keeps the pane you're in. Only the chat marks a dot's messages read; the feed and the other panes don't. Every control has a label for VoiceOver, menus work with the arrow keys, and dialogs put the safe choice first, with Escape to cancel.
 
@@ -239,7 +239,7 @@ Nothing a dot or you save to its memory, purpose or instructions keeps a likely 
 
 A worker saves file deliverables, such as a report, in its own directory, `~/.opendot/outputs/<dot>/<worker>/`, which its task names. The dot adds one to its Library with `dot_library_add`, which keeps a private copy in `~/.opendot/library/<dot>/`: only that worker's own regular files, never links, other directories or URLs, and only `.txt`, `.md`, `.csv` or `.pdf` files of up to 10 MiB, with at most 200 files and 200 MiB per dot, counting copies on disk too. It needs macOS on Apple silicon, and those directories must stay yours and private (0700); open-dot refuses rather than repairs them. Choose **Library** from the dot's ⋯ menu in the app to list them, newest first, with their type, size and worker. **Export…** checks the bytes against the saved SHA-256 and saves a copy where you choose in the save dialog; it never opens or previews the file. A copy that's gone or changed says so and can't be exported.
 
-Choose **Health** for the report `open-dot health` prints, with **Check again**.
+Choose **Health** for the report `open-dot health` prints, with **Check again**. Health and the menu bar menu also show whether OpenCode's background server is running, with **Start**, **Restart…** and **Stop…**, which run `opencode2 service start|restart|stop` (or `OPEN_DOT_OPENCODE`, found on your login PATH) and show what it printed. Restart and Stop ask first: they interrupt every running session, your dots and their workers included. open-dot never runs them on its own, and its daemon reconnects once OpenCode is back.
 
 To start the packaged app at login, hidden, save `~/Library/LaunchAgents/com.opzero1.open-dot.app.plist`:
 
