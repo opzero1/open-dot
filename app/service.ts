@@ -49,6 +49,7 @@ export const runBinary = (
   args: readonly string[],
   env: Record<string, string | undefined>,
   timeout: number,
+  limit = outputLimit,
 ) =>
   new Promise<Ran>((done) => {
     let output = "";
@@ -62,7 +63,7 @@ export const runBinary = (
       return;
     }
     const take = (chunk: Buffer) => {
-      output = (output + chunk.toString("utf8")).slice(-outputLimit);
+      output = (output + chunk.toString("utf8")).slice(-limit);
     };
     child.stdout?.on("data", take);
     child.stderr?.on("data", take);
@@ -120,6 +121,7 @@ export const loginPath = async (shell: string, env: Record<string, string | unde
     ["-i", "-l", "-c", `printf '%s%s%s' ${marker} "$PATH" ${marker}`],
     env,
     5_000,
+    65_536,
   );
   if (ran.problem) return undefined;
   const parts = ran.output.split(marker);
