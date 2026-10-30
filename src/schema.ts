@@ -1196,3 +1196,41 @@ export const slackNotices = sqliteTable(
   },
   (table) => [unique().on(table.bot, table.channel, table.user)],
 );
+
+/**
+ * Facts about the owner, shared with every dot. A dot only proposes one, as `pending`, with the
+ * dot, session and assistant message it came from; only the owner approves, edits, rejects or
+ * deletes one. A rejected or deleted row keeps its ID, version and origin, never its text.
+ */
+export const ownerFacts = sqliteTable("owner_facts", {
+  id: text().primaryKey(),
+  state: text({ enum: ["pending", "approved", "rejected", "deleted"] }).notNull(),
+  text: text(),
+  version: integer().notNull(),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+  // Set by a proposal and never changed; null for a fact the owner added.
+  originDot: text("origin_dot"),
+  originSession: text("origin_session"),
+  originMessage: text("origin_message"),
+  // The owner's latest change, by the ID their client chose before sending it.
+  lastMutationID: text("last_mutation_id"),
+});
+
+export type OwnerFact = typeof ownerFacts.$inferSelect;
+
+/**
+ * Permanent aliases of owner facts: the SHA-256 of each text a fact has had, as `text`, and of the
+ * assistant message a rejected or deleted proposal came from, as `source`. Never the text itself.
+ */
+export const ownerFactKeys = sqliteTable(
+  "owner_fact_keys",
+  {
+    kind: text({ enum: ["text", "source"] }).notNull(),
+    key: text().notNull(),
+    fact: text()
+      .notNull()
+      .references(() => ownerFacts.id),
+  },
+  (table) => [primaryKey({ columns: [table.kind, table.key] })],
+);
