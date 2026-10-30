@@ -1776,7 +1776,7 @@ test("a change whose answer was lost stays blocked until a read shows it, and Tr
   );
 }, 170_000);
 
-test("Copy and Share are all or nothing, and pending, attachment and worker rows match the notch", async () => {
+test("Copy and Share are all or nothing, and pending, attachment and worker rows follow their state", async () => {
   const app = await scenario(
     "parity",
     (fake) => {
@@ -1849,7 +1849,7 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
         { texts: 1, files: 7 },
       ]);
 
-      // Pending rows offer Send now and Cancel as the notch does.
+      // Pending rows offer Send now and Cancel.
       const actions = await js(
         `Object.fromEntries([...document.querySelectorAll("[data-pending]")].map((row) => [row.dataset.id, [...row.querySelectorAll("button")].map((b) => b.textContent)]))`,
       );
@@ -2062,6 +2062,23 @@ test("Memory: a refused edit shows beside the value now, edits send only changed
         await delay(100);
       expect(mutations(fake, "/dots/jojo/memory/archive")).toEqual([
         { method: "DELETE", path: "/dots/jojo/memory/archive/msg_a", body: null },
+      ]);
+      // A reminder's repeat changes alone, keeping its time and the version it started from.
+      await press('[data-reminder="3"]', "Change time");
+      await js(`t.fill('[data-reminder="3"] input[inputmode=numeric]', "90")`);
+      await press('[data-reminder="3"]', "Save");
+      for (
+        let tick = 0;
+        tick < 50 && !mutations(fake, "/dots/jojo/memory/reminders/3").length;
+        tick++
+      )
+        await delay(100);
+      expect(mutations(fake, "/dots/jojo/memory/reminders/3")).toEqual([
+        {
+          method: "PATCH",
+          path: "/dots/jojo/memory/reminders/3",
+          body: { version: 1, everyMinutes: 90 },
+        },
       ]);
     },
   );

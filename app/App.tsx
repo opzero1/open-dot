@@ -1140,6 +1140,7 @@ const App = () => {
           {dots.map((item) => {
             const count = unread.get(item.name) ?? 0;
             const needs = needsCount(item);
+            const editing = editors.current.get(item.name)?.dirty ?? false;
             return (
               <div key={item.name} className="dot-row">
                 <button
@@ -1160,6 +1161,9 @@ const App = () => {
                 >
                   <Avatar dot={item} />
                   <span className="dot-name">{item.name}</span>
+                  {editing ? (
+                    <span className="badge unsaved" aria-label="Unsaved instructions" />
+                  ) : null}
                   {item.busy ? <span className="badge busy" aria-label="Busy" /> : null}
                   {needs ? (
                     <span className="badge needs" aria-label={`${needs} need you`}>
@@ -1455,6 +1459,7 @@ const App = () => {
         <DotMenu
           menu={dotMenu}
           fresh={!freshening.has(dotMenu.dot)}
+          unsaved={editors.current.get(dotMenu.dot)?.dirty ?? false}
           onPick={(next) => show(dotMenu.dot, next)}
           onFresh={() => confirmFresh(dotMenu.dot)}
           onClose={() => setDotMenu(undefined)}
@@ -1487,12 +1492,14 @@ const App = () => {
 const DotMenu = ({
   menu,
   fresh,
+  unsaved,
   onPick,
   onFresh,
   onClose,
 }: {
   menu: { dot: string; x: number; y: number };
   fresh: boolean;
+  unsaved: boolean;
   onPick: (pane: Pane) => void;
   onFresh: () => void;
   onClose: () => void;
@@ -1536,6 +1543,8 @@ const DotMenu = ({
             role="menuitem"
             aria-keyshortcuts={index < 3 ? `Meta+${index + 1}` : undefined}
             title={index < 3 ? `⌘${index + 1}` : undefined}
+            data-unsaved={pane === "instructions" && unsaved ? "" : undefined}
+            aria-description={pane === "instructions" && unsaved ? "Unsaved edits" : undefined}
             onClick={() => onPick(pane)}
           >
             {label}

@@ -517,6 +517,13 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   const reminderRow = (reminder: MemoryReminder) => {
     const row = `reminder:${reminder.id}`;
     const editing = edits.get(row);
+    const repeat = `reminder-every:${reminder.id}`;
+    const every = (edits.get(repeat) ?? "").trim();
+    // Empty repeats never; otherwise whole minutes, as the daemon takes them.
+    const everyMinutes = every === "" ? null : /^\d+$/.test(every) ? Number(every) : Number.NaN;
+    const everyValid =
+      everyMinutes === null ||
+      (Number.isSafeInteger(everyMinutes) && everyMinutes >= 1 && everyMinutes <= 525_600);
     return (
       <li key={reminder.id} className="item" data-reminder={reminder.id}>
         <div className="item-text">{reminder.text}</div>
@@ -536,20 +543,43 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
                 onChange={(event) => edit(row, event.target.value)}
               />
             </label>
+            <label>
+              Repeat every{" "}
+              <input
+                inputMode="numeric"
+                size={7}
+                aria-invalid={!everyValid}
+                value={edits.get(repeat) ?? ""}
+                onChange={(event) => edit(repeat, event.target.value)}
+              />{" "}
+              minutes (empty for once)
+            </label>
             <div className="item-actions">
-              <button type="button" onClick={() => edit(row, undefined)}>
+              <button
+                type="button"
+                onClick={() => {
+                  edit(row, undefined);
+                  edit(repeat, undefined);
+                }}
+              >
                 Cancel
               </button>
               <button
                 type="button"
                 className="send"
-                disabled={busy.has(row) || Number.isNaN(new Date(editing).getTime())}
+                disabled={busy.has(row) || Number.isNaN(new Date(editing).getTime()) || !everyValid}
                 onClick={() => {
                   const dueAt = new Date(editing).getTime();
+                  // Only what changed goes, against the version the edit started from.
+                  const change: { dueAt?: number; everyMinutes?: number | null } = {};
+                  // The field shows whole minutes, so an untouched time keeps its seconds.
+                  if (editing !== local(reminder.dueAt)) change.dueAt = dueAt;
+                  if (everyMinutes !== reminder.everyMinutes) change.everyMinutes = everyMinutes;
                   edit(row, undefined);
-                  if (dueAt !== reminder.dueAt)
+                  edit(repeat, undefined);
+                  if (Object.keys(change).length)
                     void mutate(row, () =>
-                      bridge.call("editReminder", dot, reminder.id, reminder.version, { dueAt }),
+                      bridge.call("editReminder", dot, reminder.id, reminder.version, change),
                     );
                 }}
               >
@@ -559,7 +589,13 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           </div>
         ) : null}
         <div className="item-actions">
-          <button type="button" onClick={() => edit(row, local(reminder.dueAt))}>
+          <button
+            type="button"
+            onClick={() => {
+              edit(row, local(reminder.dueAt));
+              edit(repeat, reminder.everyMinutes === null ? "" : String(reminder.everyMinutes));
+            }}
+          >
             Change time
           </button>
           <button

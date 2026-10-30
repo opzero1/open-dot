@@ -161,6 +161,14 @@ button:disabled {
   color: white;
 }
 
+.badge.unsaved {
+  min-width: 8px;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border: 1.5px solid var(--accent);
+}
+
 .badge.needs {
   background: var(--danger);
   color: white;
@@ -862,6 +870,11 @@ button:disabled {
   background: none;
   padding: 2px 6px;
   color: var(--muted);
+}
+
+.dot-menu [data-unsaved]::after {
+  content: " •";
+  color: var(--accent);
 }
 
 .dot-menu hr {
