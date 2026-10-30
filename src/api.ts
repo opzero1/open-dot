@@ -1067,7 +1067,39 @@ const changePending = (db: Db, dot: Dot, id: string, request: Request) =>
     });
   });
 
-const react = (db: Db, dot: Dot, id: string, request: Request) =>
+/**
+ * Orders the owner's writes to one message's reaction or hidden marker by when each request
+ * arrived. A request that waited on OpenCode, perhaps after its caller gave up and retried, can't
+ * commit over a write from a request that arrived after it, so the owner's newer choice stands.
+ * `commit` is called just before the synchronous write, after every check. A key is forgotten once
+ * no request holds it; numbers only grow, so a later request never loses to an earlier one.
+ */
+const writeOrder = { last: 0, keys: new Map<string, { open: number; committed: number }>() };
+const inOrder = <A, E, R>(
+  key: string,
+  write: (commit: () => boolean) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.suspend(() => {
+    const seq = ++writeOrder.last;
+    const entry = writeOrder.keys.get(key) ?? { open: 0, committed: 0 };
+    writeOrder.keys.set(key, entry);
+    entry.open++;
+    const commit = () => {
+      if (entry.committed > seq) return false;
+      entry.committed = seq;
+      return true;
+    };
+    return write(commit).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (--entry.open === 0) writeOrder.keys.delete(key);
+        }),
+      ),
+    );
+  });
+const newerWrite = () => error(409, "A newer change to this message came first. Refresh.");
+
+const react = (db: Db, dot: Dot, id: string, request: Request, commit: () => boolean) =>
   Effect.gen(function* () {
     const body: unknown = yield* Effect.tryPromise(() => request.json()).pipe(
       Effect.orElseSucceed(() => undefined),
@@ -1095,6 +1127,7 @@ const react = (db: Db, dot: Dot, id: string, request: Request) =>
       return error(404, "There's no such dot message in recent history.");
     if (rebound(db, dot))
       return error(409, "The dot's conversation changed. Refresh before reacting.");
+    if (!commit()) return newerWrite();
     const reaction = saveReaction(db, dot, id, "owner", body.emoji, target.text);
     return Response.json({ reaction, recentEmojis: recentEmojis(db) });
   });
@@ -1103,7 +1136,7 @@ const react = (db: Db, dot: Dot, id: string, request: Request) =>
  * Hides a message in the notch only, for the session the owner saw it in. A repeat keeps the first
  * time. Nothing is sent, and OpenCode history, the dot's context and reactions are unchanged.
  */
-const hide = (db: Db, dot: Dot, id: string, request: Request) =>
+const hide = (db: Db, dot: Dot, id: string, request: Request, commit: () => boolean) =>
   Effect.gen(function* () {
     const body = yield* Effect.tryPromise(() => messageBody(request, 1024)).pipe(
       Effect.orElseSucceed(() => undefined),
@@ -1127,6 +1160,7 @@ const hide = (db: Db, dot: Dot, id: string, request: Request) =>
       return error(409, "The dot's conversation changed. Refresh before deleting.");
     // Restoring removes only this session's marker; it needs no OpenCode read.
     if (!body.hidden) {
+      if (!commit()) return newerWrite();
       db.delete(hiddenMessages)
         .where(
           and(
@@ -1145,6 +1179,7 @@ const hide = (db: Db, dot: Dot, id: string, request: Request) =>
       return error(404, "There's no such message in recent history.");
     if (messageSources(db, dot.sessionID, [id]).get(id)?.state === "pending")
       return error(409, "This message is still being delivered.");
+    if (!commit()) return newerWrite();
     const key = and(
       eq(hiddenMessages.dot, dot.name),
       eq(hiddenMessages.sessionID, dot.sessionID),
@@ -2090,7 +2125,9 @@ const route = (
     extra.length === 2 &&
     request.method === "PUT"
   )
-    return react(db, dot, id, request);
+    return inOrder(`reaction\0${dot.name}\0${dot.sessionID}\0${id}`, (commit) =>
+      react(db, dot, id, request, commit),
+    );
   if (
     rest === "messages" &&
     part === "hidden" &&
@@ -2098,7 +2135,9 @@ const route = (
     extra.length === 2 &&
     request.method === "PUT"
   )
-    return hide(db, dot, id, request);
+    return inOrder(`hidden\0${dot.name}\0${dot.sessionID}\0${id}`, (commit) =>
+      hide(db, dot, id, request, commit),
+    );
   if (
     rest === "messages" &&
     part === "attachments" &&

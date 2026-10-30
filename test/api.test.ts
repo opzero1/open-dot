@@ -1955,3 +1955,68 @@ test("restoring a hidden message removes only its marker, and a pinned reaction 
   expect((await pinnedReaction("ses_jojo")).status).toBe(200);
   expect((await putReaction("❤️")).status).toBe(200);
 });
+
+test("a write the app gave up on can't land over a retry and the owner's newer choice", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "answer")]);
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  let hold: Promise<void> | undefined;
+  // Only the first lookup of each round waits: the original request, still alive in the daemon
+  // after the app's 10-second timeout.
+  const layer = Layer.succeed(OpenCode, {
+    ...oc,
+    message: (input) => {
+      const wait = hold;
+      hold = undefined;
+      return Effect.promise(async () => wait).pipe(Effect.andThen(oc.message(input)));
+    },
+  });
+  const handler = api(db, "secret", layer);
+  const put = (part: string, body: unknown) =>
+    handler(
+      new Request(`http://127.0.0.1/dots/jojo/messages/msg_answer/${part}`, {
+        method: "PUT",
+        headers: { authorization: "Bearer secret" },
+        body: JSON.stringify(body),
+      }),
+    );
+  const pinned = async () =>
+    (await (
+      await handler(
+        new Request("http://127.0.0.1/dots/jojo/messages/msg_answer?sessionID=ses_jojo", {
+          headers: { authorization: "Bearer secret" },
+        }),
+      )
+    ).json()) as { hidden: boolean; reactions: { actor: string; emoji: string | null }[] };
+
+  let release = Promise.withResolvers<void>();
+  hold = release.promise;
+  const original = put("reaction", { emoji: "❤️", sessionID: "ses_jojo" });
+  await Bun.sleep(10);
+  expect((await put("reaction", { emoji: "❤️", sessionID: "ses_jojo" })).status).toBe(200);
+  expect((await pinned()).reactions).toMatchObject([{ actor: "owner", emoji: "❤️" }]);
+  expect((await put("reaction", { emoji: "👍", sessionID: "ses_jojo" })).status).toBe(200);
+  release.resolve();
+  expect((await original).status).toBe(409);
+  expect((await pinned()).reactions).toMatchObject([{ actor: "owner", emoji: "👍" }]);
+
+  release = Promise.withResolvers<void>();
+  hold = release.promise;
+  const hiding = put("hidden", { sessionID: "ses_jojo", hidden: true });
+  await Bun.sleep(10);
+  expect((await put("hidden", { sessionID: "ses_jojo", hidden: true })).status).toBe(200);
+  expect((await pinned()).hidden).toBe(true);
+  expect((await put("hidden", { sessionID: "ses_jojo", hidden: false })).status).toBe(200);
+  release.resolve();
+  expect((await hiding).status).toBe(409);
+  expect((await pinned()).hidden).toBe(false);
+  expect(db.select().from(hiddenMessages).all()).toEqual([]);
+
+  // With nothing newer, a slow write still lands.
+  release = Promise.withResolvers<void>();
+  hold = release.promise;
+  const slow = put("reaction", { emoji: null, sessionID: "ses_jojo" });
+  await Bun.sleep(10);
+  release.resolve();
+  expect((await slow).status).toBe(200);
+  expect((await pinned()).reactions).toMatchObject([{ actor: "owner", emoji: null }]);
+});
