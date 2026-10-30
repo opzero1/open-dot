@@ -409,7 +409,7 @@ ${currentTime()}
  * takes the slot of the tail breakpoint, which would otherwise land on open-dot's changing tail
  * and leave the history uncached on every step.
  */
-function markCacheBreakpoint(
+export function markCacheBreakpoint(
   messages: { content: readonly { type?: string; cache?: unknown }[] }[],
   index: number,
 ) {
@@ -429,6 +429,20 @@ function markCacheBreakpoint(
     ...message,
     content: parts.map((part, i) => (i === at ? { ...part, cache: { type: "ephemeral" } } : part)),
   };
+}
+
+/**
+ * Puts the memory tail just before the owner's latest message, so that message still ends the
+ * request, or at the end once the turn's steps follow it, and marks the message before the tail
+ * as a cache breakpoint. Measured in docs/PLAN.md: the owner's message itself is cached only from
+ * the turn's second step on.
+ */
+export function placeTail<
+  M extends { role: string; content: readonly { type?: string; cache?: unknown }[] },
+>(messages: M[], tail: M) {
+  const at = messages.at(-1)?.role === "user" ? messages.length - 1 : messages.length;
+  markCacheBreakpoint(messages, at - 1);
+  messages.splice(at, 0, tail);
 }
 
 /** Gives a dot's own location its tools, and its memory each turn. */
@@ -1450,10 +1464,7 @@ ${snapshot}
       const sections = memory(db, name, notesShown);
       const changed = await syncEntries(event.sessionID, sections);
       if (current && !bound(event.sessionID)) return;
-      const at =
-        event.messages.at(-1)?.role === "user" ? event.messages.length - 1 : event.messages.length;
-      markCacheBreakpoint(event.messages, at - 1);
-      event.messages.splice(at, 0, {
+      placeTail(event.messages, {
         role: "user",
         content: [
           {

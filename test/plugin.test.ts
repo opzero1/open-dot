@@ -13,7 +13,7 @@ import { OpenCode, OpenCodeError } from "../src/opencode";
 import { createDot, findDot } from "../src/dots";
 import { databasePath, home, observerDirectory, outputDirectory } from "../src/home";
 import { cancelReminder, editNote, editResponsibility, runsWordsTogether } from "../src/memory";
-import plugin from "../src/plugin";
+import plugin, { markCacheBreakpoint, placeTail } from "../src/plugin";
 import { saveReaction } from "../src/reactions";
 import {
   archive,
@@ -2539,4 +2539,68 @@ test("issue61: a deleted archived message is never recalled, auto-recalled or zo
     await loaded.cleanup?.();
     db.$client.close();
   }
+});
+
+type Placed = { role: string; content: { type?: string; text?: string; cache?: unknown }[] };
+const breakpoints = (messages: readonly Placed[]) =>
+  messages.flatMap((message, at) =>
+    message.content.flatMap((part, index) => (part.cache ? [`${at}.${index}`] : [])),
+  );
+const tailMessage = (): Placed => ({ role: "user", content: [{ type: "text", text: "tail" }] });
+
+test("issue62: on a turn's first step the tail goes before the owner's message, which ends the request, and the message before it holds the breakpoint", () => {
+  const history: Placed[] = [
+    { role: "user", content: [{ type: "text", text: "earlier" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "answer" },
+        { type: "reasoning", text: "thinking" },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "the owner's question" }] },
+  ];
+  const shared = history[1];
+  placeTail(history, tailMessage());
+  expect(history.map((message) => message.content[0]?.text)).toEqual([
+    "earlier",
+    "answer",
+    "tail",
+    "the owner's question",
+  ]);
+  // The last text part, not the reasoning after it, and only that one.
+  expect(breakpoints(history)).toEqual(["1.0"]);
+  expect(history[1]?.content[0]?.cache).toEqual({ type: "ephemeral" });
+  // OpenCode's own copy of the message is never changed.
+  expect(shared?.content[0]?.cache).toBeUndefined();
+});
+
+test("issue62: on a later step the tail goes last and the last tool result before it holds the breakpoint", () => {
+  const messages: Placed[] = [
+    { role: "user", content: [{ type: "text", text: "the owner's question" }] },
+    { role: "assistant", content: [{ type: "tool-call" }] },
+    { role: "tool", content: [{ type: "tool-result" }, { type: "effort" }] },
+  ];
+  placeTail(messages, tailMessage());
+  expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "tool", "user"]);
+  expect(messages.at(-1)?.content[0]?.text).toBe("tail");
+  // No text part: the last part that isn't compaction, effort or reasoning.
+  expect(breakpoints(messages)).toEqual(["2.0"]);
+});
+
+test("issue62: a message that already has a breakpoint, or none to mark, is left as it is", () => {
+  const marked: Placed[] = [
+    { role: "assistant", content: [{ type: "text", text: "a", cache: { type: "persistent" } }] },
+  ];
+  markCacheBreakpoint(marked, 0);
+  expect(marked[0]?.content[0]?.cache).toEqual({ type: "persistent" });
+  const empty: Placed[] = [{ role: "assistant", content: [{ type: "compaction" }] }];
+  markCacheBreakpoint(empty, 0);
+  markCacheBreakpoint(empty, -1);
+  expect(breakpoints(empty)).toEqual([]);
+  // The first request of a conversation has nothing before the tail to mark.
+  const first: Placed[] = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
+  placeTail(first, tailMessage());
+  expect(first.map((message) => message.content[0]?.text)).toEqual(["tail", "hello"]);
+  expect(breakpoints(first)).toEqual([]);
 });
