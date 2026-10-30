@@ -10,7 +10,16 @@ import {
 } from "@pierre/diffs";
 import type { Element, ElementContent } from "hast";
 import type { Blockquote, Paragraph, Root, RootContent } from "mdast";
-import { createContext, memo, type ReactNode, useContext, useEffect, useId, useState } from "react";
+import {
+  createContext,
+  memo,
+  type ReactNode,
+  useContext,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
@@ -404,6 +413,8 @@ export const DiffBlock = ({ code }: { code: string }) => {
 
 /** A reply's remote media: the ones the daemon listed, how to load one, and the image viewer. */
 export interface MediaContext {
+  /** The reply's dot, session and message: with a media ID, what a loaded blob belongs to. */
+  scope: string;
   list: readonly MediaView[];
   load: (id: string) => Promise<Result<Bytes>>;
   onOpenImage: (url: string) => void;
@@ -457,6 +468,10 @@ const RemoteMedia = ({
   const [failed, setFailed] = useState(false);
   // Bytes that passed the daemon's checks can still fail to decode or play: the link comes back.
   const [broken, setBroken] = useState(false);
+  // A poll hands over an equal but new context: the blob, and a playing video, stay while the
+  // reply and media are the same, and load again only for another one.
+  const load = useRef(media.load);
+  load.current = media.load;
   useEffect(() => {
     let live = true;
     let held = 0;
@@ -464,7 +479,7 @@ const RemoteMedia = ({
     setURL(undefined);
     setFailed(false);
     setBroken(false);
-    void media.load(entry.id).then((result) => {
+    void load.current(entry.id).then((result) => {
       if (!live) return;
       const size = result.ok ? result.value.data.byteLength : 0;
       if (
@@ -487,7 +502,7 @@ const RemoteMedia = ({
       mediaHeld -= held;
       if (made) URL.revokeObjectURL(made);
     };
-  }, [media, entry.id, entry.kind]);
+  }, [media.scope, entry.id, entry.kind]);
   if (!url || broken)
     return (
       <span

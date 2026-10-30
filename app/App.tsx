@@ -2279,16 +2279,21 @@ const MessageRow = ({
   };
   const reactions = message.reactions.filter((reaction) => reaction.emoji);
   // Only a dot's own replies show remote media, and only what the daemon listed for them.
-  const media = useMemo(() => {
-    const list = message.kind === "dot" ? messageMedia(message) : [];
-    return list.length > 0
-      ? {
-          list,
-          load: (id: string) => bridge.media(dot, message.id, message.sessionID, id),
-          onOpenImage,
-        }
-      : undefined;
-  }, [dot, message.id, message.sessionID, message.kind, message.media, onOpenImage]);
+  // Each poll decodes a new but equal list: keyed by its content, the context stays the same.
+  const list = message.kind === "dot" ? messageMedia(message) : [];
+  const listed = list.map((entry) => `${entry.id} ${entry.kind} ${entry.url}`).join("\n");
+  const media = useMemo(
+    () =>
+      list.length > 0
+        ? {
+            scope: `${dot}/${message.sessionID}/${message.id}`,
+            list,
+            load: (id: string) => bridge.media(dot, message.id, message.sessionID, id),
+            onOpenImage,
+          }
+        : undefined,
+    [dot, message.id, message.sessionID, listed, onOpenImage],
+  );
   return (
     <div
       className={`message ${message.kind} ${message.hidden ? "hidden" : ""}`}

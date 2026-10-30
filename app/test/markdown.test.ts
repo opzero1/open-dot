@@ -47,6 +47,7 @@ test("remote images never load: they become labelled links, or labels when unsaf
 test("only media the daemon listed for the reply load, and only through it", () => {
   const url = "https://example.com/chart.png";
   const media = {
+    scope: "jojo/ses_jojo/msg_reply",
     list: [{ id: "0123456789abcdef", url, kind: "image" as const }],
     load: () => Promise.resolve({ ok: false as const, error: "no" }),
     onOpenImage: () => {},

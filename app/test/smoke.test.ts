@@ -34,6 +34,11 @@ const webm = Buffer.from(
   "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAIkEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEyTbuMU6uEHFO7a1OsggIO7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjMuMS4xMDJXQYxMYXZmNjMuMS4xMDJEiYhAeQAAAAAAABZUrmvXrgEAAAAAAABO14EBc8WI2k8EuBUmJq+cgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QL68IA4JCwgRC6gRCagQJVsIRVuYEBVe6BAOwBAAAAAAAAAgAAElTDZ/pzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYzLjEuMTAyc3PVY8CLY8WI2k8EuBUmJq9nyKBFo4dFTkNPREVSRIeTTGF2YzYzLjEuMTAyIGxpYnZweGfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDAuNDAwMDAwMDAwAB9DtnXY54EAo7yBAACAsAIAnQEqEAAQAABHCIWFiIWEiAICAnWqA/gCDP0oAP7/TRL//FhX8WFfxYV/8WFf/PzO7cX85gCjlYEAyACxAQABEBAAGAAYWC/0AAgAABxTu2uRu4+zgQC3iveBAfGCAbHwgQM=",
   "base64",
 );
+// A 20-second, 16×16 VP8 WebM at two frames a second: long enough to play through several polls.
+const longWebm = Buffer.from(
+  "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",
+  "base64",
+);
 const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
   "base64",
@@ -1171,6 +1176,57 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         "msg_reply/cccccccccccccccc",
       ]);
       expect(fake.log.activityReads).toBeGreaterThan(0);
+    },
+  );
+}, 60_000);
+
+test("an inline video keeps its element, blob and playback through unchanged polls, read once", async () => {
+  await scenario(
+    "video-polls",
+    (fake) => {
+      fake.messages = [
+        { id: "msg_owner", kind: "owner", text: "Show me" },
+        {
+          id: "msg_reply",
+          kind: "dot",
+          text: "Here:\n\nhttps://media.example/long.webm",
+          extra: {
+            media: [
+              { id: "dddddddddddddddd", url: "https://media.example/long.webm", kind: "video" },
+            ],
+          },
+        },
+      ];
+      fake.media.set("dddddddddddddddd", longWebm);
+    },
+    async ({ fake, js, until }) => {
+      const video = `document.querySelector("video[data-media='dddddddddddddddd']")`;
+      await until(`${video}?.readyState >= 1`, "the video's metadata");
+      expect(await js(`${video}.duration`)).toBeGreaterThan(15);
+      // Marks this element, then plays it; the poll keeps replacing the message objects.
+      await js(`(${video}.dataset.marked = "yes", ${video}.play().then(() => true))`);
+      const source = await js(`${video}.src`);
+      const reads = fake.log.latestReads;
+      await until(`${video}.currentTime > 0`, "playback to start");
+      const started = (await js(`${video}.currentTime`)) as number;
+      // Several unchanged polls of the latest page, each with newly decoded message objects.
+      for (const deadline = Date.now() + 15_000; fake.log.latestReads - reads < 3;) {
+        if (Date.now() > deadline) throw new Error("Timed out waiting for three polls.");
+        await delay(100);
+      }
+      expect(
+        await js(`(() => {
+          const video = ${video};
+          return {
+            marked: video.dataset.marked,
+            source: video.src,
+            paused: video.paused,
+            count: document.querySelectorAll("video").length,
+          };
+        })()`),
+      ).toEqual({ marked: "yes", source, paused: false, count: 1 });
+      expect(await js(`${video}.currentTime`)).toBeGreaterThan(started + 2);
+      expect(fake.log.mediaReads).toEqual(["msg_reply/dddddddddddddddd"]);
     },
   );
 }, 60_000);
