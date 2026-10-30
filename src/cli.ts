@@ -386,7 +386,7 @@ const observationAdd = (name: string, given: string) =>
       return fail("Run this in a terminal: adding a row needs you to confirm it. Nothing changed.");
     if (
       !confirmed(
-        `Add to ${name}'s observed memory: "${text}"? A forgotten fact with exactly this text, ignoring case, accents, spacing and punctuation, may then be observed again. A forgotten fact put any other way stays forgotten.`,
+        `Add to ${name}'s observed memory: "${text}"? Only a forgotten fact with exactly this text, ignoring case, accents, spacing and punctuation, may then be observed again from the messages it came from; other forgotten facts keep their block.`,
       )
     )
       return Effect.sync(() => console.log("Nothing changed."));

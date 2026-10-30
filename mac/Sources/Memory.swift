@@ -501,7 +501,7 @@ struct MemoryView: View {
           }
           if let rows = memory.observations {
             section("Observed") {
-              Text("What a background observer noted about this conversation. It may be wrong: edit or forget any row. The observer won't note a forgotten one again from the messages it came from, with the same text under any topic, or in much the same words, but could from new messages in other words. Forgetting can also delete the archived messages it came from. To let the observer note a forgotten fact again, add its text as it was.")
+              Text("What a background observer noted about this conversation. It may be wrong: edit or forget any row. The observer won't note a forgotten one again from the messages it came from or with the same text under any topic, but may if you say it again in a new message. To erase it completely, forget it and delete its source messages. To let the observer note a forgotten fact again, add its text as it was.")
                 .font(.caption2).foregroundStyle(.secondary)
               Text(dailyBudgetNote)
                 .font(.caption2).foregroundStyle(.secondary)
@@ -824,7 +824,7 @@ struct MemoryRow: View {
       alert.addButton(withTitle: "Delete").hasDestructiveAction = true
     case .observation(let row):
       alert.messageText = "Forget this observation?"
-      alert.informativeText = "It leaves the ledger. The observer won't note it again from the messages it came from, with the same text under any topic, or in much the same words, but could from new messages in other words. Forget keeps the archived messages it came from, so recall may still surface what they said; Forget and Delete Sources deletes them from the archive too: \(row.text.prefix(200))"
+      alert.informativeText = "It leaves the ledger. The observer won't note it again from the messages it came from or with the same text under any topic, but may if you say it again in a new message. To erase it completely, forget it and delete its source messages. Forget keeps the archived messages it came from, so recall may still surface what they said; Forget and Delete Sources deletes them from the archive too: \(row.text.prefix(200))"
       alert.addButton(withTitle: "Cancel")
       alert.addButton(withTitle: "Forget").hasDestructiveAction = true
       alert.addButton(withTitle: "Forget and Delete Sources").hasDestructiveAction = true
