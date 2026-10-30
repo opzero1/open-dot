@@ -33,7 +33,6 @@ const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
   "base64",
 );
-const sessionID = "ses_jojo";
 const delay = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
 interface FakeMessage {
@@ -68,6 +67,7 @@ const worker = (id: number, state: string, needs: string[] = []) => ({
  */
 class FakeDaemon {
   messages: FakeMessage[] = [];
+  sessionID = "ses_jojo";
   hidden = new Set<string>();
   reactions = new Map<string, string>();
   pending: { id: string; status: string; delivery: string | null }[] = [];
@@ -140,7 +140,7 @@ class FakeDaemon {
     const emoji = this.reactions.get(message.id);
     return {
       id: message.id,
-      sessionID,
+      sessionID: this.sessionID,
       kind: message.kind,
       hidden: this.hidden.has(message.id),
       text: message.text,
@@ -194,7 +194,7 @@ class FakeDaemon {
       if (empty > 0)
         return Response.json({
           messages: [],
-          sessionID,
+          sessionID: this.sessionID,
           next: `c.${index}.${end}.${empty - 1}`,
           pending: [...this.pending],
           recentEmojis: [],
@@ -203,7 +203,7 @@ class FakeDaemon {
       const start = Math.max(0, end - limit);
       const page = {
         messages: this.messages.slice(start, end).map((item, at) => this.view(item, start + at)),
-        sessionID,
+        sessionID: this.sessionID,
         next: start > 0 ? `c.${index}.${start}` : null,
         pending: [...this.pending],
         recentEmojis: [],
@@ -246,7 +246,7 @@ class FakeDaemon {
       this.log.receipts++;
       if (this.failReceipts) return Response.json({ error: "Not now." }, { status: 503 });
       const status = this.receipts.get(receipt[1]) ?? "unknown";
-      return Response.json({ id: receipt[1], sessionID, status });
+      return Response.json({ id: receipt[1], sessionID: this.sessionID, status });
     }
     if (receipt?.[1] && (method === "PATCH" || method === "DELETE"))
       return Response.json({ pending: null });
@@ -1116,6 +1116,60 @@ test("an older page or error read for a window that's gone is dropped, so histor
       await delay(3500);
       expect(await js(`!!document.querySelector("[data-older-error]")`)).toBe(false);
       expect(await js(contiguous)).toBe(true);
+    },
+  );
+}, 170_000);
+
+test("Back to latest keeps a same-session quote, and drops it when the dot rebinds meanwhile, keeping the draft", async () => {
+  await scenario(
+    "rebind",
+    (fake) => {
+      fake.messages = many(100);
+    },
+    async ({ fake, js, until, menu }) => {
+      await until(`!!t.msg("m95")`, "the latest page");
+      await menu("m95", "Reply");
+      await until(`!!document.querySelector(".quote-bar")`, "the quote");
+      await js(`t.type("Draft text"), t.paste("shot.png"), true`);
+      await until(`document.querySelectorAll(".draft-thumb").length === 1`, "the image");
+      const olderError = async () => {
+        fake.failOlder = true;
+        await js(`t.scroll(0), true`);
+        await until(`!!document.querySelector("[data-older-error]")`, "the older-page error");
+        fake.failOlder = false;
+      };
+
+      // Back to latest in the same conversation keeps the quote.
+      await olderError();
+      await js(`t.click("Back to latest", document.querySelector("[data-older-error]"))`);
+      await until(
+        `t.count() === 50 && !document.querySelector("[data-older-error]")`,
+        "the latest page again",
+      );
+      expect(await js(`!!document.querySelector(".quote-bar")`)).toBe(true);
+
+      // The dot moves to a new session while Back to latest waits for its page.
+      await olderError();
+      const { promise: held, resolve: unhold } = Promise.withResolvers<void>();
+      fake.hold = held;
+      await delay(1500);
+      fake.sessionID = "ses_next";
+      fake.messages = [{ id: "n1", kind: "dot", text: "A new conversation" }];
+      await js(`t.click("Back to latest", document.querySelector("[data-older-error]"))`);
+      fake.hold = undefined;
+      unhold();
+      await until(`!!t.msg("n1") && t.count() === 1`, "the new session's page");
+      expect(
+        await js(`({
+          quote: !!document.querySelector(".quote-bar"),
+          text: t.box().value,
+          images: document.querySelectorAll(".draft-thumb").length,
+        })`),
+      ).toEqual({ quote: false, text: "Draft text", images: 1 });
+      await js(`t.enter(), true`);
+      await until(`t.box().value === ""`, "the send");
+      expect(fake.log.posts).toEqual([expect.objectContaining({ text: "Draft text", files: 1 })]);
+      expect(fake.log.posts[0]?.replyTo).toBeUndefined();
     },
   );
 }, 170_000);

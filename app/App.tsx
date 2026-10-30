@@ -305,6 +305,8 @@ const App = () => {
   const fences = useRef(new Map<string, Map<string, number>>());
   // Per dot, bumped by Back to latest: a latest read that began before it is dropped.
   const epochs = useRef(new Map<string, number>());
+  // Per dot, the session of the last page applied; Back to latest drops the page, not this.
+  const sessions = useRef(new Map<string, string>());
 
   /** Drops intents once nothing can change their message or a read settled them, and fences them. */
   const dropIntents = useCallback(
@@ -337,7 +339,9 @@ const App = () => {
       const previous = conversationsRef.current.get(name);
       const { startedAt } = read;
       const page = fencePage(read, previous, fences.current.get(name), startedAt);
-      if (previous && previous.sessionID !== page.sessionID) {
+      const session = sessions.current.get(name);
+      sessions.current.set(name, page.sessionID);
+      if (session !== undefined && session !== page.sessionID) {
         // A new session: old actions, quotes and intents no longer apply; the draft text stays.
         fences.current.delete(name);
         updateIntents((all) => without(all, name));
