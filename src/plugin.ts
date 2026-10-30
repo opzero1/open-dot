@@ -34,6 +34,7 @@ import {
 } from "./library";
 import {
   parseSearch,
+  redact,
   searchDefaultLimit,
   searchNotes,
   searchResultLimit,
@@ -109,6 +110,8 @@ const plainText = (field: string, value: string) => {
     );
   return value;
 };
+/** Text a dot saves to its memory: plain sentences, with likely credentials redacted. */
+const memoryWrite = (field: string, value: string) => redact(plainText(field, value));
 const id = (description: string) => Schema.Int.annotate({ description });
 const withOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 const list = (lines: string[]) => (lines.length > 0 ? lines.join("\n") : "(none)");
@@ -620,7 +623,7 @@ export default Plugin.define({
             .values({
               dot: name,
               route,
-              text: plainText("The reminder", input.text),
+              text: memoryWrite("The reminder", input.text),
               dueAt,
               everyMinutes: every,
               state: "scheduled",
@@ -670,7 +673,7 @@ export default Plugin.define({
             .insert(notes)
             .values({
               dot: name,
-              text: plainText("The note", input.text),
+              text: memoryWrite("The note", input.text),
               createdAt: Date.now(),
               ...source,
             })
@@ -934,8 +937,8 @@ ${dataJSON(part)}
             .insert(responsibilities)
             .values({
               dot: name,
-              goal: plainText("The goal", input.goal),
-              nextAction: plainText("The next action", input.next_action),
+              goal: memoryWrite("The goal", input.goal),
+              nextAction: memoryWrite("The next action", input.next_action),
               status: "active",
               schedule,
               nextRunAt: nextRunAfter(
@@ -994,7 +997,7 @@ ${dataJSON(part)}
                 .set({
                   ...(input.next_action === undefined
                     ? {}
-                    : { nextAction: plainText("The next action", input.next_action) }),
+                    : { nextAction: memoryWrite("The next action", input.next_action) }),
                   ...(input.status === undefined ? {} : { status: input.status }),
                   ...(schedule === undefined ? {} : { schedule }),
                   nextRunAt: nextRunAfter(current, after, now),
@@ -1332,7 +1335,7 @@ ${dataJSON(part)}
           if (removing === (input.text !== undefined))
             throw new Error("Pass either text or remove: true.");
           const instruction =
-            input.text === undefined ? null : plainText("The instruction", input.text.trim());
+            input.text === undefined ? null : memoryWrite("The instruction", input.text.trim());
           if (instruction !== null && !instruction) throw new Error("Write the instruction.");
           if (instruction !== null && instruction.length > instructionLimit)
             throw new Error(`Keep it to ${instructionLimit} characters.`);

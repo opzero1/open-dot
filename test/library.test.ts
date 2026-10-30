@@ -191,6 +191,14 @@ test("only the dot's own workers count, and a path can't leave that worker's dir
   expect(db.select().from(artifacts).all()).toEqual([]);
 });
 
+test("a file whose path looks like it holds a credential isn't added to the Library", () => {
+  for (const name of [`ghp_${"A1b2".repeat(9)}.md`, "password=hunter2.txt"]) {
+    writeFileSync(join(outputDirectory("jojo", 1), name), "# Findings\n");
+    expect(add("jojo", 1, name)).toContain("looks like it holds a credential");
+  }
+  expect(db.select().from(artifacts).all()).toEqual([]);
+});
+
 test("links, swapped directories, hard links and special files are refused", () => {
   const root = outputDirectory("jojo", 1);
   writeFileSync(join(home, "outside.md"), "outside");

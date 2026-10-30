@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, isNull, lt, or } from "drizzle-orm";
 import { Effect, Exit } from "effect";
 import type { Db } from "./db";
+import { redact } from "./memory";
 import { OpenCode, type Turn } from "./opencode";
 import { needsYou } from "./requests";
 import {
@@ -64,7 +65,9 @@ const endOf = (run: ResponsibilityRun, turn: Turn) => {
     endedAt: turn.endedAt ?? null,
     attribution,
     resultID: reply?.id ?? null,
-    resultText: reply ? reply.text.slice(0, resultLimit).replace(/[\uD800-\uDBFF]$/, "") : null,
+    resultText: reply
+      ? redact(reply.text.slice(0, resultLimit).replace(/[\uD800-\uDBFF]$/, ""))
+      : null,
   };
 };
 

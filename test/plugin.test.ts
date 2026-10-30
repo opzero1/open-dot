@@ -2438,3 +2438,54 @@ test("issue48: connecting or disconnecting a dot's Slack app changes no tool, sc
     db.$client.close();
   }
 });
+
+/** Credential-shaped strings, built at run time so no scanner mistakes the file for a leak. */
+const planted = [
+  `ghp_${"A1b2".repeat(9)}`,
+  `xoxb-1234567890-abcdefghijkl`,
+  `sk-proj${"Z9y8".repeat(5)}`,
+  "password: hunter2",
+];
+
+test("issue61: no memory tool stores a planted secret", async () => {
+  const db = openDatabase(databasePath());
+  db.insert(supervisions)
+    .values({
+      dot: "jojo",
+      sessionID: "ses_owner1",
+      directory: "/work/ses_owner1",
+      mode: "send",
+      state: "active",
+      busyMinutes: 30,
+      createdAt: 1,
+      activatedAt: 1,
+    })
+    .run();
+  const binding = db.select().from(supervisions).get()?.id ?? 0;
+  const loaded = await load(dot.directory);
+  try {
+    for (const secret of planted) {
+      await loaded.call("dot_note", { text: `Deploy key ${secret} for staging.` });
+      await loaded.call("dot_remind", {
+        text: `Rotate ${secret} soon.`,
+        at: "2099-01-01T09:00:00Z",
+      });
+      await loaded.call("dot_track", { goal: `Guard ${secret} well.`, next_action: secret });
+      await loaded.call("dot_instruct", { id: binding, text: `Use ${secret} to log in.` });
+    }
+    const tracked = db.select().from(responsibilities).get()?.id ?? 0;
+    await loaded.call("dot_update", { id: tracked, next_action: `Check ${planted[0]} again.` });
+    const stored = JSON.stringify([
+      db.select().from(notes).all(),
+      db.select().from(reminders).all(),
+      db.select().from(responsibilities).all(),
+      db.select().from(supervisions).all(),
+    ]);
+    for (const secret of planted) expect(stored).not.toContain(secret);
+    expect(stored).not.toContain("hunter2");
+    expect(stored).toContain("[redacted]");
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});

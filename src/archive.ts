@@ -1,7 +1,7 @@
 import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { Effect } from "effect";
 import type { Db } from "./db";
-import { fold, indexTerms, noteSource, snippet } from "./memory";
+import { fold, indexTerms, noteSource, redact, snippet } from "./memory";
 import { type HistoryItem, OpenCode, OpenCodeError } from "./opencode";
 import { messageKind, messageSources } from "./reactions";
 import {
@@ -192,21 +192,6 @@ export const archivingDots = (db: Db) =>
     .where(and(eq(memorySettings.archive, true), eq(dots.sessionState, "ready")))
     .all()
     .map((row) => row.name);
-
-const secrets = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
-  /\b(?:xox[abposre]-|xapp-|xoxe\.)[\w.-]{8,}/g,
-  /\b(?:gh[pousr]_|github_pat_|lin_api_|sk-|sk_live_|rk_live_)[\w-]{16,}/g,
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g,
-];
-const labelled = /\b(pass(?:word|phrase|code)?|secret|token|api[_ -]?key|otp)(\s*[:=]\s*)\S+/gi;
-
-/** Drops what looks like a credential before anything is saved, best effort. */
-export const redact = (text: string) =>
-  secrets
-    .reduce((rest, pattern) => rest.replace(pattern, "[redacted]"), text)
-    .replace(labelled, "$1$2[redacted]");
 
 /**
  * The rows a page adds: the dot's own text and the owner's own words, never a notice, another

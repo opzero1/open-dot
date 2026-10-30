@@ -1484,3 +1484,23 @@ test("a reported cost and the day's stop it reaches are saved together or not at
     "Today's budget is used up; the observer stops until tomorrow.",
   );
 });
+
+test("the observer's notes never keep a planted secret", () => {
+  const ops = parseOps(
+    JSON.stringify({
+      ops: [
+        {
+          op: "add",
+          kind: "fact",
+          topic: `token: ${"abc".repeat(6)}`,
+          text: `The deploy key is ghp_${"A1b2".repeat(9)} and the password: hunter2.`,
+          priority: 1,
+          sources: ["msg_x"],
+        },
+      ],
+    }),
+  );
+  expect(JSON.stringify(ops)).not.toContain("A1b2");
+  expect(JSON.stringify(ops)).not.toContain("hunter2");
+  expect(ops).toMatchObject([{ topic: "token: [redacted]" }]);
+});

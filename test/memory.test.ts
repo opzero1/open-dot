@@ -392,3 +392,57 @@ test("memory shows each schedule and next run, and the owner's status edits paus
   claimDue(db, Date.now());
   expect(db.select().from(outbox).all()).toHaveLength(1);
 });
+
+test("the owner's notes, goals, next actions and trigger tasks never keep a planted secret", async () => {
+  const planted = [
+    `ghp_${"A1b2".repeat(9)}`,
+    `xoxb-1234567890-abcdefghijkl`,
+    `sk-proj${"Z9y8".repeat(5)}`,
+    "password: hunter2",
+  ];
+  const item = responsibility("jojo");
+  for (const [index, secret] of planted.entries()) {
+    const added = await json(
+      await call("/dots/jojo/memory/notes", { method: "POST", body: { text: `Key ${secret}` } }),
+    );
+    expect(added.status).toBe(201);
+    const id = (added.body.note as { id: number }).id;
+    expect(
+      (
+        await call(`/dots/jojo/memory/notes/${id}`, {
+          method: "PATCH",
+          body: { version: 1, text: `Still ${secret}` },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await call(`/dots/jojo/memory/responsibilities/${item.id}`, {
+          method: "PATCH",
+          body: { version: index + 1, goal: `Guard ${secret}`, nextAction: secret },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await call("/dots/jojo/memory/triggers", {
+          method: "POST",
+          body: {
+            responsibility: item.id,
+            repository: "opzero1/open-dot",
+            reasons: ["Mentioned"],
+            task: `Reply using ${secret}.`,
+          },
+        })
+      ).status,
+    ).toBe(201);
+  }
+  const stored = JSON.stringify([
+    db.select().from(notes).all(),
+    db.select().from(responsibilities).all(),
+    db.$client.query("SELECT * FROM feed_triggers").all(),
+  ]);
+  for (const secret of planted) expect(stored).not.toContain(secret);
+  expect(stored).not.toContain("hunter2");
+  expect(stored).toContain("[redacted]");
+});

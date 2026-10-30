@@ -34,6 +34,24 @@ export function runsWordsTogether(value: string) {
   return glued >= 3 && glued * 40 >= words.length;
 }
 
+const secrets = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
+  /\b(?:xox[abposre]-|xapp-|xoxe\.)[\w.-]{8,}/g,
+  /\b(?:gh[pousr]_|github_pat_|lin_api_|sk-|sk_live_|rk_live_)[\w-]{16,}/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g,
+];
+const labelled = /\b(pass(?:word|phrase|code)?|secret|token|api[_ -]?key|otp)(\s*[:=]\s*)\S+/gi;
+
+/**
+ * Drops what looks like a credential before anything is saved, best effort: archived messages,
+ * notes, responsibilities, reminders, observed rows and every other memory write go through it.
+ */
+export const redact = (text: string) =>
+  secrets
+    .reduce((rest, pattern) => rest.replace(pattern, "[redacted]"), text)
+    .replace(labelled, "$1$2[redacted]");
+
 /** The longest note, goal or next action the owner can save, in UTF-16 code units. */
 export const memoryTextLimit = 2000;
 /** How far ahead the owner can move a reminder. */
@@ -221,10 +239,13 @@ const onlyKeys = (body: Fields, allowed: readonly string[]) =>
 export const isID = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 
-/** Text the owner typed: not blank, bounded, and no control characters except newline and tab. */
+/**
+ * Text the owner typed, or the observer wrote: not blank, bounded, no control characters except
+ * newline and tab, and likely credentials replaced by `[redacted]`.
+ */
 export const memoryText = (value: unknown, name: string): string | Invalid => {
   if (typeof value !== "string") return { invalid: `${name} must be a string.` };
-  const text = value.trim();
+  const text = redact(value.trim());
   if (!text) return { invalid: `${name} can't be blank.` };
   if (text.length > memoryTextLimit)
     return { invalid: `${name} must be at most ${memoryTextLimit} characters.` };
