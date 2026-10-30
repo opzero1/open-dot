@@ -1263,7 +1263,7 @@ enum APIError: Error {
     return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/memory/notes", body: body)).note
   }
 
-  /// Adds the owner's own observed row, which lets a forgotten fact in much the same words be
+  /// Adds the owner's own observed row; with a forgotten fact's text as it was, that fact may be
   /// observed again. Never retried on its own.
   func addObservation(_ dot: String, text: String) async throws -> MemoryObservation {
     struct Body: Decodable { let observation: MemoryObservation }
