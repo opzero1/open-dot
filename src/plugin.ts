@@ -1425,20 +1425,36 @@ ${dataJSON(part)}
      */
     // One synchronization at a time, so a slow put never lands over a newer one's value.
     let syncing: Promise<unknown> = Promise.resolve();
-    const syncEntries = (sessionID: string, sections: readonly { key: string; text: string }[]) => {
-      const run = syncing.then(() => putEntries(sessionID, sections));
+    /**
+     * `holds` is checked when the synchronization starts and after each await: once it fails,
+     * nothing more is put or taken as put, and the cached entries are dropped.
+     */
+    const syncEntries = (
+      sessionID: string,
+      sections: readonly { key: string; text: string }[],
+      holds: () => boolean,
+    ) => {
+      const run = syncing.then(() => putEntries(sessionID, sections, holds));
       syncing = run.catch(() => undefined);
       return run;
     };
     const putEntries = async (
       sessionID: string,
       sections: readonly { key: string; text: string }[],
+      holds: () => boolean,
     ) => {
       const api = context.session.instructions?.entry;
       if (!api) return undefined;
+      const lost = () => {
+        if (holds()) return false;
+        entries = undefined;
+        return true;
+      };
       try {
+        if (lost()) return undefined;
         if (entries?.sessionID !== sessionID) {
           const listed = await api.list({ sessionID });
+          if (lost()) return undefined;
           entries = {
             sessionID,
             values: new Map(
@@ -1456,6 +1472,7 @@ ${dataJSON(part)}
             key: section.key,
             value: section.text,
           });
+          if (lost()) return undefined;
           values.set(section.key, section.text);
         }
         return changed;
@@ -1535,7 +1552,12 @@ ${snapshot}
       }
       // The owner's approved facts go to every ready dot, never to an unready binding.
       const sections = [...memory(db, name, notesShown), ...(current ? [ownerSection(db)] : [])];
-      const synced = await syncEntries(event.sessionID, sections);
+      // A ready dot's synchronization stops the moment it's no longer this exact ready binding.
+      const synced = await syncEntries(
+        event.sessionID,
+        sections,
+        current ? () => bound(event.sessionID) !== undefined : () => true,
+      );
       if (current && !bound(event.sessionID)) return;
       const changed = synced && current ? ownerSince(sections, synced) : synced;
       // A failed put falls back to the whole memory, with the owner's facts as they are now.
@@ -1568,7 +1590,11 @@ ${snapshot}
       // Without the entries API no memory is in the compaction request, so none is added.
       if (!context.session.instructions?.entry) return;
       const owner = ownerSection(db);
-      const synced = await syncEntries(event.sessionID, [owner]);
+      const synced = await syncEntries(
+        event.sessionID,
+        [owner],
+        () => bound(event.sessionID) !== undefined,
+      );
       if (!bound(event.sessionID)) return;
       const changed = synced ? ownerSince([owner], synced) : [ownerSection(db)];
       if (changed.length)

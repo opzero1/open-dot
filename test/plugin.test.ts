@@ -2814,3 +2814,99 @@ test("M10: a change landing while an entry is put is told in the tail and put ne
     db.$client.close();
   }
 });
+
+/** Instruction entries whose next list, or put of a given key, waits until it's released. */
+function heldEntries() {
+  const entries = fakeEntries();
+  const { list, put } = entries.api;
+  let lists = 0;
+  const hold = (gate: { key?: string; list?: boolean }) => {
+    const { promise: released, resolve: release } = Promise.withResolvers<void>();
+    const { promise: waiting, resolve: reached } = Promise.withResolvers<void>();
+    entries.api.list = async () => {
+      lists++;
+      if (gate.list) {
+        gate.list = false;
+        reached();
+        await released;
+      }
+      return list();
+    };
+    entries.api.put = async (input) => {
+      if (input.key === gate.key) {
+        delete gate.key;
+        reached();
+        await released;
+      }
+      return put(input);
+    };
+    return { waiting, release: () => release() };
+  };
+  return { entries, hold, lists: () => lists };
+}
+
+const transitions = {
+  rebound: { sessionID: "ses_rebound" },
+  unready: { sessionState: "creating" as const },
+};
+
+for (const [name, change] of Object.entries(transitions))
+  test(`M10: once ${name} while a synchronization is held, no owner entry is written to the old session`, async () => {
+    const db = openDatabase(databasePath());
+    changeFact(db, crypto.randomUUID(), 0, mutation(), { action: "create", text: "Likes tea." });
+    const { entries, hold, lists } = heldEntries();
+    const loaded = await load(dot.directory, undefined, undefined, entries);
+    const restore = () =>
+      db
+        .update(dots)
+        .set({ sessionID: dot.sessionID, sessionState: "ready" })
+        .where(eq(dots.name, "jojo"))
+        .run();
+    const move = () => db.update(dots).set(change).where(eq(dots.name, "jojo")).run();
+    const prompt: FakeMessage = { role: "user", content: [{ text: "Hi" }] };
+    try {
+      // The first list is held, then the binding goes: nothing is put at all.
+      let gate = hold({ list: true });
+      let request = loaded.injected(dot.sessionID);
+      await gate.waiting;
+      move();
+      gate.release();
+      await request;
+      expect(entries.puts).toEqual([]);
+
+      // An earlier section's put is held, with a compaction queued behind it: once the binding
+      // goes, neither puts the owner entry, nor takes anything as put.
+      restore();
+      gate = hold({ key: "open-dot.dots" });
+      request = loaded.injected(dot.sessionID);
+      await gate.waiting;
+      const compaction = loaded.compacting(dot.sessionID, [prompt]);
+      await Bun.sleep(0);
+      move();
+      gate.release();
+      await request;
+      expect(await compaction).toEqual([prompt]);
+      expect(entries.puts).not.toContain("open-dot.owner");
+
+      // A compaction's own held list, then the binding goes: no owner put.
+      restore();
+      gate = hold({ list: true });
+      const listedBefore = lists();
+      const held = loaded.compacting(dot.sessionID, [prompt]);
+      await gate.waiting;
+      move();
+      gate.release();
+      expect(await held).toEqual([prompt]);
+      expect(entries.puts).not.toContain("open-dot.owner");
+      expect(lists()).toBe(listedBefore + 1);
+
+      // Bound and ready again, the cached entries were dropped: they're listed afresh and put.
+      restore();
+      await loaded.injected(dot.sessionID);
+      expect(lists()).toBe(listedBefore + 2);
+      expect(ownerEntry(entries)).toContain("Likes tea.");
+    } finally {
+      await loaded.cleanup?.();
+      db.$client.close();
+    }
+  });
