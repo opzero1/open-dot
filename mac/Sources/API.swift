@@ -1237,6 +1237,19 @@ enum APIError: Error {
     try decode(ObservationSourceRead.self, await send("GET", "/dots/\(escape(dot))/memory/observations/\(observation)/sources/\(escape(message))"))
   }
 
+  /// Deletes one archived message from the dot's memory, so recall never finds it again. False when
+  /// the daemon has no such message. Never retried on its own.
+  func deleteArchived(_ dot: String, message: String) async throws -> Bool {
+    let (status, data) = try await exchange("DELETE", "/dots/\(escape(dot))/memory/archive/\(escape(message))")
+    switch status {
+    case 204: return true
+    case 404: return false
+    default:
+      struct Failure: Decodable { let error: String }
+      throw APIError.server((try? JSONDecoder().decode(Failure.self, from: data))?.error ?? HTTPURLResponse.localizedString(forStatusCode: status))
+    }
+  }
+
   func noteSource(_ dot: String, note: Int) async throws -> NoteSourceRead {
     try decode(NoteSourceRead.self, await send("GET", "/dots/\(escape(dot))/memory/notes/\(note)/source"))
   }
@@ -1252,14 +1265,15 @@ enum APIError: Error {
 
   /// Changes one item, with a JSON body that names the version the owner saw, or deletes or cancels
   /// it at that version when `body` is nil. Never retried on its own.
-  func changeMemory(_ dot: String, _ key: MemoryKey, version: Int, body: Data?) async throws -> MemoryOutcome {
+  /// With `forgetSources`, forgetting an observation also deletes the archived messages it came from.
+  func changeMemory(_ dot: String, _ key: MemoryKey, version: Int, body: Data?, forgetSources: Bool = false) async throws -> MemoryOutcome {
     let path = "/dots/\(escape(dot))/memory/\(key.kind.rawValue)/\(key.id)"
     let status: Int
     let data: Data
     if let body {
       (status, data) = try await exchange("PATCH", path, body: body)
     } else {
-      (status, data) = try await exchange("DELETE", "\(path)?version=\(version)")
+      (status, data) = try await exchange("DELETE", "\(path)?version=\(version)\(forgetSources ? "&sources=true" : "")")
     }
     struct Failure: Decodable { let error: String }
     let message = (try? JSONDecoder().decode(Failure.self, from: data))?.error ?? HTTPURLResponse.localizedString(forStatusCode: status)

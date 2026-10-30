@@ -327,6 +327,8 @@ struct MessageWindow: Equatable {
   var memories: [String: MemoryState] = [:]
   /// Observation sources the owner opened, by "dot/observation/message": the read, or why it failed.
   var observationSources: [String: Result<ObservationSourceRead, MemoryInvalid>] = [:]
+  /// Opened sources whose deletion from the archive is in flight.
+  var deletingSources: Set<String> = []
   /// Dots whose older observed rows are being read.
   var loadingObservations: Set<String> = []
   /// Each dot's AGENTS.md editor, kept while the notch folds or another dot or view is shown.
@@ -1427,6 +1429,23 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// Deletes an opened source from the dot's archive, once at a time, then reads the memory again,
+  /// which shows it as no longer archived. Never retried on its own.
+  func deleteArchivedSource(_ name: String, observation: Int, message: String) {
+    let key = "\(name)/\(observation)/\(message)"
+    guard deletingSources.insert(key).inserted else { return }
+    Task {
+      defer { deletingSources.remove(key) }
+      do {
+        _ = try await api.deleteArchived(name, message: message)
+        observationSources[key] = nil
+      } catch {
+        observationSources[key] = .failure(MemoryInvalid(Self.describeMemory(error, "Not deleted", unknown: "It may have been deleted; the next refresh shows what the daemon has.")))
+      }
+      await refreshMemory(name)
+    }
+  }
+
   /// Sends the edit at the version the owner started from. Nothing changed closes the editor.
   func saveMemory(_ name: String, _ key: MemoryKey) {
     guard let draft = memories[name]?.drafts[key] else { return }
@@ -1447,7 +1466,7 @@ struct MessageWindow: Equatable {
   }
 
   /// Deletes a note or cancels a reminder at the version shown, once the owner confirmed it.
-  func removeMemory(_ name: String, _ item: MemoryItem) {
+  func removeMemory(_ name: String, _ item: MemoryItem, forgetSources: Bool = false) {
     let version: Int
     switch item {
     case .note(let note): version = note.version
@@ -1455,14 +1474,14 @@ struct MessageWindow: Equatable {
     case .observation(let row): version = row.version
     case .responsibility: return
     }
-    change(name, item.key, version: version, body: nil)
+    change(name, item.key, version: version, body: nil, forgetSources: forgetSources)
   }
 
-  private func change(_ name: String, _ key: MemoryKey, version: Int, body: Data?) {
+  private func change(_ name: String, _ key: MemoryKey, version: Int, body: Data?, forgetSources: Bool = false) {
     guard memories[name, default: MemoryState()].begin(key) else { return }
     Task {
       do {
-        let outcome = try await api.changeMemory(name, key, version: version, body: body)
+        let outcome = try await api.changeMemory(name, key, version: version, body: body, forgetSources: forgetSources)
         memories[name, default: MemoryState()].finish(key, .outcome(outcome))
       } catch {
         let message = Self.describeMemory(error, "Not saved", unknown: "It may have been saved; the next refresh shows what the daemon has.")

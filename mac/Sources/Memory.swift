@@ -498,7 +498,7 @@ struct MemoryView: View {
           }
           if let rows = memory.observations {
             section("Observed") {
-              Text("What a background observer noted about this conversation. It may be wrong: edit or forget any row. Forgetting never deletes the messages it came from.")
+              Text("What a background observer noted about this conversation. It may be wrong: edit or forget any row, and the observer won't add a forgotten one back. Forgetting can also delete the archived messages it came from.")
                 .font(.caption2).foregroundStyle(.secondary)
               Text(dailyBudgetNote)
                 .font(.caption2).foregroundStyle(.secondary)
@@ -800,9 +800,16 @@ struct MemoryRow: View {
       alert.addButton(withTitle: "Delete").hasDestructiveAction = true
     case .observation(let row):
       alert.messageText = "Forget this observation?"
-      alert.informativeText = "It leaves the ledger, and an observer job already running can't save it back. The archived messages it came from stay, so recall and later observations may still surface what they said: \(row.text.prefix(200))"
+      alert.informativeText = "It leaves the ledger, and the observer won't add it back. Forget keeps the archived messages it came from, so recall may still surface what they said; Forget and Delete Sources deletes them from the archive too: \(row.text.prefix(200))"
       alert.addButton(withTitle: "Cancel")
       alert.addButton(withTitle: "Forget").hasDestructiveAction = true
+      alert.addButton(withTitle: "Forget and Delete Sources").hasDestructiveAction = true
+      switch runAlert(alert, store) {
+      case .alertSecondButtonReturn: store.removeMemory(dot, item)
+      case .alertThirdButtonReturn: store.removeMemory(dot, item, forgetSources: true)
+      default: break
+      }
+      return
     case .reminder(let reminder):
       alert.messageText = "Cancel this reminder?"
       alert.informativeText = "It won't go off\(reminder.everyMinutes == nil ? "" : " again"): \(reminder.text.prefix(200))"
@@ -839,6 +846,13 @@ struct ObservationSources: View {
                 Text(verbatim: read.state == "found" ? (read.text ?? "") + (read.truncated == true ? "…" : "") : "No longer archived.")
                   .font(.caption2).textSelection(.enabled)
                   .accessibilityIdentifier("observation-source-text-\(id)-\(source.messageID)")
+                if read.state == "found" {
+                  let deleting = store.deletingSources.contains("\(dot)/\(id)/\(source.messageID)")
+                  Button(deleting ? "Deleting…" : "Delete from Archive…") { confirmDelete(source.messageID) }
+                    .buttonStyle(.plain).font(.caption2.weight(.semibold)).disabled(deleting)
+                    .help("Delete this message from open-dot's archive, so recall never finds it again.")
+                    .accessibilityIdentifier("observation-source-delete-\(id)-\(source.messageID)")
+                }
               case .failure(let failure)?:
                 Text(verbatim: failure.message).font(.caption2).foregroundStyle(.red)
               case nil:
@@ -855,6 +869,17 @@ struct ObservationSources: View {
     }
     .font(.caption2)
     .accessibilityIdentifier("observation-sources-\(id)")
+  }
+
+  /// Asks first, with Cancel as the default for Return and Escape.
+  private func confirmDelete(_ message: String) {
+    let alert = NSAlert()
+    alert.messageText = "Delete this message from the archive?"
+    alert.informativeText = "dot_recall, automatic recall and dot_zoom won't find it again, and open-dot never copies it back. OpenCode's own history of the conversation keeps it."
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+    guard runAlert(alert, store) == .alertSecondButtonReturn else { return }
+    store.deleteArchivedSource(dot, observation: id, message: message)
   }
 }
 
