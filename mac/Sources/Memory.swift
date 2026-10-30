@@ -148,6 +148,9 @@ struct MemoryState {
   var drafts: [MemoryKey: MemoryDraft] = [:]
   var rejected: [MemoryKey: MemoryDraft] = [:]
   var noteDraft = ""
+  /// The owner's own observed row being written, and whether it's being added.
+  var observationDraft = ""
+  var addingObservation = false
   /// Supervisions being approved or ended.
   var supervising: Set<Int> = []
   /// Grants being revoked.
@@ -498,7 +501,7 @@ struct MemoryView: View {
           }
           if let rows = memory.observations {
             section("Observed") {
-              Text("What a background observer noted about this conversation. It may be wrong: edit or forget any row, and the observer won't add a forgotten one back. Forgetting can also delete the archived messages it came from.")
+              Text("What a background observer noted about this conversation. It may be wrong: edit or forget any row. The observer won't note a forgotten one again from the messages it came from or in much the same words, but could from new messages in other words. Forgetting can also delete the archived messages it came from. To bring a forgotten fact back, add it in your own words.")
                 .font(.caption2).foregroundStyle(.secondary)
               Text(dailyBudgetNote)
                 .font(.caption2).foregroundStyle(.secondary)
@@ -515,6 +518,7 @@ struct MemoryView: View {
               if let superseded = memory.observationsSuperseded, superseded > 0 {
                 Text("\(superseded) older observations were superseded.").font(.caption2).foregroundStyle(.tertiary)
               }
+              addObservation
             }
           }
           section("Scheduled reminders") {
@@ -609,6 +613,26 @@ struct MemoryView: View {
         .accessibilityIdentifier("memory-search-summary")
       ForEach(found.results) { NoteMatchRow(store: store, dot: name, match: $0) }
     }
+  }
+
+  private var addObservation: some View {
+    let draft = Binding { store.memories[name]?.observationDraft ?? "" } set: { store.memories[name, default: MemoryState()].observationDraft = $0 }
+    let adding = store.memories[name]?.addingObservation == true
+    let blank = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    return HStack {
+      TextField("Add your own observation", text: draft, axis: .vertical)
+        .textFieldStyle(.plain)
+        .lineLimit(1...4)
+        .accessibilityIdentifier("observation-draft")
+      Button(adding ? "Adding…" : "Add") { store.addObservation(name) }
+        .buttonStyle(.plain)
+        .font(.caption.weight(.semibold))
+        .disabled(adding || blank)
+        .opacity(adding || blank ? 0.4 : 1)
+        .accessibilityIdentifier("observation-add")
+    }
+    .padding(8)
+    .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
   }
 
   private var addNote: some View {
@@ -800,7 +824,7 @@ struct MemoryRow: View {
       alert.addButton(withTitle: "Delete").hasDestructiveAction = true
     case .observation(let row):
       alert.messageText = "Forget this observation?"
-      alert.informativeText = "It leaves the ledger, and the observer won't add it back. Forget keeps the archived messages it came from, so recall may still surface what they said; Forget and Delete Sources deletes them from the archive too: \(row.text.prefix(200))"
+      alert.informativeText = "It leaves the ledger. The observer won't note it again from the messages it came from or in much the same words, but could from new messages in other words. Forget keeps the archived messages it came from, so recall may still surface what they said; Forget and Delete Sources deletes them from the archive too: \(row.text.prefix(200))"
       alert.addButton(withTitle: "Cancel")
       alert.addButton(withTitle: "Forget").hasDestructiveAction = true
       alert.addButton(withTitle: "Forget and Delete Sources").hasDestructiveAction = true

@@ -53,6 +53,18 @@ final class APIEndpointTests: XCTestCase {
   }
 }
 
+/// Issue 61: the owner's own observed row goes to its one route, once, as the text alone.
+final class ObservationAddRouteTests: XCTestCase {
+  @MainActor func testAddingAnObservationPostsOnlyItsText() async throws {
+    FakeDaemon.requests.reset()
+    let api = API(file: try endpointFile("http://127.0.0.1:4567"), protocols: [FakeDaemon.self])
+    let added = try await api.addObservation("jojo", text: "Tea in the afternoon.")
+    XCTAssertEqual(added.updatedBy, "owner")
+    XCTAssertEqual(added.sources, [])
+    XCTAssertEqual(FakeDaemon.requests.all, [#"POST /dots/jojo/memory/observations | Bearer test-token | {"text":"Tea in the afternoon."}"#])
+  }
+}
+
 /// Issue 50's actions reach only their own daemon routes, each once.
 final class SlackLoginRouteTests: XCTestCase {
   @MainActor func testTheLoginInstallAndLinkActionsUseTheirRoutes() async throws {
@@ -164,7 +176,9 @@ final class FakeDaemon: URLProtocol {
     }
     guard let ok = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else { return }
     client.urlProtocol(self, didReceive: ok, cacheStoragePolicy: .notAllowed)
-    let answer = url.path == "/slack/login" ? Self.loginAnswer : Data(#"{"config":{"state":"idle"},"app":null}"#.utf8)
+    let answer = url.path == "/slack/login" ? Self.loginAnswer
+      : url.path == "/dots/jojo/memory/observations" ? Data(#"{"observation":{"id":7,"version":1,"kind":"fact","topic":"owner","text":"Tea in the afternoon.","priority":2,"validFrom":1,"sessionID":"ses_jojo","createdAt":1,"updatedAt":1,"updatedBy":"owner","sources":[]}}"#.utf8)
+      : Data(#"{"config":{"state":"idle"},"app":null}"#.utf8)
     client.urlProtocol(self, didLoad: answer)
     client.urlProtocolDidFinishLoading(self)
   }

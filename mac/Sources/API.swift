@@ -1263,6 +1263,14 @@ enum APIError: Error {
     return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/memory/notes", body: body)).note
   }
 
+  /// Adds the owner's own observed row, which lets a forgotten fact in much the same words be
+  /// observed again. Never retried on its own.
+  func addObservation(_ dot: String, text: String) async throws -> MemoryObservation {
+    struct Body: Decodable { let observation: MemoryObservation }
+    let body = try JSONSerialization.data(withJSONObject: ["text": text])
+    return try decode(Body.self, await send("POST", "/dots/\(escape(dot))/memory/observations", body: body)).observation
+  }
+
   /// Changes one item, with a JSON body that names the version the owner saw, or deletes or cancels
   /// it at that version when `body` is nil. Never retried on its own.
   /// With `forgetSources`, forgetting an observation also deletes the archived messages it came from.

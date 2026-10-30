@@ -1193,6 +1193,28 @@ struct MessageWindow: Equatable {
     }
   }
 
+  /// Adds the owner's own observed row, then reads the memory again. Never retried on its own.
+  func addObservation(_ name: String) {
+    let draft = memories[name]?.observationDraft ?? ""
+    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty, memories[name]?.addingObservation != true else { return }
+    guard text.utf16.count <= observationTextLimit else {
+      memories[name, default: MemoryState()].notice = "An observation must be at most \(observationTextLimit) characters."
+      return
+    }
+    memories[name, default: MemoryState()].addingObservation = true
+    Task {
+      defer { memories[name, default: MemoryState()].addingObservation = false }
+      do {
+        _ = try await api.addObservation(name, text: text)
+        if memories[name]?.observationDraft == draft { memories[name]?.observationDraft = "" }
+      } catch {
+        memories[name, default: MemoryState()].notice = Self.describeMemory(error, "Not added", unknown: "It may have been added; it shows on the next refresh.")
+      }
+      await refreshMemory(name)
+    }
+  }
+
   /// Searches the dot's saved notes for the words in its search box. A blank box clears the search.
   func searchNotes(_ name: String) {
     let query = memories[name]?.searchDraft ?? ""
