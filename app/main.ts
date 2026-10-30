@@ -31,11 +31,10 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { type ChildProcessByStdio, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
-import type { Readable, Writable } from "node:stream";
 import { homedir, tmpdir } from "node:os";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import {
@@ -67,6 +66,7 @@ import {
   sendOutcome,
   settled,
 } from "./chat";
+import { type Clipboard, helperClipboard } from "./clipboard";
 import { decoded } from "./decode";
 import {
   isSlackAppID,
@@ -1223,13 +1223,6 @@ const secret = (input: unknown): Promise<Reply<unknown>> | Reply<unknown> => {
 // Clipboard pickup. Electron can't read the clipboard's change count, so a small helper does,
 // over its own pipes; in the smoke test a fake stands in, so tests never touch the real one.
 
-interface Clipboard {
-  revision(): Promise<number | undefined>;
-  /** The text while the clipboard still holds `revision`, null once it doesn't. */
-  text(revision: number): Promise<string | null | undefined>;
-  clear(revision: number): Promise<void>;
-}
-
 const fakeClipboard = {
   revision: 0,
   text: "" as string | undefined,
@@ -1269,97 +1262,13 @@ const helperPath = () =>
     `${sep}app.asar.unpacked${sep}`,
   );
 
-let helper: ChildProcessByStdio<Writable, Readable, null> | undefined;
-let helperBuffer = Buffer.alloc(0);
-// Each command's reader, in order; a reader takes what it needs from the buffer, or waits.
-const helperQueue: ((buffer: Buffer) => number)[] = [];
-const helperWaiters: (() => void)[] = [];
+// The real helper is started only when a pickup first looks, and stopped on quit.
+const nativeClipboard = helperClipboard(() =>
+  spawn(helperPath(), [], { stdio: ["pipe", "pipe", "ignore"] }),
+);
+const stopHelper = nativeClipboard.stop;
 
-const stopHelper = () => {
-  helper?.kill();
-  helper = undefined;
-  helperBuffer = Buffer.alloc(0);
-  helperQueue.length = 0;
-  for (const wake of helperWaiters.splice(0)) wake();
-};
-
-const startHelper = () => {
-  if (helper) return helper;
-  try {
-    const child = spawn(helperPath(), [], { stdio: ["pipe", "pipe", "ignore"] });
-    child.on("error", stopHelper);
-    child.on("exit", () => {
-      if (helper === child) stopHelper();
-    });
-    child.stdout.on("data", (chunk: Buffer) => {
-      helperBuffer = Buffer.concat([helperBuffer, chunk]);
-      while (helperQueue.length) {
-        const used = helperQueue[0]?.(helperBuffer) ?? 0;
-        if (used <= 0) break;
-        helperBuffer = helperBuffer.subarray(used);
-        helperQueue.shift();
-      }
-      if (helperBuffer.length > 16 * 1024) stopHelper();
-    });
-    helper = child;
-  } catch {
-    helper = undefined;
-  }
-  return helper;
-};
-
-/** One helper command, answered by `read`, or undefined if the helper failed or took too long. */
-const ask = <T>(command: string, read: (buffer: Buffer) => [number, T] | undefined) =>
-  new Promise<T | undefined>((done) => {
-    const child = startHelper();
-    if (!child) return done(undefined);
-    let finished = false;
-    const timer = setTimeout(() => {
-      if (!finished) stopHelper();
-    }, 2_000);
-    const finish = (value: T | undefined) => {
-      finished = true;
-      clearTimeout(timer);
-      done(value);
-    };
-    helperWaiters.push(() => finish(undefined));
-    helperQueue.push((buffer) => {
-      const got = read(buffer);
-      if (!got) return 0;
-      finish(got[1]);
-      return got[0];
-    });
-    child.stdin.write(`${command}\n`);
-  });
-
-const readLine = (buffer: Buffer): [number, string] | undefined => {
-  const end = buffer.indexOf(10);
-  return end < 0 ? undefined : [end + 1, buffer.subarray(0, end).toString("utf8")];
-};
-
-const helperClipboard: Clipboard = {
-  revision: async () => {
-    const value = await ask("r", readLine);
-    return value !== undefined && /^-?\d{1,18}$/.test(value) ? Number(value) : undefined;
-  },
-  text: (revision) =>
-    ask<string | null | undefined>(`t ${revision}`, (buffer) => {
-      const head = readLine(buffer);
-      if (!head) return undefined;
-      const [used, value] = head;
-      if (value === "-") return [used, null];
-      if (value === "0" || value === "L") return [used, undefined];
-      const size = Number(value);
-      if (!Number.isSafeInteger(size) || size <= 0 || size > 4096) return [used, undefined];
-      if (buffer.length < used + size) return undefined;
-      return [used + size, buffer.subarray(used, used + size).toString("utf8")];
-    }),
-  clear: async (revision) => {
-    await ask(`c ${revision}`, readLine);
-  },
-};
-
-const clipboardFor = (): Clipboard => (smoke ? smokeClipboard : helperClipboard);
+const clipboardFor = (): Clipboard => (smoke ? smokeClipboard : nativeClipboard.clipboard);
 
 interface Armed {
   dot: string;
