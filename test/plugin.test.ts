@@ -2793,6 +2793,22 @@ test("M10: a change landing while an entry is put is told in the tail and put ne
     expect(ownerEntry(entries)).not.toContain("Arrived during the put.");
     await loaded.injected(dot.sessionID);
     expect(ownerEntry(entries)).toContain("Arrived during the put.");
+
+    // A change landing during a put that fails is in the fallback, never the older snapshot.
+    entries.api.put = async () => {
+      changeFact(db, crypto.randomUUID(), 0, crypto.randomUUID(), {
+        action: "create",
+        text: "Arrived during a failed put.",
+      });
+      throw new Error("instruction entries unavailable");
+    };
+    changeFact(db, crypto.randomUUID(), 0, crypto.randomUUID(), {
+      action: "create",
+      text: "Second.",
+    });
+    const fallback = await loaded.injected(dot.sessionID);
+    expect(fallback).toContain("Second.");
+    expect(fallback).toContain("Arrived during a failed put.");
   } finally {
     await loaded.cleanup?.();
     db.$client.close();

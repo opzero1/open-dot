@@ -1538,12 +1538,15 @@ ${snapshot}
       const synced = await syncEntries(event.sessionID, sections);
       if (current && !bound(event.sessionID)) return;
       const changed = synced && current ? ownerSince(sections, synced) : synced;
+      // A failed put falls back to the whole memory, with the owner's facts as they are now.
+      const fallback = () =>
+        sections.map((section) => (section.key === ownerKey ? ownerSection(db) : section));
       placeTail(event.messages, {
         role: "user",
         content: [
           {
             type: "text",
-            text: (changed ? entriesTail(changed) : reminder(sections)) + feedback + recalledTail,
+            text: (changed ? entriesTail(changed) : reminder(fallback())) + feedback + recalledTail,
           },
         ],
       });
