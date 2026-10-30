@@ -33,7 +33,7 @@ import {
   writeSync,
 } from "node:fs";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { homedir, tmpdir } from "node:os";
@@ -47,6 +47,8 @@ import {
   type DraftImage,
   eventChannel,
   type Operation,
+  type OwnerAction,
+  type OwnerMutation,
   type PickupState,
   type PickupStep,
   type Reply,
@@ -72,7 +74,7 @@ import {
   settled,
 } from "./chat";
 import { type Clipboard, helperClipboard } from "./clipboard";
-import { decoded } from "./decode";
+import { decoded, ownerRequest } from "./decode";
 import { isServiceAction, serviceBinary, serviceControl } from "./service";
 import {
   isSlackAppID,
@@ -397,19 +399,21 @@ const readAttempts = (): Attempt[] => {
   }
 };
 
-/** Replaces the record atomically and durably; a failure throws, so nothing is sent. */
-const writeAttempts = (attempts: Attempt[]) => {
+/** Replaces a record file atomically and durably; a failure throws, so nothing is sent. */
+const writeRecord = (file: string, value: unknown) => {
   mkdirSync(app.getPath("userData"), { recursive: true, mode: 0o700 });
-  const temporary = `${attemptsFile()}.${process.pid}.tmp`;
+  const temporary = `${file}.${process.pid}.tmp`;
   const handle = openSync(temporary, "w", 0o600);
   try {
-    writeSync(handle, JSON.stringify(attempts));
+    writeSync(handle, JSON.stringify(value));
     fsyncSync(handle);
   } finally {
     closeSync(handle);
   }
-  renameSync(temporary, attemptsFile());
+  renameSync(temporary, file);
 };
+
+const writeAttempts = (attempts: Attempt[]) => writeRecord(attemptsFile(), attempts);
 
 // Sends with a known outcome whose records couldn't be removed yet: never reconciled or offered
 // again, and removed by the next write that succeeds. After a restart a leftover record is
@@ -440,6 +444,96 @@ const isText = (value: unknown, max: number): value is string =>
 const isName = (value: unknown): value is string => isText(value, 255) && value.length > 0;
 const isID = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+
+// Owner fact changes: like a send, only IDs, the action and the version are saved before the call,
+// never the text. One whose answer is lost stays saved until the renderer reads the fact by ID and
+// finds it, or the owner dismisses it; it is never sent again.
+
+const ownerFile = () => join(app.getPath("userData"), "owner-mutations.json");
+const ownerActions: readonly OwnerAction[] = ["create", "approve", "edit", "reject", "delete"];
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const isUUID = (value: unknown): value is string => typeof value === "string" && uuid.test(value);
+const isOwnerAction = (value: unknown): value is OwnerAction =>
+  ownerActions.some((action) => action === value);
+// Changes whose request is still out, which the renderer doesn't reconcile yet.
+const ownerSending = new Set<string>();
+
+const isOwnerMutation = (value: unknown): value is OwnerMutation =>
+  isRecord(value) &&
+  isUUID(value.factID) &&
+  isUUID(value.mutationID) &&
+  isOwnerAction(value.action) &&
+  typeof value.version === "number" &&
+  Number.isSafeInteger(value.version) &&
+  value.version >= 0 &&
+  typeof value.createdAt === "number";
+
+const readOwnerMutations = (): OwnerMutation[] => {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(ownerFile(), "utf8"));
+    return Array.isArray(parsed) ? parsed.filter(isOwnerMutation) : [];
+  } catch {
+    return [];
+  }
+};
+
+/** Drops a saved change; best effort, since a leftover one is only reconciled again. */
+const settleOwner = (mutationID: string) => {
+  try {
+    const kept = readOwnerMutations();
+    if (kept.some((mutation) => mutation.mutationID === mutationID))
+      writeRecord(
+        ownerFile(),
+        kept.filter((mutation) => mutation.mutationID !== mutationID),
+      );
+  } catch {}
+};
+
+/**
+ * One owner fact change, sent once: its IDs are chosen and saved first, so a lost answer can be
+ * looked up by them. A change with a definite answer is dropped from the record.
+ */
+const changeOwnerFact = async (args: unknown[]): Promise<Reply<unknown>> => {
+  const [given, action, version, text] = args;
+  if (
+    !isOwnerAction(action) ||
+    typeof version !== "number" ||
+    !Number.isSafeInteger(version) ||
+    !(action === "create" ? given === null && version === 0 : isUUID(given) && version > 0) ||
+    !(action === "create" || action === "edit"
+      ? isText(text, 2000)
+      : action === "approve"
+        ? text === null || isText(text, 2000)
+        : text === null)
+  )
+    return { ok: false, error: "That request isn't valid." };
+  const mutation: OwnerMutation = {
+    factID: isUUID(given) ? given : randomUUID(),
+    mutationID: randomUUID(),
+    action,
+    version,
+    createdAt: Date.now(),
+  };
+  try {
+    writeRecord(ownerFile(), [...readOwnerMutations(), mutation]);
+  } catch {
+    return { ok: false, error: "Couldn't save the change's ID first, so nothing was sent." };
+  }
+  const { mutationID } = mutation;
+  const request = ownerRequest(mutation, typeof text === "string" ? text : null);
+  ownerSending.add(mutationID);
+  try {
+    const result = decoded(
+      "ownerChange",
+      request.method,
+      await reply(request.method, request.path, request.body),
+    );
+    if (result.ok || !result.lost) settleOwner(mutationID);
+    return result;
+  } finally {
+    ownerSending.delete(mutationID);
+  }
+};
 
 const validImage = (image: unknown): image is DraftImage => {
   if (!isRecord(image)) return false;
@@ -915,6 +1009,10 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
         : undefined;
     case "health":
       return { method: "GET", path: "/health", timeout: 30_000 };
+    case "ownerMemory":
+      return { method: "GET", path: "/owner/memory" };
+    case "ownerFact":
+      return isUUID(dot) ? { method: "GET", path: `/owner/facts/${dot}` } : undefined;
     case "slackLogin":
       return { method: "POST", path: "/slack/login", body: {}, timeout: 30_000 };
   }
@@ -1127,6 +1225,11 @@ const operationNames = new Set<string>([
   "dismiss",
   "dismissAll",
   "memory",
+  "ownerMemory",
+  "ownerFact",
+  "ownerChange",
+  "ownerMutations",
+  "ownerSettle",
   "observations",
   "observationSource",
   "noteSource",
@@ -1183,6 +1286,18 @@ const readFlights = new Map<string, Promise<Reply<unknown>>>();
 /** Never retried: a mutation whose answer was lost is reported as unknown for the owner to check. */
 const operate = (op: unknown, ...args: unknown[]): Promise<Reply<unknown>> | Reply<unknown> => {
   if (!isOperation(op)) return { ok: false, error: "That isn't something the app does." };
+  if (op === "ownerChange") return changeOwnerFact(args);
+  if (op === "ownerMutations")
+    return {
+      ok: true,
+      value: readOwnerMutations().filter((mutation) => !ownerSending.has(mutation.mutationID)),
+    };
+  if (op === "ownerSettle") {
+    if (!isUUID(args[0]) || ownerSending.has(args[0]))
+      return { ok: false, error: "That request isn't valid." };
+    settleOwner(args[0]);
+    return { ok: true, value: true };
+  }
   const built = build(op, args);
   if (!built) return { ok: false, error: "That request isn't valid." };
   if (built.method === "GET") {

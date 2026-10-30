@@ -7,6 +7,7 @@ import type {
   Instructions,
   MemoryResponsibility,
   NoteSourceRead,
+  OwnerMutation,
   ReceiptStatus,
   Reply,
   RequestAudit,
@@ -908,3 +909,29 @@ export class AvatarState<Image> {
     this.images.delete(name);
   }
 }
+
+/**
+ * What became of an owner fact change whose answer was lost, from a read of the fact by its ID: it
+ * landed only when the fact's latest change is this one. Otherwise, whether the fact is missing,
+ * unchanged or changed by something newer, its outcome stays unknown and it's never sent again.
+ */
+export const ownerOutcome = (
+  mutation: OwnerMutation,
+  read: Reply<{ fact: { lastMutationID: string | null } }>,
+): "landed" | "unknown" =>
+  read.ok && read.value.fact.lastMutationID === mutation.mutationID ? "landed" : "unknown";
+
+/** A refused or unconfirmed owner fact change, in words: the daemon's own, unless it was lost. */
+export const ownerFailure = (result: Extract<Reply<unknown>, { ok: false }>) =>
+  result.lost
+    ? "Couldn't confirm this change. It may have been saved; the app checks it by its ID and never sends it again."
+    : result.error;
+
+/** How a change is described while its outcome is unknown. */
+export const ownerActionWords: Record<OwnerMutation["action"], string> = {
+  create: "Adding a fact",
+  approve: "Approving a suggestion",
+  edit: "Editing a fact",
+  reject: "Rejecting a suggestion",
+  delete: "Deleting a fact",
+};

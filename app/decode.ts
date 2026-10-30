@@ -1,6 +1,6 @@
 // What main checks each daemon answer against before the renderer sees it. Plain data and functions,
 // apart from Electron, so a test can hold them against the daemon's real answers.
-import type { Operation, Reply } from "./bridge";
+import type { Operation, OwnerMutation, Reply } from "./bridge";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -73,6 +73,16 @@ const observation = {
   text: "s",
   sources: [{ messageID: "s", "excerpt?": "s", "from?": "s", "date?": "s" }],
 } as const;
+const ownerFact = {
+  id: "s",
+  state: "s",
+  "text?": "s",
+  version: "n",
+  createdAt: "n",
+  updatedAt: "n",
+  "origin?": { dot: "s", sessionID: "s", messageID: "s" },
+  "lastMutationID?": "s",
+} as const;
 const instructions = { content: "s", revision: "s", canRevert: "b" } as const;
 const slackSetup = { config: { state: "s" }, "app?": { state: "s" } } as const;
 
@@ -106,6 +116,17 @@ export const shapes: Record<Operation, Shape> = {
       },
     ],
   },
+  ownerMemory: {
+    pending: [ownerFact],
+    approved: [ownerFact],
+    removed: [ownerFact],
+    entryBytes: "n",
+    entryLimit: "n",
+  },
+  ownerFact: { fact: ownerFact },
+  ownerChange: { fact: ownerFact },
+  ownerMutations: "*",
+  ownerSettle: "*",
   observations: { observations: [observation], "next?": "n" },
   observationSource: { message: "s", text: "s" },
   noteSource: { note: "n", state: "s", "message?": { text: "s", time: "n", role: "s" } },
@@ -240,4 +261,18 @@ export const decoded = (op: Operation, method: string, result: Reply<unknown>): 
           "The daemon's answer wasn't understood, so this may or may not have been done. Nothing was retried.",
         lost: true,
       };
+};
+
+/** The daemon request for a saved owner fact change: its IDs and version, and the text if any. */
+export const ownerRequest = (mutation: OwnerMutation, text: string | null) => {
+  const { factID, mutationID, action, version } = mutation;
+  const path = `/owner/facts/${factID}`;
+  if (action === "create") return { method: "PUT", path, body: { version: 0, text, mutationID } };
+  if (action === "delete")
+    return { method: "DELETE", path: `${path}?version=${version}&mutationID=${mutationID}` };
+  return {
+    method: "PATCH",
+    path,
+    body: { action, version, mutationID, ...(text === null ? {} : { text }) },
+  };
 };

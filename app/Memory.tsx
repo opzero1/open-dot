@@ -14,6 +14,10 @@ import type {
   MemoryReminder,
   MemoryResponsibility,
   NoteSearch,
+  OwnerAction,
+  OwnerFact,
+  OwnerMemory,
+  OwnerMutation,
   Observation,
   Recall,
   Reply,
@@ -33,6 +37,9 @@ import {
   memoryChange,
   memoryFailure,
   nextRunLine,
+  ownerActionWords,
+  ownerFailure,
+  ownerOutcome,
   requestAsked,
   requestLine,
   requestTimes,
@@ -1253,6 +1260,10 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           <h2>Memory</h2>
         </header>
         {error ? <div className="banner">{error}</div> : <p className="empty-line">Loading…</p>}
+        {/* Shared by every dot, so it doesn't wait for this dot's memory. */}
+        <div className="pane-body">
+          <OwnerFacts ask={ask} />
+        </div>
       </div>
     );
 
@@ -1390,6 +1401,8 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
             ) : null}
           </Section>
         ) : null}
+
+        <OwnerFacts ask={ask} />
 
         <Section title="Notes" id="notes">
           <form
@@ -1705,5 +1718,357 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
         </Section>
       </div>
     </div>
+  );
+};
+
+// The owner's facts are shared by every dot, so their drafts, the one change out at a time and the
+// read fence are global, never kept per selected dot: switching dots can't start a second save.
+const ownerStore = {
+  memory: undefined as OwnerMemory | undefined,
+  error: undefined as string | undefined,
+  drafts: new Drafts<string>(),
+  adding: "",
+  /** The row whose change is out; while set, no other owner fact change starts. */
+  sending: undefined as string | undefined,
+  fence: new Fence(),
+  errors: new Map<string, string>(),
+  rejected: new Map<string, { mine: string; current: string }>(),
+  /** Saved changes whose answer was lost and that a read by ID didn't find landed. */
+  unknown: [] as OwnerMutation[],
+  panes: new Set<() => void>(),
+};
+
+const drawOwner = () => {
+  for (const draw of ownerStore.panes) draw();
+};
+
+/** Reads the facts and settles each saved change whose outcome a read by its fact's ID shows. */
+const readOwner = async () => {
+  const generation = ownerStore.fence.current("owner");
+  const [result, saved] = await Promise.all([
+    bridge.call("ownerMemory"),
+    bridge.call("ownerMutations"),
+  ]);
+  const unknown: OwnerMutation[] = [];
+  for (const mutation of saved.ok ? saved.value : []) {
+    const read = await bridge.call("ownerFact", mutation.factID);
+    if (ownerOutcome(mutation, read) === "landed")
+      void bridge.call("ownerSettle", mutation.mutationID);
+    else unknown.push(mutation);
+  }
+  // A read begun before or during a change shows nothing; the change's end reads again.
+  if (!ownerStore.fence.holds("owner", generation)) return;
+  if (result.ok) {
+    ownerStore.memory = result.value;
+    ownerStore.error = undefined;
+  } else ownerStore.error = `Not up to date: ${result.error}`;
+  if (saved.ok) ownerStore.unknown = unknown;
+  drawOwner();
+};
+
+/** Sends one change once; nothing is retried, and any later read shows what it left. */
+const changeOwner = async (
+  row: string,
+  factID: string | null,
+  action: OwnerAction,
+  version: number,
+  text: string | null,
+) => {
+  if (ownerStore.sending !== undefined) return undefined;
+  ownerStore.sending = row;
+  ownerStore.fence.advance("owner");
+  drawOwner();
+  let result: Reply<{ fact: OwnerFact }>;
+  try {
+    result = await bridge.call("ownerChange", factID, action, version, text);
+  } catch {
+    result = { ok: false, error: "No answer. Nothing was retried.", lost: true };
+  }
+  ownerStore.sending = undefined;
+  ownerStore.fence.advance("owner");
+  if (result.ok) ownerStore.errors.delete(row);
+  else ownerStore.errors.set(row, ownerFailure(result));
+  const current = result.ok ? undefined : result.current;
+  if (
+    !result.ok &&
+    result.status === 409 &&
+    text !== null &&
+    current &&
+    typeof current === "object"
+  )
+    ownerStore.rejected.set(row, {
+      mine: text,
+      current:
+        "text" in current && typeof current.text === "string"
+          ? current.text
+          : "(no longer pending or approved)",
+    });
+  void readOwner();
+  return result;
+};
+
+const originLine = (fact: OwnerFact) =>
+  fact.origin
+    ? `Suggested by ${fact.origin.dot}, in session ${fact.origin.sessionID}, message ${fact.origin.messageID}.`
+    : "Suggested by a dot.";
+
+/** About you: facts every dot sees as the owner's own word, once the owner approves them. */
+export const OwnerFacts = ({ ask }: { ask: AskOwner }) => {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const draw = () => setTick((tick) => tick + 1);
+    ownerStore.panes.add(draw);
+    void readOwner();
+    const timer = setInterval(() => void readOwner(), 20_000);
+    return () => {
+      ownerStore.panes.delete(draw);
+      clearInterval(timer);
+    };
+  }, []);
+  const { memory, drafts, sending } = ownerStore;
+  const busy = sending !== undefined;
+
+  const rowState = (row: string) => (
+    <>
+      {ownerStore.errors.get(row) ? (
+        <div className="item-error" role="alert" data-row-error={row}>
+          {ownerStore.errors.get(row)}
+        </div>
+      ) : null}
+      {ownerStore.rejected.get(row) ? (
+        <div className="conflict" data-rejected={row}>
+          <div className="note">Your text (not saved)</div>
+          <pre className="conflict-text">{ownerStore.rejected.get(row)?.mine}</pre>
+          <div className="note">As it is now</div>
+          <pre className="conflict-text">{ownerStore.rejected.get(row)?.current}</pre>
+          <button
+            type="button"
+            onClick={() => {
+              ownerStore.rejected.delete(row);
+              drawOwner();
+            }}
+          >
+            Discard your text
+          </button>
+        </div>
+      ) : null}
+    </>
+  );
+
+  /** Saves a draft with the version it started from; the editor takes no typing meanwhile. */
+  const saveDraft = async (row: string, fact: OwnerFact, action: "approve" | "edit") => {
+    const draft = drafts.begin(row);
+    if (!draft) return;
+    drawOwner();
+    const result = await changeOwner(row, fact.id, action, draft.version, draft.edited);
+    if (!result) {
+      drafts.finish(row, { ok: false, error: "" }, false);
+      return drawOwner();
+    }
+    drafts.finish(row, result, ownerStore.rejected.has(row));
+    drawOwner();
+  };
+
+  const editor = (row: string, fact: OwnerFact, action: "approve" | "edit") => {
+    const draft = drafts.get(row);
+    if (!draft) return null;
+    const out = draft.sending !== undefined;
+    return (
+      <div className="editor" data-editing={row}>
+        <textarea
+          aria-label={action === "approve" ? "Edit the suggestion before approving" : "Edit fact"}
+          value={draft.edited}
+          readOnly={out}
+          maxLength={500}
+          onChange={(event) => {
+            if (drafts.edit(row, event.target.value)) drawOwner();
+          }}
+        />
+        <div className="item-actions">
+          <button
+            type="button"
+            disabled={out}
+            onClick={() => {
+              drafts.cancel(row);
+              drawOwner();
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={busy || !draft.edited.trim()}
+            onClick={() => void saveDraft(row, fact, action)}
+          >
+            {action === "approve" ? "Approve this text for every dot" : "Save for every dot"}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  const pending = memory?.pending ?? [];
+  const approved = memory?.approved ?? [];
+  return (
+    <Section
+      title="About you — shared with every dot"
+      id="owner"
+      note="Approved facts reach every dot as your own word, from its next request. A dot can only suggest one; a suggestion reaches no dot until you approve it. Notes and observations stay with their own dot."
+    >
+      {ownerStore.error ? <div className="banner">{ownerStore.error}</div> : null}
+      {ownerStore.unknown.map((mutation) => (
+        <div className="item-error" role="alert" key={mutation.mutationID} data-owner-unknown>
+          {ownerActionWords[mutation.action]} may or may not have been saved: its answer was lost.
+          It was not sent again; check the facts below.{" "}
+          <button
+            type="button"
+            onClick={() => {
+              void bridge.call("ownerSettle", mutation.mutationID).then(() => readOwner());
+            }}
+          >
+            Dismiss
+          </button>
+        </div>
+      ))}
+      <h4>Suggested by dots</h4>
+      {pending.length ? null : <p className="empty-line">No suggestions waiting.</p>}
+      <ul className="items">
+        {pending.map((fact) => {
+          const row = `owner:${fact.id}`;
+          const text = fact.text ?? "";
+          return (
+            <li key={fact.id} className="item" data-owner-pending={fact.id}>
+              <div className="note">
+                Untrusted suggestion, not evidence it's true. {originLine(fact)}
+              </div>
+              <div className="item-text">{text}</div>
+              {drafts.get(row) ? (
+                editor(row, fact, "approve")
+              ) : (
+                <div className="item-actions">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      ask({
+                        title: "Approve for every dot?",
+                        text: `Every dot will see this about you as your own word: ${text}`,
+                        buttons: [
+                          { label: "Cancel" },
+                          {
+                            label: "Approve",
+                            run: () =>
+                              void changeOwner(row, fact.id, "approve", fact.version, null),
+                          },
+                        ],
+                      })
+                    }
+                  >
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      drafts.start(row, fact.version, text);
+                      drawOwner();
+                    }}
+                  >
+                    Edit and approve
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void changeOwner(row, fact.id, "reject", fact.version, null)}
+                  >
+                    Reject
+                  </button>
+                </div>
+              )}
+              {rowState(row)}
+            </li>
+          );
+        })}
+      </ul>
+      <h4>Approved</h4>
+      {approved.length ? null : <p className="empty-line">No approved facts.</p>}
+      <ul className="items">
+        {approved.map((fact) => {
+          const row = `owner:${fact.id}`;
+          const text = fact.text ?? "";
+          return (
+            <li key={fact.id} className="item" data-owner-approved={fact.id}>
+              <div className="item-text">{text}</div>
+              {drafts.get(row) ? (
+                editor(row, fact, "edit")
+              ) : (
+                <div className="item-actions">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      drafts.start(row, fact.version, text);
+                      drawOwner();
+                    }}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      ask({
+                        title: "Delete this fact?",
+                        text: `No dot will see it from its next request, and no dot can suggest it again: ${text}`,
+                        buttons: [
+                          { label: "Cancel" },
+                          {
+                            label: "Delete",
+                            danger: true,
+                            run: () => void changeOwner(row, fact.id, "delete", fact.version, null),
+                          },
+                        ],
+                      })
+                    }
+                  >
+                    Delete
+                  </button>
+                </div>
+              )}
+              {rowState(row)}
+            </li>
+          );
+        })}
+      </ul>
+      <form
+        className="editor"
+        aria-label="Add a fact about you"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const text = ownerStore.adding;
+          if (!text.trim()) return;
+          void changeOwner("owner:new", null, "create", 0, text).then((result) => {
+            // Only a confirmed add of the text as sent clears the field.
+            if (result?.ok && ownerStore.adding === text) ownerStore.adding = "";
+            drawOwner();
+          });
+        }}
+      >
+        <textarea
+          aria-label="New fact about you, shared with every dot"
+          value={ownerStore.adding}
+          maxLength={500}
+          readOnly={sending === "owner:new"}
+          onChange={(event) => {
+            ownerStore.adding = event.target.value;
+            drawOwner();
+          }}
+        />
+        <button type="submit" disabled={busy || !ownerStore.adding.trim()}>
+          Add for every dot
+        </button>
+        {rowState("owner:new")}
+      </form>
+    </Section>
   );
 };

@@ -4,12 +4,13 @@ import { beforeEach, expect, test } from "bun:test";
 import { Effect, Layer } from "effect";
 import { createHmac } from "node:crypto";
 import { cursorLimit as appCursorLimit } from "../app/chat";
-import { decoded, fits, shapes } from "../app/decode";
-import { triggerReasons } from "../app/surfaces";
+import type { OwnerMutation } from "../app/bridge";
+import { decoded, fits, ownerRequest, shapes } from "../app/decode";
+import { ownerOutcome, triggerReasons } from "../app/surfaces";
 import { api, cursorLimit } from "../src/api";
 import { type Db, openDatabase } from "../src/db";
 import { OpenCode, OpenCodeError } from "../src/opencode";
-import { dots, feed, reminders, responsibilities } from "../src/schema";
+import { dots, feed, ownerFacts, reminders, responsibilities } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
@@ -186,4 +187,61 @@ test("a signed work cursor past 8,192 characters is one the daemon reads, up to 
     status: 400,
     value: { error: "Invalid work cursor. Refresh." },
   });
+});
+
+/** An owner fact change as main saves it before sending. */
+const saved = (
+  action: OwnerMutation["action"],
+  version: number,
+  factID: string = crypto.randomUUID(),
+): OwnerMutation => ({
+  factID,
+  mutationID: crypto.randomUUID(),
+  action,
+  version,
+  createdAt: 0,
+});
+
+test("M10: the owner fact requests main builds are what the daemon parses, and its answers fit", async () => {
+  const send = (mutation: OwnerMutation, text: string | null) => {
+    const request = ownerRequest(mutation, text);
+    return call(request.method, request.path, "body" in request ? request.body : undefined);
+  };
+  const add = saved("create", 0);
+  const created = await send(add, "Lives in Lisbon.");
+  expect(created.status).toBe(201);
+  expect(fits(created.value, shapes.ownerChange)).toBe(true);
+  const edit = saved("edit", 1, add.factID);
+  expect((await send(edit, "Lives in Porto.")).status).toBe(200);
+  // A lost answer is settled only by reading the fact and finding this very change.
+  const read = await call("GET", `/owner/facts/${add.factID}`);
+  expect(fits(read.value, shapes.ownerFact)).toBe(true);
+  const reply = { ok: true as const, value: read.value as { fact: { lastMutationID: string } } };
+  expect(ownerOutcome(edit, reply)).toBe("landed");
+  expect(ownerOutcome(add, reply)).toBe("unknown");
+  expect(ownerOutcome(edit, { ok: false, error: "gone", status: 404 })).toBe("unknown");
+
+  db.insert(ownerFacts)
+    .values({
+      id: crypto.randomUUID(),
+      state: "pending",
+      text: "Prefers tea.",
+      version: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      originDot: "jojo",
+      originSession: "ses_jojo",
+      originMessage: "msg_1",
+    })
+    .run();
+  const memory = await call("GET", "/owner/memory");
+  expect(fits(memory.value, shapes.ownerMemory)).toBe(true);
+  const [pending] = (memory.value as { pending: { id: string }[] }).pending;
+  if (!pending) throw new Error("no pending fact");
+  expect((await send(saved("approve", 1, pending.id), "Prefers green tea.")).status).toBe(200);
+  expect((await send(saved("delete", 2, pending.id), null)).status).toBe(200);
+  const other = await send(saved("reject", 1, add.factID), null);
+  // A stale or wrong-state change is a conflict with the fact as it is now.
+  expect(other.status).toBe(409);
+  expect(other.value).toMatchObject({ current: { id: add.factID, version: 2 } });
 });

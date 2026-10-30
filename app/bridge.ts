@@ -653,6 +653,40 @@ export interface FreshResult {
   moved?: number;
 }
 
+export interface OwnerFact {
+  id: string;
+  state: "pending" | "approved" | "rejected" | "deleted";
+  text: string | null;
+  version: number;
+  createdAt: number;
+  updatedAt: number;
+  /** Where a dot's proposal came from: audit only, never evidence the fact is true. */
+  origin: { dot: string; sessionID: string; messageID: string } | null;
+  lastMutationID: string | null;
+}
+
+export interface OwnerMemory {
+  pending: OwnerFact[];
+  approved: OwnerFact[];
+  removed: OwnerFact[];
+  entryBytes: number;
+  entryLimit: number;
+}
+
+export type OwnerAction = "create" | "approve" | "edit" | "reject" | "delete";
+
+/**
+ * An owner fact change main saved before sending it: only IDs, the action and the version it was
+ * made at, never the text. One still listed may or may not have landed.
+ */
+export interface OwnerMutation {
+  factID: string;
+  mutationID: string;
+  action: OwnerAction;
+  version: number;
+  createdAt: number;
+}
+
 /**
  * The daemon operations the renderer may ask main for, by name, with their arguments and answer.
  * Main builds each request itself from validated arguments: never a path, URL or file.
@@ -662,6 +696,17 @@ export interface Operations {
   dismiss: [[id: number], true];
   dismissAll: [[ids: number[]], { dismissed: number[]; missing: number[] }];
   memory: [[dot: string], Memory];
+  ownerMemory: [[], OwnerMemory];
+  ownerFact: [[id: string], { fact: OwnerFact }];
+  /** `factID` is null only to create: main then chooses it, and saves both IDs before sending. */
+  ownerChange: [
+    [factID: string | null, action: OwnerAction, version: number, text: string | null],
+    { fact: OwnerFact },
+  ];
+  /** Saved changes whose outcome main hasn't seen, outside any still being sent. */
+  ownerMutations: [[], OwnerMutation[]];
+  /** Drops a saved change once its outcome is known or the owner dismisses it. */
+  ownerSettle: [[mutationID: string], true];
   observations: [[dot: string, before: number], ObservationPage];
   observationSource: [[dot: string, id: number, message: string], SourceText];
   noteSource: [[dot: string, id: number], NoteSourceRead];

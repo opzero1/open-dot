@@ -97,6 +97,25 @@ const surfaces = () => ({
   handedOff: [] as ReturnType<typeof feedItem>[],
   // While set, each memory change waits for it.
   memoryHold: undefined as Promise<void> | undefined,
+  // The owner's facts, shared by every dot: one pending suggestion from jojo to start with.
+  owner: {
+    facts: [
+      {
+        id: "11111111-1111-4111-8111-111111111111",
+        state: "pending",
+        text: "Prefers <b>tea</b> [link](https://evil.example)",
+        version: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        origin: { dot: "jojo", sessionID: "ses_jojo", messageID: "msg_suggest" },
+        lastMutationID: null as string | null,
+      },
+    ],
+    // While set, each owner fact change waits for it.
+    hold: undefined as Promise<void> | undefined,
+    // The next change is saved but answered with a body that isn't a fact.
+    garbleOnce: false,
+  },
   // The next instructions save answers 200 with a body that isn't instructions.
   malformedOnce: false,
   memory: {
@@ -603,6 +622,65 @@ class FakeDaemon {
     const memory = d.memory;
     const mutation = method !== "GET";
     if (mutation) d.calls.push(call);
+    const owner = d.owner;
+    if (path === "/owner/memory")
+      return json({
+        pending: owner.facts.filter((fact) => fact.state === "pending"),
+        approved: owner.facts.filter((fact) => fact.state === "approved"),
+        removed: owner.facts.filter(
+          (fact) => fact.state === "rejected" || fact.state === "deleted",
+        ),
+        entryBytes: 120,
+        entryLimit: 8192,
+      });
+    const factID = /^\/owner\/facts\/([0-9a-f-]{36})$/.exec(path)?.[1];
+    if (factID) {
+      if (mutation) await owner.hold;
+      const fact = owner.facts.find((known) => known.id === factID);
+      if (method === "GET")
+        return fact ? json({ fact }) : json({ error: "There's no such fact." }, 404);
+      const given = (body ?? {}) as {
+        version?: number;
+        text?: string;
+        action?: string;
+        mutationID?: string;
+      };
+      const version = method === "DELETE" ? Number(url.searchParams.get("version")) : given.version;
+      const mutationID =
+        method === "DELETE" ? url.searchParams.get("mutationID") : (given.mutationID ?? null);
+      let saved: (typeof owner.facts)[number];
+      if (method === "PUT") {
+        if (fact) return json({ error: "Exists.", current: fact }, 409);
+        saved = {
+          id: factID,
+          state: "approved",
+          text: given.text ?? "",
+          version: 1,
+          createdAt: 2,
+          updatedAt: 2,
+          origin: null as never,
+          lastMutationID: mutationID,
+        };
+        owner.facts.push(saved);
+      } else {
+        if (!fact) return json({ error: "There's no such fact." }, 404);
+        if (fact.version !== version)
+          return json({ error: "This fact changed since you loaded it.", current: fact }, 409);
+        const action = method === "DELETE" ? "delete" : given.action;
+        Object.assign(fact, {
+          state: action === "reject" ? "rejected" : action === "delete" ? "deleted" : "approved",
+          text: action === "reject" || action === "delete" ? null : (given.text ?? fact.text),
+          version: fact.version + 1,
+          lastMutationID: mutationID,
+        });
+        saved = fact;
+      }
+      if (owner.garbleOnce) {
+        owner.garbleOnce = false;
+        return json({ ok: true });
+      }
+      return json({ fact: saved });
+    }
     if (path === "/feed") return json({ items: d.feed, remaining: 0, handedOff: d.handedOff });
     if (path === "/feed/dismiss") {
       const ids = (body as { ids: number[] }).ids;
@@ -3461,3 +3539,77 @@ test("avatars: a failed read is asked for again, a deleted one clears, and Comma
     },
   );
 }, 120_000);
+
+test("About you: suggestions show as plain untrusted text, one change goes at a time across dots, and a lost answer settles by the fact's ID without resending", async () => {
+  await scenario(
+    "owner-facts",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+      fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      const pending = '[data-owner-pending="11111111-1111-4111-8111-111111111111"]';
+      await openPane(app, "Memory");
+      await until(`!!document.querySelector(${JSON.stringify(pending)})`, "the suggestion");
+      // Plain text, labelled as an untrusted suggestion with where it came from; no markup or links.
+      expect(
+        await js(`(() => {
+          const row = document.querySelector(${JSON.stringify(pending)});
+          return {
+            text: row.querySelector(".item-text").textContent,
+            label: row.querySelector(".note").textContent,
+            markup: !!row.querySelector("b, a"),
+          };
+        })()`),
+      ).toEqual({
+        text: "Prefers <b>tea</b> [link](https://evil.example)",
+        label:
+          "Untrusted suggestion, not evidence it's true. Suggested by jojo, in session ses_jojo, message msg_suggest.",
+        markup: false,
+      });
+      // An edit-and-approve draft is global: it survives showing another dot's memory.
+      await press(pending, "Edit and approve");
+      await js(
+        `t.fill('[aria-label="Edit the suggestion before approving"]', "Prefers green tea.")`,
+      );
+      const held = Promise.withResolvers<void>();
+      fake.data.owner.hold = held.promise;
+      await press(pending, "Approve this text for every dot");
+      await js(`document.querySelector('[data-dot="dio"]').click(), true`);
+      await js(`t.cmd("2"), true`);
+      await until(
+        `document.querySelector('[aria-label="Edit the suggestion before approving"]')?.value === "Prefers green tea."`,
+        "the same draft in dio's memory",
+      );
+      // While it's out, no other change to the owner's facts can start, from any dot.
+      expect(
+        await js(
+          `[...document.querySelector('[data-section="owner"]').querySelectorAll("button")].filter((b) => /Approve|Reject|Add for every dot/.test(b.textContent) && !b.disabled).length`,
+        ),
+      ).toBe(0);
+      held.resolve();
+      fake.data.owner.hold = undefined;
+      await until(`!!document.querySelector("[data-owner-approved]")`, "the approved fact");
+      // A delete whose answer is lost: read by the fact's ID, found landed, and never resent.
+      fake.data.owner.garbleOnce = true;
+      await press("[data-owner-approved]", "Delete");
+      await press('[role="alertdialog"]', "Delete");
+      await until(`!document.querySelector("[data-owner-approved]")`, "the deleted fact");
+      await until(`!document.querySelector("[data-owner-unknown]")`, "the settled change");
+      expect(
+        mutations(fake, "/owner/facts").map((call) => [
+          call.method,
+          (call.body as { action?: string } | null)?.action ?? null,
+        ]),
+      ).toEqual([
+        ["PATCH", "approve"],
+        ["DELETE", null],
+      ]);
+      expect(mutations(fake, "/owner/facts")[0]?.body).toMatchObject({
+        version: 1,
+        text: "Prefers green tea.",
+      });
+    },
+  );
+}, 170_000);
