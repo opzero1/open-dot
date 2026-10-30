@@ -18,7 +18,6 @@ import { createRoot } from "react-dom/client";
 import type {
   Attempt,
   DotView,
-  DraftImage,
   MessageView,
   PageView,
   PendingView,
@@ -71,7 +70,7 @@ import { Memory } from "./Memory";
 import { Health, Library } from "./Panes";
 import { Slack } from "./SlackView";
 import { AvatarState, InstructionsState } from "./surfaces";
-import { type Ask, bridge, Dialog } from "./ui";
+import { type Ask, bridge, Dialog, LocalThumb } from "./ui";
 
 /** What the window shows for the selected dot; the Feed shows over any of them. */
 type Pane = "chat" | "memory" | "instructions" | "library" | "health" | "slack";
@@ -191,33 +190,6 @@ const Thumb = ({
     </button>
   ) : (
     <span className="thumb loading" aria-label={`Loading ${name}`} />
-  );
-};
-
-/** A local image's preview, released when it leaves the screen. */
-const LocalThumb = ({
-  image,
-  className,
-  onRemove,
-}: {
-  image: DraftImage;
-  className: string;
-  onRemove?: () => void;
-}) => {
-  const url = useMemo(
-    () => URL.createObjectURL(new Blob([new Uint8Array(image.data)], { type: image.mime })),
-    [image],
-  );
-  useEffect(() => () => URL.revokeObjectURL(url), [url]);
-  return (
-    <span className={className}>
-      <img src={url} alt={image.name} title={image.name} />
-      {onRemove ? (
-        <button type="button" aria-label={`Remove ${image.name}`} onClick={onRemove}>
-          ×
-        </button>
-      ) : null}
-    </span>
   );
 };
 

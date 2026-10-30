@@ -1,6 +1,7 @@
 /** @jsxImportSource react */
 // The feed: unread items from GitHub, Linear and Slack, oldest first. Each can be opened,
 // dismissed or replied to: a reply sends one message per picked dot, each once, by its saved ID.
+// Items handed off to dots can be replied to again.
 import {
   type ClipboardEvent,
   type DragEvent,
@@ -12,23 +13,21 @@ import {
 import type { DotView, DraftImage, FeedItem, Reply, SendResult } from "./bridge";
 import { imageLimits } from "./chat";
 import {
+  type FeedReply,
+  FeedReplies,
   FeedState,
   feedPrompts,
-  type ReplyOutcome,
   shortAgo,
   sourceNames,
-  unsentRecipients,
 } from "./surfaces";
-import { bridge } from "./ui";
+import { bridge, LocalThumb } from "./ui";
 
-interface ReplyBox {
-  item: FeedItem;
-  dots: string[];
-  text: string;
-  images: DraftImage[];
-  sending: boolean;
-  problems: { dot: string; error: string }[];
-}
+type ReplyBox = FeedReply<DraftImage>;
+
+// Reply drafts and what each dot's send came to, kept while the window lives, so leaving the Feed,
+// Escape or the item moving to Handed off never drops one.
+const replies = new FeedReplies<DraftImage>();
+let mounted = 0;
 
 const dismissal = (result: Extract<Reply<unknown>, { ok: false }>) =>
   result.lost
@@ -51,14 +50,27 @@ export const Feed = ({
 }) => {
   const state = useRef(new FeedState());
   const [, setTick] = useState(0);
-  const render = () => setTick((tick) => tick + 1);
+  const render = useCallback(() => setTick((tick) => tick + 1), []);
   const [remaining, setRemaining] = useState(0);
   const [handedOff, setHandedOff] = useState<FeedItem[]>([]);
+  const [handedOpen, setHandedOpen] = useState(false);
   const [error, setError] = useState<string>();
   const [loaded, setLoaded] = useState(false);
-  const [reply, setReply] = useState<ReplyBox>();
-  const replyRef = useRef(reply);
-  replyRef.current = reply;
+
+  useEffect(() => {
+    mounted++;
+    return () => {
+      mounted--;
+    };
+  }, []);
+
+  /** Asks the daemon what became of each unknown reply send, by its ID; nothing is sent again. */
+  const reconcile = useCallback(async () => {
+    for (const { id, dot, attempt } of replies.unknown()) {
+      const result = await bridge.reconcile(attempt);
+      if (result.ok && replies.settle(id, dot, result.value)) render();
+    }
+  }, [render]);
 
   const refresh = useCallback(async () => {
     const poll = state.current.startPoll();
@@ -74,7 +86,8 @@ export const Feed = ({
     setHandedOff(result.value.handedOff);
     setLoaded(true);
     render();
-  }, []);
+    void reconcile();
+  }, [render, reconcile]);
 
   useEffect(() => {
     void refresh();
@@ -114,24 +127,15 @@ export const Feed = ({
     if (remaining > 0) void refresh();
   };
 
-  const startReply = (item: FeedItem) =>
-    setReply((current) =>
-      current?.item.id === item.id
-        ? current
-        : {
-            item,
-            dots: (selected ?? dots[0]?.name) ? [selected ?? dots[0]?.name ?? ""] : [],
-            text: "",
-            images: [],
-            sending: false,
-            problems: [],
-          },
-    );
+  const startReply = (item: FeedItem) => {
+    replies.open(item, selected ?? dots[0]?.name);
+    render();
+  };
 
-  const attach = async (files: File[]) => {
+  const attach = async (id: number, files: File[]) => {
     for (const file of files) {
       if (!file.type.startsWith("image/")) continue;
-      const box = replyRef.current;
+      const box = replies.boxes.get(id);
       if (!box || box.sending) return;
       if (box.images.length >= imageLimits.count) return;
       if (file.size === 0 || file.size > imageLimits.bytes) continue;
@@ -140,33 +144,36 @@ export const Feed = ({
         data: new Uint8Array(await file.arrayBuffer()),
       });
       if (!result.ok) continue;
-      setReply((current) =>
-        current && !current.sending && current.images.length < imageLimits.count
-          ? { ...current, images: [...current.images, result.value] }
-          : current,
-      );
+      if (
+        replies.change(id, (current) =>
+          current.images.length < imageLimits.count
+            ? { images: [...current.images, result.value] }
+            : {},
+        )
+      )
+        render();
     }
   };
 
   /**
-   * Captures the recipients, text, images and item once, then sends one message to each dot in
-   * turn. A dot whose send was saved, or whose outcome is unknown and is being reconciled by its
-   * ID, is never sent this reply again; one that was refused stays picked to try again.
+   * Captures the recipients, their sessions, the text, the images and the item once, then sends
+   * one message to each dot in turn. A dot whose send was saved, or whose outcome is unknown and is
+   * reconciled by its ID, is never sent this reply again; one that refused stays picked.
    */
-  const send = async () => {
-    const box = replyRef.current;
-    if (!box || box.sending) return;
-    const text = box.text.trim();
-    if (!text || !box.dots.length) return;
-    const captured = { item: box.item.id, text, images: [...box.images], dots: [...box.dots] };
-    setReply({ ...box, sending: true, problems: [] });
-    const outcomes = new Map<string, ReplyOutcome>();
-    const problems: { dot: string; error: string }[] = [];
+  const send = async (id: number) => {
+    const captured = replies.begin(id);
+    if (!captured) return;
+    render();
+    const sessions = new Map<string, string | undefined>();
+    for (const dot of captured.dots) sessions.set(dot, await sessionFor(dot));
     for (const dot of captured.dots) {
-      const sessionID = await sessionFor(dot);
+      const sessionID = sessions.get(dot);
       if (!sessionID) {
-        outcomes.set(dot, "refused");
-        problems.push({ dot, error: "its conversation couldn't be read, so nothing was sent." });
+        replies.record(id, dot, {
+          outcome: "refused",
+          error: "its conversation couldn't be read, so nothing was sent.",
+        });
+        render();
         continue;
       }
       let result: SendResult;
@@ -181,42 +188,52 @@ export const Feed = ({
       } catch {
         result = { outcome: "unknown", id: "", error: "No answer." };
       }
-      if (result.outcome === "saved") outcomes.set(dot, "saved");
-      else if (result.outcome === "unknown") {
-        outcomes.set(dot, "unknown");
-        problems.push({
-          dot,
-          error: "open-dot didn't confirm it. Its chat checks by ID and won't send it again.",
+      if (result.outcome === "saved") replies.record(id, dot, { outcome: "saved" });
+      else if (result.outcome === "unknown")
+        replies.record(id, dot, {
+          outcome: "unknown",
+          error: "open-dot didn't confirm it. It's checked by its ID and never sent again.",
+          ...(result.id
+            ? { attempt: { dot, sessionID, messageID: result.id, createdAt: Date.now() } }
+            : {}),
         });
-      } else {
-        outcomes.set(dot, "refused");
-        problems.push({ dot, error: result.error });
-      }
+      else replies.record(id, dot, { outcome: "refused", error: result.error });
       onSent(dot);
+      render();
     }
-    const unsent = unsentRecipients(captured.dots, outcomes);
-    if (!problems.length) setReply(undefined);
-    else
-      setReply((current) =>
-        current
-          ? {
-              ...current,
-              sending: false,
-              problems,
-              // Unsent content stays to try again; only dots that got nothing stay picked.
-              dots: unsent,
-              ...(unsent.length ? {} : { text: "", images: [] }),
-            }
-          : current,
-      );
+    const done = replies.end(id, captured.dots);
+    render();
     void refresh();
-    const first = captured.dots.find((dot) => outcomes.get(dot) === "saved");
-    if (first && !problems.length) onOpenChat(first);
+    const first = captured.dots[0];
+    if (done === "done" && first && mounted > 0) onOpenChat(first);
   };
 
   const items = state.current.items;
   const overflow = state.current.overflow;
   const more = remaining + overflow;
+  const listed = new Set([...items, ...handedOff].map((item) => item.id));
+  // Replies whose item left both lists, such as one dismissed elsewhere, still show.
+  const elsewhere = [...replies.boxes.values()].filter((box) => !listed.has(box.item.id));
+
+  const editor = (id: number) => {
+    const box = replies.boxes.get(id);
+    if (!box) return null;
+    return (
+      <ReplyEditor
+        box={box}
+        dots={dots}
+        canPick={(dot) => replies.canPick(id, dot)}
+        onChange={(change) => {
+          if (replies.change(id, change)) render();
+        }}
+        onAttach={(files) => void attach(id, files)}
+        onSend={() => void send(id)}
+        onCancel={() => {
+          if (replies.cancel(id)) render();
+        }}
+      />
+    );
+  };
 
   return (
     <div className="pane feed" aria-label="Feed" data-pane="feed">
@@ -272,37 +289,50 @@ export const Feed = ({
                     Dismiss
                   </button>
                 </div>
-                {reply?.item.id === item.id ? (
-                  <ReplyEditor
-                    box={reply}
-                    dots={dots}
-                    onChange={(change) =>
-                      setReply((current) =>
-                        current && !current.sending ? change(current) : current,
-                      )
-                    }
-                    onAttach={(files) => void attach(files)}
-                    onSend={() => void send()}
-                    onCancel={() => setReply(undefined)}
-                  />
-                ) : null}
+                {editor(item.id)}
               </li>
             );
           })}
         </ul>
         {more > 0 ? <p className="note">More unread items will appear on refresh.</p> : null}
         {handedOff.length ? (
-          <details className="handed-off">
+          <details
+            className="handed-off"
+            open={handedOpen || handedOff.some((item) => replies.boxes.has(item.id))}
+            onToggle={(event) => setHandedOpen(event.currentTarget.open)}
+          >
             <summary>Handed off ({handedOff.length})</summary>
             <ul>
               {handedOff.map((item) => (
                 <li key={item.id} data-handed-off={item.id}>
                   <span className="feed-title">{item.title}</span>{" "}
                   <span className="note">→ {(item.handedTo ?? []).join(", ")}</span>
+                  <div className="item-actions">
+                    {item.url ? (
+                      <button type="button" onClick={() => void bridge.openLink(item.url ?? "")}>
+                        Open
+                      </button>
+                    ) : null}
+                    <button type="button" onClick={() => startReply(item)}>
+                      Reply
+                    </button>
+                  </div>
+                  {editor(item.id)}
                 </li>
               ))}
             </ul>
           </details>
+        ) : null}
+        {elsewhere.length ? (
+          <ul className="feed-list">
+            {elsewhere.map((box) => (
+              <li key={box.item.id} className="feed-item" data-feed-reply-only={box.item.id}>
+                <div className="feed-title">{box.item.title}</div>
+                <div className="note">No longer in the feed. Your reply is kept here.</div>
+                {editor(box.item.id)}
+              </li>
+            ))}
+          </ul>
         ) : null}
       </div>
     </div>
@@ -311,9 +341,12 @@ export const Feed = ({
 
 const imageFiles = (list: FileList) => [...list].filter((file) => file.type.startsWith("image/"));
 
+const outcomeWords = { saved: "Saved", unknown: "Not confirmed", refused: "Not sent" } as const;
+
 const ReplyEditor = ({
   box,
   dots,
+  canPick,
   onChange,
   onAttach,
   onSend,
@@ -321,7 +354,8 @@ const ReplyEditor = ({
 }: {
   box: ReplyBox;
   dots: DotView[];
-  onChange: (change: (box: ReplyBox) => ReplyBox) => void;
+  canPick: (dot: string) => boolean;
+  onChange: (change: (box: ReplyBox) => Partial<ReplyBox>) => void;
   onAttach: (files: File[]) => void;
   onSend: () => void;
   onCancel: () => void;
@@ -338,11 +372,13 @@ const ReplyEditor = ({
     onAttach(imageFiles(event.dataTransfer.files));
   };
   const picked = box.dots;
+  const results = [...box.results];
   return (
     <div
       className="reply-box"
       role="group"
-      aria-label="Reply"
+      aria-label={`Reply to ${box.item.title}`}
+      data-reply={box.item.id}
       onDragOver={(event) => event.preventDefault()}
       onDrop={onDrop}
     >
@@ -353,9 +389,9 @@ const ReplyEditor = ({
             <input
               type="checkbox"
               checked={picked.includes(dot.name)}
+              disabled={!canPick(dot.name)}
               onChange={() =>
                 onChange((current) => ({
-                  ...current,
                   dots: current.dots.includes(dot.name)
                     ? current.dots.filter((name) => name !== dot.name)
                     : [...current.dots, dot.name],
@@ -370,14 +406,14 @@ const ReplyEditor = ({
         <button
           type="button"
           disabled={box.sending}
-          onClick={() => onChange((current) => ({ ...current, text: feedPrompts.start }))}
+          onClick={() => onChange(() => ({ text: feedPrompts.start }))}
         >
           Start on it
         </button>
         <button
           type="button"
           disabled={box.sending}
-          onClick={() => onChange((current) => ({ ...current, text: feedPrompts.context }))}
+          onClick={() => onChange(() => ({ text: feedPrompts.context }))}
         >
           Use as context
         </button>
@@ -390,44 +426,42 @@ const ReplyEditor = ({
         readOnly={box.sending}
         onChange={(event) => {
           const text = event.target.value;
-          onChange((current) => ({ ...current, text }));
+          onChange(() => ({ text }));
         }}
         onPaste={onPaste}
       />
       {box.images.length ? (
         <div className="draft-images">
           {box.images.map((image, index) => (
-            <span key={index} className="draft-chip">
-              {image.name}
-              <button
-                type="button"
-                aria-label={`Remove ${image.name}`}
-                disabled={box.sending}
-                onClick={() =>
-                  onChange((current) => ({
-                    ...current,
-                    images: current.images.filter((other) => other !== image),
-                  }))
-                }
-              >
-                ×
-              </button>
-            </span>
+            <LocalThumb
+              key={index}
+              className="draft-thumb"
+              image={image}
+              {...(box.sending
+                ? {}
+                : {
+                    onRemove: () =>
+                      onChange((current) => ({
+                        images: current.images.filter((other) => other !== image),
+                      })),
+                  })}
+            />
           ))}
         </div>
       ) : null}
-      {box.problems.length ? (
-        <div className="item-error" role="alert" data-reply-problems>
-          {box.problems.map((problem) => (
-            <div key={problem.dot}>
-              {problem.dot}: {problem.error}
-            </div>
+      {results.length ? (
+        <ul className="reply-results" aria-live="polite" data-reply-results>
+          {results.map(([dot, result]) => (
+            <li key={dot} data-reply-result={dot} data-outcome={result.outcome}>
+              {dot}: {outcomeWords[result.outcome]}
+              {result.error ? `. ${result.error}` : ""}
+            </li>
           ))}
-        </div>
+        </ul>
       ) : null}
       <div className="item-actions">
         <button type="button" onClick={onCancel} disabled={box.sending}>
-          Cancel
+          {results.length ? "Discard" : "Cancel"}
         </button>
         <button
           type="button"

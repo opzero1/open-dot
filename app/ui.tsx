@@ -1,7 +1,7 @@
 /** @jsxImportSource react */
 // What the window's panes share: the bridge, the one dialog and a section heading.
-import { type ReactNode, useEffect, useRef } from "react";
-import type { Bridge } from "./bridge";
+import { type ReactNode, useEffect, useMemo, useRef } from "react";
+import type { Bridge, DraftImage } from "./bridge";
 
 const loaded = globalThis.openDot;
 if (!loaded) throw new Error("The app's preload didn't load.");
@@ -82,3 +82,30 @@ export const bytes = (size: number) =>
     : size < 1024 * 1024
       ? `${(size / 1024).toFixed(1)} KB`
       : `${(size / 1024 / 1024).toFixed(1)} MB`;
+
+/** A local image's preview, released when it leaves the screen. */
+export const LocalThumb = ({
+  image,
+  className,
+  onRemove,
+}: {
+  image: DraftImage;
+  className: string;
+  onRemove?: () => void;
+}) => {
+  const url = useMemo(
+    () => URL.createObjectURL(new Blob([new Uint8Array(image.data)], { type: image.mime })),
+    [image],
+  );
+  useEffect(() => () => URL.revokeObjectURL(url), [url]);
+  return (
+    <span className={className}>
+      <img src={url} alt={image.name} title={image.name} />
+      {onRemove ? (
+        <button type="button" aria-label={`Remove ${image.name}`} onClick={onRemove}>
+          ×
+        </button>
+      ) : null}
+    </span>
+  );
+};

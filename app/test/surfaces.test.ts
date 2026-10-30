@@ -4,11 +4,11 @@ import { linkAppID, tokenMatches } from "../slack";
 import {
   changedFields,
   Drafts,
+  FeedReplies,
   FeedState,
   Fence,
   InstructionsState,
   Searches,
-  unsentRecipients,
 } from "../surfaces";
 
 const item = (id: number): FeedItem => ({
@@ -93,16 +93,60 @@ test("a lost clear keeps the whole bounded snapshot and the overflow", () => {
   expect(shown(state)).toEqual([1001]);
 });
 
-test("a feed reply never sends again to a dot whose send saved or is unknown", () => {
-  const outcomes = new Map([
-    ["jotaro", "saved"],
-    ["jolyne", "unknown"],
-    ["giorno", "refused"],
-  ] as const);
-  expect(unsentRecipients(["jotaro", "jolyne", "giorno", "josuke"], outcomes)).toEqual([
-    "giorno",
-    "josuke",
+test("a feed reply never sends again to a dot whose send saved or is unknown, and keeps its content until all saved", () => {
+  const replies = new FeedReplies<string>();
+  const box = replies.open(item(1), "jotaro");
+  replies.change(1, () => ({
+    dots: ["jotaro", "jolyne", "giorno"],
+    text: " Take this on ",
+    images: ["a.png", "b.png"],
+  }));
+  const sent = replies.begin(1);
+  expect(sent).toEqual({
+    item: 1,
+    text: "Take this on",
+    images: ["a.png", "b.png"],
+    dots: ["jotaro", "jolyne", "giorno"],
+  });
+  // While it sends, nothing changes and a second Send sends nothing.
+  expect(replies.change(1, () => ({ text: "other" }))).toBe(false);
+  expect(replies.begin(1)).toBeUndefined();
+  expect(replies.cancel(1)).toBe(false);
+  const attempt = { dot: "jolyne", sessionID: "ses_j", messageID: "msg_j", createdAt: 1 };
+  replies.record(1, "jotaro", { outcome: "saved" });
+  replies.record(1, "jolyne", { outcome: "unknown", attempt });
+  replies.record(1, "giorno", { outcome: "refused", error: "No session." });
+  expect(replies.end(1, sent?.dots ?? [])).toBe("kept");
+  // Only the dot that refused stays picked; the text and images stay for it.
+  expect(box.dots).toEqual(["giorno"]);
+  expect(box.text).toBe(" Take this on ");
+  expect(box.images).toEqual(["a.png", "b.png"]);
+  expect(["jotaro", "jolyne", "giorno", "josuke"].map((dot) => replies.canPick(1, dot))).toEqual([
+    false,
+    false,
+    true,
+    true,
   ]);
+  // Picking a dot already reached is refused.
+  replies.change(1, () => ({ dots: ["jotaro", "giorno"] }));
+  expect(box.dots).toEqual(["giorno"]);
+  // Reopening the item, as after Escape or a move to Handed off, gives the same reply.
+  expect(replies.open(item(1), "jotaro")).toBe(box);
+  // The unknown send reconciles by its ID; a cancelled one may be picked again.
+  expect(replies.unknown()).toEqual([{ id: 1, dot: "jolyne", attempt }]);
+  expect(replies.settle(1, "jolyne", "unknown")).toBe(false);
+  expect(replies.settle(1, "jolyne", "cancelled")).toBe(true);
+  expect(replies.canPick(1, "jolyne")).toBe(true);
+  replies.change(1, () => ({ dots: ["giorno", "jolyne"] }));
+  const again = replies.begin(1);
+  expect(again?.dots).toEqual(["giorno", "jolyne"]);
+  replies.record(1, "giorno", { outcome: "saved" });
+  replies.record(1, "jolyne", { outcome: "unknown", attempt });
+  expect(replies.end(1, again?.dots ?? [])).toBe("kept");
+  expect(replies.boxes.has(1)).toBe(true);
+  // Once every dot is known to have it, the reply ends.
+  expect(replies.settle(1, "jolyne", "delivered")).toBe(true);
+  expect(replies.boxes.has(1)).toBe(false);
 });
 
 const file = (content: string, revision: string, canRevert = false): Instructions => ({

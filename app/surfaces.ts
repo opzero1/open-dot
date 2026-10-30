@@ -1,11 +1,13 @@
 // The plain logic behind the app's Feed, Memory and Instructions, apart from React and
 // Electron so it can be tested. Each piece holds only view state; the daemon owns every value.
 import type {
+  Attempt,
   FeedItem,
   Grant,
   Instructions,
   MemoryResponsibility,
   NoteSourceRead,
+  ReceiptStatus,
   Reply,
   RequestAudit,
   RunView,
@@ -106,14 +108,130 @@ export const feedPrompts = {
 /** What a feed reply did for one dot. Unknown sends are tracked by ID and never sent again. */
 export type ReplyOutcome = "saved" | "unknown" | "refused";
 
+export interface ReplyResult {
+  outcome: ReplyOutcome;
+  error?: string;
+  /** An unknown send's IDs, to reconcile by; never its text or images. */
+  attempt?: Attempt;
+}
+
+export interface FeedReply<Image> {
+  item: FeedItem;
+  dots: string[];
+  text: string;
+  images: Image[];
+  sending: boolean;
+  /** What each dot's send from this reply came to, kept across sends. */
+  results: Map<string, ReplyResult>;
+}
+
+/** Statuses a send's receipt has once the daemon holds it. */
+const held: readonly ReceiptStatus[] = ["sending", "confirming", "sent", "delivered", "held"];
+
 /**
- * The dots still to send to after a reply: those whose send didn't land. A saved or unknown one is
- * never sent again from the same reply.
+ * The feed's reply drafts, by item, kept while the window lives: leaving the Feed, Escape and a
+ * refresh that moves the item to Handed off keep each one's dots, text, images and what each dot's
+ * send came to. A dot whose send was saved, or is unknown and reconciling by its ID, is never sent
+ * the reply again; the text and images stay until every dot's send is known to be saved.
  */
-export const unsentRecipients = (
-  recipients: readonly string[],
-  outcomes: ReadonlyMap<string, ReplyOutcome>,
-) => recipients.filter((dot) => outcomes.get(dot) === "refused" || !outcomes.has(dot));
+export class FeedReplies<Image> {
+  readonly boxes = new Map<number, FeedReply<Image>>();
+
+  /** Opens an item's reply, or goes back to the one kept for it. */
+  open(item: FeedItem, dot: string | undefined) {
+    const known = this.boxes.get(item.id);
+    if (known) return known;
+    const box: FeedReply<Image> = {
+      item,
+      dots: dot ? [dot] : [],
+      text: "",
+      images: [],
+      sending: false,
+      results: new Map(),
+    };
+    this.boxes.set(item.id, box);
+    return box;
+  }
+
+  /** The owner's change to a reply, refused while it sends. */
+  change(id: number, change: (box: FeedReply<Image>) => Partial<FeedReply<Image>>) {
+    const box = this.boxes.get(id);
+    if (!box || box.sending) return false;
+    Object.assign(box, change(box));
+    box.dots = box.dots.filter((dot) => this.canPick(id, dot));
+    return true;
+  }
+
+  /** Only a dot this reply hasn't reached, or that refused it, can be picked. */
+  canPick(id: number, dot: string) {
+    const result = this.boxes.get(id)?.results.get(dot);
+    return !result || result.outcome === "refused";
+  }
+
+  /** What one Send sends, captured once; undefined while one is out or nothing can go. */
+  begin(id: number) {
+    const box = this.boxes.get(id);
+    if (!box || box.sending) return undefined;
+    const text = box.text.trim();
+    const dots = box.dots.filter((dot) => this.canPick(id, dot));
+    if (!text || !dots.length) return undefined;
+    box.sending = true;
+    return { item: id, text, images: [...box.images], dots };
+  }
+
+  record(id: number, dot: string, result: ReplyResult) {
+    this.boxes.get(id)?.results.set(dot, result);
+  }
+
+  /**
+   * A Send's end: dots that refused stay picked to try again. The reply ends only when every dot
+   * it went to saved it; otherwise its text and images stay.
+   */
+  end(id: number, sent: readonly string[]) {
+    const box = this.boxes.get(id);
+    if (!box) return "gone" as const;
+    box.sending = false;
+    box.dots = sent.filter((dot) => box.results.get(dot)?.outcome === "refused");
+    return this.finished(id) ? ("done" as const) : ("kept" as const);
+  }
+
+  /** An unknown send's receipt, as the daemon has it now. */
+  settle(id: number, dot: string, status: ReceiptStatus) {
+    const result = this.boxes.get(id)?.results.get(dot);
+    if (result?.outcome !== "unknown") return false;
+    if (held.includes(status)) this.record(id, dot, { outcome: "saved" });
+    else if (status === "cancelled")
+      this.record(id, dot, { outcome: "refused", error: "It was cancelled before it was sent." });
+    else return false;
+    this.finished(id);
+    return true;
+  }
+
+  /** The owner discards a reply; never while it sends. */
+  cancel(id: number) {
+    if (this.boxes.get(id)?.sending) return false;
+    return this.boxes.delete(id);
+  }
+
+  /** Every unknown send to reconcile by its ID. */
+  unknown() {
+    return [...this.boxes.values()].flatMap((box) =>
+      [...box.results].flatMap(([dot, result]) =>
+        result.outcome === "unknown" && result.attempt
+          ? [{ id: box.item.id, dot, attempt: result.attempt }]
+          : [],
+      ),
+    );
+  }
+
+  private finished(id: number) {
+    const box = this.boxes.get(id);
+    if (!box || box.sending || box.dots.length || !box.results.size) return false;
+    if (![...box.results.values()].every((result) => result.outcome === "saved")) return false;
+    this.boxes.delete(id);
+    return true;
+  }
+}
 
 export const sourceNames: Record<string, string> = {
   github: "GitHub",
@@ -130,6 +248,16 @@ export const shortAgo = (time: number, now = Date.now()) => {
 };
 
 // Memory.
+
+/** The GitHub reasons a trigger filters on, in the words the feed and the daemon use. */
+export const triggerReasons = [
+  "Review requested",
+  "Mentioned",
+  "Team mentioned",
+  "Assigned",
+  "Comment",
+  "Author",
+] as const;
 
 export const ago = (time: number, now = Date.now()) => {
   const seconds = Math.max(0, (now - time) / 1000);
@@ -249,16 +377,6 @@ export const runAttribution = (run: Pick<RunView, "attribution">) =>
 
 export const runWorkerLine = (worker: RunView["workers"][number]) => {
   const status = worker.needs?.length
-/** The GitHub reasons a trigger filters on, in the words the feed and the daemon use. */
-export const triggerReasons = [
-  "Review requested",
-  "Mentioned",
-  "Team mentioned",
-  "Assigned",
-  "Comment",
-  "Author",
-] as const;
-
     ? `needs you: ${worker.needs.join(", ")}`
     : worker.state === "done"
       ? `finished (${worker.outcome ?? "unknown"})`
@@ -305,124 +423,6 @@ export const requestTitle = (request: Pick<RequestAudit, "state" | "goneAt">) =>
   }
 };
 
-/**
- * The fields an edit changes, compared with the version the owner started from: only those are
- * sent, so a field the dot changed meanwhile isn't overwritten with the stale value.
- */
-export const changedFields = <T extends Record<string, unknown>>(original: T, edited: T) => {
-  const change: Partial<T> = {};
-  for (const key of Object.keys(edited) as (keyof T)[])
-    if (edited[key] !== original[key]) change[key] = edited[key];
-  return change;
-};
-
-/** What a memory change's answer means for the owner. Nothing is ever retried on its own. */
-export const memoryFailure = (result: Extract<Reply<unknown>, { ok: false }>) => {
-  if (result.lost)
-    return "Couldn't confirm this change. It may have been saved; check after the next refresh. Nothing was retried.";
-  if (result.status === 409)
-    return "Not done: this was changed since you loaded it, so this is its current value. Nothing was retried.";
-  if (result.status === 404)
-    return "Nothing was changed: that item is gone, maybe deleted by the dot.";
-  return result.error;
-};
-
-/**
- * Reads of a dot's memory that may show: each read takes the generation when it began, and any
- * change the owner makes advances it, so a read begun before or during a change is dropped.
- */
-export class Fence {
-  private generations = new Map<string, number>();
-
-  current(key: string) {
-    return this.generations.get(key) ?? 0;
-  }
-
-  advance(key: string) {
-    this.generations.set(key, this.current(key) + 1);
-  }
-
-  holds(key: string, generation: number) {
-    return this.current(key) === generation;
-  }
-}
-
-// Instructions.
-
-export const instructionsLimit = 64 * 1024;
-
-export const instructionsTiming =
-  "OpenCode watches this file. After it reloads (normally shortly after saving), edits apply to the next model request, including during a running turn. No restart is needed.";
-
-export type InstructionsBusy =
-  | { kind: "loading" }
-  | { kind: "saving"; sent: string }
-  | { kind: "reverting" };
-
-/**
- * One dot's AGENTS.md editor. One request runs at a time, and only `edit` changes the draft, never
- * while a request runs, so an answer always matches what was sent. Nothing retries on its own.
- */
-export class InstructionsState {
-  base: Instructions | undefined;
-  draft = "";
-  busy: InstructionsBusy | undefined;
-  conflict: Instructions | undefined;
-  conflictFromRevert = false;
-  error: string | undefined;
-  notice: string | undefined;
-
-  get dirty() {
-    return this.base !== undefined && this.draft !== this.base.content;
-  }
-
-  get bytes() {
-    return new TextEncoder().encode(this.draft).length;
-  }
-
-  get tooLarge() {
-    return this.bytes > instructionsLimit;
-  }
-
-  get canSave() {
-    return this.base !== undefined && !this.busy && !this.conflict && this.dirty && !this.tooLarge;
-  }
-
-  get canRevert() {
-    return this.base?.canRevert === true && !this.busy && !this.conflict;
-  }
-
-  get canOverwrite() {
-    return !!this.conflict && !this.conflictFromRevert && !this.busy && !this.tooLarge;
-  }
-
-  /** The owner's typing, kept only once a file is loaded and while no request runs. */
-  edit(text: string) {
-    if (!this.base || this.busy) return false;
-    this.draft = text;
-    return true;
-  }
-
-  beginRead(discarding: boolean) {
-    if (this.busy || (!discarding && this.dirty)) return false;
-    this.busy = { kind: "loading" };
-    this.error = undefined;
-    this.notice = undefined;
-    return true;
-  }
-
-  finishRead(result: Reply<Instructions>) {
-    this.busy = undefined;
-    if (!result.ok) {
-      this.error = result.error;
-      return;
-    }
-    this.base = result.value;
-    this.draft = result.value.content;
-    this.conflict = undefined;
-    this.conflictFromRevert = false;
-  }
-
 /** "#3 permission from worker #1 · escalated to you · Approved once (not sent)". */
 export const requestLine = (
   request: Pick<RequestAudit, "id" | "kind" | "source" | "worker" | "state" | "goneAt" | "summary">,
@@ -467,17 +467,17 @@ export const requestTimes = (
   return parts.join(" · ");
 };
 
-  /** What to send: the draft and the revision it replaces, the conflict's for Overwrite. */
-  beginSave(overwrite: boolean) {
-    if (!this.base || this.busy) return undefined;
-    if (this.draft.includes("\0")) {
-      this.error = "Instructions can't contain NUL characters.";
-      return undefined;
-    }
-    if (this.tooLarge) {
-      this.error = "Instructions must be at most 64 KiB of UTF-8 text.";
-      return undefined;
-    }
+/**
+ * The fields an edit changes, compared with the version the owner started from: only those are
+ * sent, so a field the dot changed meanwhile isn't overwritten with the stale value.
+ */
+export const changedFields = <T extends Record<string, unknown>>(original: T, edited: T) => {
+  const change: Partial<T> = {};
+  for (const key of Object.keys(edited) as (keyof T)[])
+    if (edited[key] !== original[key]) change[key] = edited[key];
+  return change;
+};
+
 export interface Draft<T> {
   /** The version the edit started from: every save of this draft names it. */
   version: number;
@@ -558,37 +558,37 @@ export class Drafts<T> {
   }
 }
 
-    let revision: string;
-    if (overwrite) {
-      if (!this.canOverwrite || !this.conflict) return undefined;
-      revision = this.conflict.revision;
-    } else {
-      if (this.conflict || !this.dirty) return undefined;
-      revision = this.base.revision;
-    }
-    this.busy = { kind: "saving", sent: this.draft };
-    this.error = undefined;
-    this.notice = undefined;
-    return { content: this.draft, revision };
+/** What a memory change's answer means for the owner. Nothing is ever retried on its own. */
+export const memoryFailure = (result: Extract<Reply<unknown>, { ok: false }>) => {
+  if (result.lost)
+    return "Couldn't confirm this change. It may have been saved; check after the next refresh. Nothing was retried.";
+  if (result.status === 409)
+    return "Not done: this was changed since you loaded it, so this is its current value. Nothing was retried.";
+  if (result.status === 404)
+    return "Nothing was changed: that item is gone, maybe deleted by the dot.";
+  return result.error;
+};
+
+/**
+ * Reads of a dot's memory that may show: each read takes the generation when it began, and any
+ * change the owner makes advances it, so a read begun before or during a change is dropped.
+ */
+export class Fence {
+  private generations = new Map<string, number>();
+
+  current(key: string) {
+    return this.generations.get(key) ?? 0;
   }
 
-  beginRevert() {
-    if (!this.canRevert || !this.base) return undefined;
-    this.busy = { kind: "reverting" };
-    this.error = undefined;
-    this.notice = undefined;
-    return this.base.revision;
+  advance(key: string) {
+    this.generations.set(key, this.current(key) + 1);
   }
 
-  /**
-   * A save's or revert's answer. A lost one keeps the draft for a manual retry, which the revision
-   * check refuses if the first one landed.
-   */
-  finish(result: Reply<Instructions>) {
-    const request = this.busy;
-    this.busy = undefined;
-    if (result.ok) {
-      this.base = result.value;
+  holds(key: string, generation: number) {
+    return this.current(key) === generation;
+  }
+}
+
 const nextOf = (value: unknown) =>
   typeof value === "object" && value !== null && "next" in value && typeof value.next === "number"
     ? value.next
@@ -669,6 +669,124 @@ export class Searches<T> {
   }
 }
 
+// Instructions.
+
+export const instructionsLimit = 64 * 1024;
+
+export const instructionsTiming =
+  "OpenCode watches this file. After it reloads (normally shortly after saving), edits apply to the next model request, including during a running turn. No restart is needed.";
+
+export type InstructionsBusy =
+  | { kind: "loading" }
+  | { kind: "saving"; sent: string }
+  | { kind: "reverting" };
+
+/**
+ * One dot's AGENTS.md editor. One request runs at a time, and only `edit` changes the draft, never
+ * while a request runs, so an answer always matches what was sent. Nothing retries on its own.
+ */
+export class InstructionsState {
+  base: Instructions | undefined;
+  draft = "";
+  busy: InstructionsBusy | undefined;
+  conflict: Instructions | undefined;
+  conflictFromRevert = false;
+  error: string | undefined;
+  notice: string | undefined;
+
+  get dirty() {
+    return this.base !== undefined && this.draft !== this.base.content;
+  }
+
+  get bytes() {
+    return new TextEncoder().encode(this.draft).length;
+  }
+
+  get tooLarge() {
+    return this.bytes > instructionsLimit;
+  }
+
+  get canSave() {
+    return this.base !== undefined && !this.busy && !this.conflict && this.dirty && !this.tooLarge;
+  }
+
+  get canRevert() {
+    return this.base?.canRevert === true && !this.busy && !this.conflict;
+  }
+
+  get canOverwrite() {
+    return !!this.conflict && !this.conflictFromRevert && !this.busy && !this.tooLarge;
+  }
+
+  /** The owner's typing, kept only once a file is loaded and while no request runs. */
+  edit(text: string) {
+    if (!this.base || this.busy) return false;
+    this.draft = text;
+    return true;
+  }
+
+  beginRead(discarding: boolean) {
+    if (this.busy || (!discarding && this.dirty)) return false;
+    this.busy = { kind: "loading" };
+    this.error = undefined;
+    this.notice = undefined;
+    return true;
+  }
+
+  finishRead(result: Reply<Instructions>) {
+    this.busy = undefined;
+    if (!result.ok) {
+      this.error = result.error;
+      return;
+    }
+    this.base = result.value;
+    this.draft = result.value.content;
+    this.conflict = undefined;
+    this.conflictFromRevert = false;
+  }
+
+  /** What to send: the draft and the revision it replaces, the conflict's for Overwrite. */
+  beginSave(overwrite: boolean) {
+    if (!this.base || this.busy) return undefined;
+    if (this.draft.includes("\0")) {
+      this.error = "Instructions can't contain NUL characters.";
+      return undefined;
+    }
+    if (this.tooLarge) {
+      this.error = "Instructions must be at most 64 KiB of UTF-8 text.";
+      return undefined;
+    }
+    let revision: string;
+    if (overwrite) {
+      if (!this.canOverwrite || !this.conflict) return undefined;
+      revision = this.conflict.revision;
+    } else {
+      if (this.conflict || !this.dirty) return undefined;
+      revision = this.base.revision;
+    }
+    this.busy = { kind: "saving", sent: this.draft };
+    this.error = undefined;
+    this.notice = undefined;
+    return { content: this.draft, revision };
+  }
+
+  beginRevert() {
+    if (!this.canRevert || !this.base) return undefined;
+    this.busy = { kind: "reverting" };
+    this.error = undefined;
+    this.notice = undefined;
+    return this.base.revision;
+  }
+
+  /**
+   * A save's or revert's answer. A lost one keeps the draft for a manual retry, which the revision
+   * check refuses if the first one landed.
+   */
+  finish(result: Reply<Instructions>) {
+    const request = this.busy;
+    this.busy = undefined;
+    if (result.ok) {
+      this.base = result.value;
       this.draft = result.value.content;
       this.conflict = undefined;
       this.conflictFromRevert = false;
