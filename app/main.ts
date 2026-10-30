@@ -584,6 +584,11 @@ const receipts: readonly unknown[] = [
 ] satisfies ReceiptStatus[];
 const isReceipt = (value: unknown): value is ReceiptStatus => receipts.includes(value);
 
+// The last receipts that settled a record, by message ID, so every surface that asks after one
+// learns its outcome even once another surface's read retired its record. Bounded and in memory.
+const outcomes = new Map<string, ReceiptStatus>();
+const outcomeLimit = 1000;
+
 /** The daemon's receipt for a saved attempt, dropping the record once the daemon has it. */
 const receipt = async (attempt: Attempt): Promise<Result<ReceiptStatus>> => {
   const result = await json(
@@ -593,7 +598,15 @@ const receipt = async (attempt: Attempt): Promise<Result<ReceiptStatus>> => {
   if (!result.ok) return result;
   const status = isRecord(result.value) ? result.value.status : undefined;
   if (!isReceipt(status)) return { ok: false, error: "The daemon's receipt wasn't understood." };
-  if (settled(status)) retire(attempt.messageID);
+  if (settled(status)) {
+    outcomes.delete(attempt.messageID);
+    outcomes.set(attempt.messageID, status);
+    for (const old of outcomes.keys()) {
+      if (outcomes.size <= outcomeLimit) break;
+      outcomes.delete(old);
+    }
+    retire(attempt.messageID);
+  }
   return { ok: true, value: status };
 };
 
@@ -603,8 +616,9 @@ const unresolved = () => openAttempts().filter((attempt) => !posting.has(attempt
 const reconcile = async (input: unknown): Promise<Result<ReceiptStatus>> => {
   const messageID = isRecord(input) ? input.messageID : undefined;
   const attempt = unresolved().find((known) => known.messageID === messageID);
-  if (!attempt) return { ok: true, value: "unknown" };
-  return receipt(attempt);
+  if (attempt) return receipt(attempt);
+  const known = typeof messageID === "string" ? outcomes.get(messageID) : undefined;
+  return { ok: true, value: known ?? "unknown" };
 };
 
 interface Authoritative {

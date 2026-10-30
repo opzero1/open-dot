@@ -459,6 +459,8 @@ const App = () => {
       if (status === "unknown") return;
       if (status === "cancelled") {
         updateSent((current) => without(current, attempt.messageID));
+        // A feed reply's send keeps its text in the Feed, not in this chat's message box.
+        if (!item) return;
         setComposerError(
           attempt.dot,
           "open-dot cancelled a message it hadn't confirmed, so it wasn't sent. It's still in the message box.",

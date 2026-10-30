@@ -2096,6 +2096,102 @@ test("Feed: dismiss and Clear all; a reply to two dots keeps the refused dot's t
   );
 }, 170_000);
 
+test("Feed: a receipt the chat's poll settles while the Feed is closed still settles its reply, keeping what was changed since, with one POST each", async () => {
+  await scenario(
+    "feed-receipts",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async ({ fake, js, until, press, state }) => {
+      const openFeed = async () => {
+        await js(`document.querySelector("[data-open-feed]").click(), true`);
+        await until(`!!document.querySelector('[data-pane="feed"]')`, "the Feed");
+      };
+      const leaveFeed = async (id: number) => {
+        await js(
+          `document.querySelector('[data-reply="${id}"] textarea').focus(), t.key("Escape"), true`,
+        );
+        await until(`!document.querySelector('[data-pane="feed"]') && !!t.box()`, "the chat");
+      };
+      /** Sends feed item `id`'s reply to jojo with its answer lost, so its outcome is unknown. */
+      const lostSend = async (id: number, text: string) => {
+        await press(`[data-feed-item="${id}"]`, "Reply");
+        await js(`t.fill('[data-reply="${id}"] textarea', ${JSON.stringify(text)})`);
+        await js(pasteReply(id, `${id}.png`));
+        await until(
+          `document.querySelectorAll('[data-reply="${id}"] .draft-thumb img').length === 1`,
+          "the thumbnail",
+        );
+        fake.onPost = () => json({ error: "Upstream hiccup." }, 503);
+        await press(`[data-reply="${id}"]`, "Send");
+        await until(
+          `document.querySelector('[data-reply="${id}"] [data-reply-result="jojo"]')?.dataset.outcome === "unknown"`,
+          "the unknown outcome",
+        );
+        fake.onPost = undefined;
+        return fake.log.posts.at(-1)?.messageID ?? "";
+      };
+      /** Waits until the chat's own receipt poll retired the record, with the Feed closed. */
+      const retired = async (messageID: string) => {
+        for (let tick = 0; tick < 200; tick++) {
+          if (!(await state()).open.some((attempt) => attempt.messageID === messageID)) return;
+          await delay(100);
+        }
+        throw new Error("The receipt poll never settled the send.");
+      };
+
+      await until(`!!document.querySelector("[data-open-feed]")`, "the Feed button");
+      await openFeed();
+      await until(`document.querySelectorAll("[data-feed-item]").length === 3`, "three feed items");
+      // Saved: between the unknown answer and its receipt the owner changes the text and adds an
+      // image. The late receipt marks jojo saved and keeps that newer, unsent content.
+      const saved = await lostSend(2, "Look at this");
+      await js(`t.fill('[data-reply="2"] textarea', "Look again")`);
+      await js(pasteReply(2, "more.png"));
+      await until(
+        `document.querySelectorAll('[data-reply="2"] .draft-thumb img').length === 2`,
+        "the second thumbnail",
+      );
+      await leaveFeed(2);
+      fake.receipts.set(saved, "sent");
+      await retired(saved);
+      await openFeed();
+      await until(
+        `document.querySelector('[data-reply="2"] [data-reply-result="jojo"]')?.dataset.outcome === "saved"`,
+        "jojo saved",
+      );
+      expect(await js(replyState(2))).toMatchObject({
+        text: "Look again",
+        images: 2,
+        picks: [[false, true]],
+        results: { jojo: "saved" },
+      });
+      // Cancelled: the reply stays whole and jojo may be picked to send it again.
+      const cancelled = await lostSend(3, "And this");
+      await leaveFeed(3);
+      fake.receipts.set(cancelled, "cancelled");
+      await retired(cancelled);
+      await openFeed();
+      await until(
+        `document.querySelector('[data-reply="3"] [data-reply-result="jojo"]')?.dataset.outcome === "refused"`,
+        "jojo's cancelled send",
+      );
+      expect(await js(replyState(3))).toMatchObject({
+        text: "And this",
+        images: 1,
+        picks: [[false, false]],
+        results: { jojo: "refused" },
+      });
+      await delay(500);
+      expect(fake.log.posts.map((post) => post.messageID)).toEqual([saved, cancelled]);
+      // The chat doesn't claim a feed reply's text is in its own message box.
+      expect(await js(`document.body.innerText.includes("It's still in the message box")`)).toBe(
+        false,
+      );
+    },
+  );
+}, 170_000);
+
 test("Memory: a refused edit shows beside the value now, edits send only changed fields, and confirmations gate every change", async () => {
   await scenario(
     "memory",
