@@ -158,6 +158,9 @@ export interface MediaView {
 
 export const mediaLimit = 32 * 1024 * 1024;
 
+/** The longest conversation or work cursor the daemon signs and reads back; main passes no longer. */
+export const cursorLimit = 12_000;
+
 const mp4Brands = new Set(["isom", "iso2", "iso4", "iso5", "iso6", "mp41", "mp42", "avc1", "dash"]);
 
 /** The type remote media bytes really are: the raster images and MP4 or WebM, never SVG or HTML. */

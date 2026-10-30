@@ -849,8 +849,11 @@ const encodeCursor = (token: string, dot: Dot, cursor: string) => {
   return `${body}.${signCursor(token, body)}`;
 };
 
+/** The longest cursor the daemon signs or reads back; the app's main process passes no longer. */
+export const cursorLimit = 12_000;
+
 const decodeCursor = (token: string, value: string): string[] | undefined => {
-  if (value.length > 12_000 || !/^[\w-]+\.[\w-]{43}$/.test(value)) return undefined;
+  if (value.length > cursorLimit || !/^[\w-]+\.[\w-]{43}$/.test(value)) return undefined;
   const [body, signature] = value.split(".");
   if (
     !body ||
@@ -1162,12 +1165,10 @@ const conversation = (
 
 /** A work cursor's upstream value starts with this, so no conversation read accepts one. */
 const workScope = "work:";
-/** A work cursor longer than this is withheld, and its log says it is partial instead. */
-const workCursorLimit = 12_000;
-
 const encodeWork = (token: string, dot: Dot, position: WorkPosition) => {
   const value = encodeCursor(token, dot, `${workScope}${JSON.stringify(position)}`);
-  return value.length <= workCursorLimit ? value : null;
+  // A longer one is withheld, and its log says it is partial instead.
+  return value.length <= cursorLimit ? value : null;
 };
 
 const isQueued = (entry: unknown): entry is [string, number] =>

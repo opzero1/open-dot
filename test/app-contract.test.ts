@@ -2,12 +2,15 @@
 // what the daemon parses, and what the daemon answers fits what main lets through to the renderer.
 import { beforeEach, expect, test } from "bun:test";
 import { Effect, Layer } from "effect";
+import { createHmac } from "node:crypto";
+import { cursorLimit as appCursorLimit } from "../app/chat";
 import { decoded, fits, shapes } from "../app/decode";
 import { triggerReasons } from "../app/surfaces";
-import { api } from "../src/api";
+import { api, cursorLimit } from "../src/api";
 import { type Db, openDatabase } from "../src/db";
 import { OpenCode, OpenCodeError } from "../src/opencode";
 import { dots, feed, reminders, responsibilities } from "../src/schema";
+import { fakeOpenCode } from "./fake-opencode";
 
 let db: Db;
 const down = Layer.effect(OpenCode, Effect.fail(new OpenCodeError({ message: "Not running" })));
@@ -144,4 +147,43 @@ test("an answer that doesn't fit is an error for a read and an unknown outcome f
   });
   const conflict = { ok: false as const, error: "Changed.", status: 409, current: { text: "x" } };
   expect(decoded("editNote", "PATCH", conflict)).toBe(conflict);
+});
+
+/** A work cursor in the daemon's own form, signed with this test's token. */
+const signed = (upstream: string) => {
+  const position = JSON.stringify({ q: [], c: upstream, p: false });
+  const body = Buffer.from(JSON.stringify(["jojo", "ses_jojo", `work:${position}`])).toString(
+    "base64url",
+  );
+  return `${body}.${createHmac("sha256", "secret").update(body).digest("base64url")}`;
+};
+
+test("a signed work cursor past 8,192 characters is one the daemon reads, up to the limit main shares", async () => {
+  const opencode = fakeOpenCode().layer;
+  const read = async (cursor: string) => {
+    const response = await api(
+      db,
+      "secret",
+      opencode,
+    )(
+      new Request(
+        `http://127.0.0.1/dots/jojo/work?sessionID=ses_jojo&cursor=${encodeURIComponent(cursor)}`,
+        { headers: { authorization: "Bearer secret" } },
+      ),
+    );
+    return { status: response.status, value: await response.json() };
+  };
+  expect(appCursorLimit).toBe(cursorLimit);
+  const long = signed("u".repeat(7_000));
+  expect(long.length).toBeGreaterThan(8_192);
+  expect(long.length).toBeLessThanOrEqual(appCursorLimit);
+  const accepted = await read(long);
+  expect(accepted.status).toBe(200);
+  expect(fits(accepted.value, shapes.work)).toBe(true);
+  const over = signed("u".repeat(9_000));
+  expect(over.length).toBeGreaterThan(appCursorLimit);
+  expect(await read(over)).toEqual({
+    status: 400,
+    value: { error: "Invalid work cursor. Refresh." },
+  });
 });

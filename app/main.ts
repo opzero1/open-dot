@@ -57,6 +57,7 @@ import {
   type TrayState,
 } from "./bridge";
 import {
+  cursorLimit,
   displayName,
   type Endpoint,
   imageInfo,
@@ -1096,7 +1097,7 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
         ? { method: "GET", path: `${base}/activity?sessionID=${segment(a)}`, timeout: 5_000 }
         : undefined;
     case "work":
-      return isName(a) && isText(b, 8192)
+      return isName(a) && isText(b, cursorLimit)
         ? { method: "GET", path: `${base}/work?sessionID=${segment(a)}&cursor=${segment(b)}` }
         : undefined;
     case "toolDetail":
@@ -1969,7 +1970,7 @@ const trusted = (event: IpcMainInvokeEvent) =>
 const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
   dots: () => coalesce("dots", () => json("GET", "/dots")),
   messages: (dot, before, from) => {
-    if (!isName(dot) || (before !== undefined && !isText(before, 8192)))
+    if (!isName(dot) || (before !== undefined && !isText(before, cursorLimit)))
       return { ok: false, error: "Bad read." };
     const target = current();
     const read = generation;

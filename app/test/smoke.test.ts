@@ -12,6 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createHmac } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -231,6 +232,18 @@ const worker = (id: number, state: string, needs: string[] = []) => ({
   answered: null,
 });
 
+const sign = (token: string, body: string) =>
+  createHmac("sha256", token).update(body).digest("base64url");
+const signedMore = "<signed>";
+/** A work cursor in the daemon's form: its scope and position, signed with the server's token. */
+const signWork = (token: string, sessionID: string, upstream: string) => {
+  const position = JSON.stringify({ q: [], c: upstream, p: false });
+  const body = Buffer.from(JSON.stringify(["jojo", sessionID, `work:${position}`])).toString(
+    "base64url",
+  );
+  return `${body}.${sign(token, body)}`;
+};
+
 /**
  * A fake daemon with the API the app uses. Restarting it serves the same state on a new port with
  * a new token, and its cursors name the server that signed them, so an old one is refused.
@@ -249,6 +262,10 @@ class FakeDaemon {
   work: object[] = [];
   activity: object | null = null;
   details = new Map<string, object>();
+  // A work log whose `more` is this placeholder gets a cursor signed like the daemon's, naming
+  // `continuation`; a work read with it answers `earlier`.
+  continuation = "";
+  earlier: object | null = null;
   // Each listed media's bytes, by its ID.
   media = new Map<string, Uint8Array>();
   // jojo's avatar: its listed revision, and how many reads of it fail before one answers.
@@ -297,6 +314,8 @@ class FakeDaemon {
     dotReads: 0,
     activityReads: 0,
     toolReads: [] as string[],
+    // The length of each work cursor read.
+    workReads: [] as number[],
     mediaReads: [] as string[],
     // Requests each server instance got, by its number.
     requests: [] as number[],
@@ -442,7 +461,15 @@ class FakeDaemon {
         pending: [...this.pending],
         recentEmojis: [],
         ...(this.capable ? { clientMessageIDs: true } : {}),
-        ...(before === null ? { work: this.work } : {}),
+        ...(before === null
+          ? {
+              work: this.work.map((log) =>
+                "more" in log && log.more === signedMore
+                  ? { ...log, more: signWork(token, this.sessionID, this.continuation) }
+                  : log,
+              ),
+            }
+          : {}),
       };
       if (before === null && this.stallNext) {
         // A read that started before the owner's change answers after it, with the old state.
@@ -500,6 +527,14 @@ class FakeDaemon {
       return this.activity
         ? Response.json({ ...this.activity, sessionID: url.searchParams.get("sessionID") })
         : Response.json({ error: "Not found" }, { status: 404 });
+    }
+    if (path === "/dots/jojo/work" && method === "GET") {
+      const cursor = url.searchParams.get("cursor") ?? "";
+      this.log.workReads.push(cursor.length);
+      const [body = "", signature] = cursor.split(".");
+      return signature === sign(token, body) && this.earlier
+        ? Response.json(this.earlier)
+        : Response.json({ error: "Invalid work cursor. Refresh." }, { status: 400 });
     }
     const remote = /^\/dots\/jojo\/messages\/([^/]+)\/media\/([^/]+)$/.exec(path);
     if (remote && method === "GET") {
@@ -1227,6 +1262,56 @@ test("an inline video keeps its element, blob and playback through unchanged pol
       ).toEqual({ marked: "yes", source, paused: false, count: 1 });
       expect(await js(`${video}.currentTime`)).toBeGreaterThan(started + 2);
       expect(fake.log.mediaReads).toEqual(["msg_reply/dddddddddddddddd"]);
+    },
+  );
+}, 60_000);
+
+test("a work cursor longer than 8,192 characters loads earlier calls; one past 12,000 never leaves main", async () => {
+  await scenario(
+    "work-cursor",
+    (fake) => {
+      fake.messages = [
+        { id: "msg_owner", kind: "owner", text: "Do a lot" },
+        { id: "msg_reply", kind: "dot", text: "Done." },
+      ];
+      fake.continuation = "u".repeat(7_000);
+      fake.work = [
+        {
+          anchor: "msg_reply",
+          calls: [toolCall("c9", "bash", "bun test", "done")],
+          counts: { commands: 1, edits: 0, edited: 0, failed: 0, total: 1 },
+          complete: false,
+          open: false,
+          more: signedMore,
+        },
+      ];
+      fake.earlier = {
+        calls: [toolCall("c1", "bash", "bun install", "done")],
+        counts: { commands: 1, edits: 0, edited: 0, failed: 0, total: 1 },
+        complete: true,
+        more: null,
+      };
+    },
+    async ({ fake, js, until }) => {
+      await until(`!!document.querySelector("[data-work-log='msg_reply']")`, "the work log");
+      await js(`document.querySelector("[data-work-log='msg_reply'] .work-summary").click(), true`);
+      await js(
+        `[...document.querySelectorAll("[data-work-log='msg_reply'] .link-button")].find((b) => b.textContent === "Load earlier calls").click(), true`,
+      );
+      await until(`document.querySelectorAll("[data-tool-call]").length === 2`, "the earlier call");
+      const [signed = 0] = fake.log.workReads;
+      expect(fake.log.workReads).toHaveLength(1);
+      expect(signed).toBeGreaterThan(8_192);
+      expect(signed).toBeLessThanOrEqual(12_000);
+      // The shared limit: main sends a cursor of 12,000 characters, and refuses one longer.
+      expect(
+        await js(`window.openDot.call("work", "jojo", "ses_jojo", "a.".padEnd(12_001, "b"))`),
+      ).toEqual({ ok: false, error: "That request isn't valid." });
+      expect(fake.log.workReads).toHaveLength(1);
+      expect(
+        await js(`window.openDot.call("work", "jojo", "ses_jojo", "a.".padEnd(12_000, "b"))`),
+      ).toMatchObject({ ok: false });
+      expect(fake.log.workReads).toEqual([signed, 12_000]);
     },
   );
 }, 60_000);
