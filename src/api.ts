@@ -86,6 +86,7 @@ import {
 } from "./reactions";
 import { quoted, quoteText, replyPrompt } from "./replies";
 import { answerSummary, needsYou, requestView } from "./requests";
+import { loadMedia, mediaLinks } from "./media";
 import { listRuns } from "./runs";
 import { isRecord, slackIDs } from "./slack";
 import {
@@ -808,11 +809,15 @@ const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
       time: item.time,
       reactions: saved.filter((reaction) => reaction.messageID === item.id),
     };
-    // Show what the dot said and the open-dot actions it took, not mechanics such as shell
-    // commands, file reads or compaction.
+    // Show what the dot said and the open-dot actions it took. Its other tool calls, such as
+    // shell commands and edits, are the turn's work log. The media its text links to are listed,
+    // so the app can ask the daemon for exactly those.
     if (item.role === "assistant") {
       const actions = item.tools.filter((tool) => tool.startsWith("dot_"));
-      return item.text || actions.length > 0 ? [{ ...base, tools: actions, kind: "dot" }] : [];
+      const media = mediaLinks(item.text);
+      return item.text || actions.length > 0
+        ? [{ ...base, tools: actions, kind: "dot", ...(media.length > 0 ? { media } : {}) }]
+        : [];
     }
     const row = sent.get(item.id);
     const kind = messageKind(item.role, row);
@@ -1151,6 +1156,38 @@ const toolRead = (db: Db, dot: Dot, id: string, callID: string, request: Request
     return detail
       ? Response.json(detail, { headers: { "cache-control": "no-store" } })
       : error(404, "There's no such tool call.");
+  });
+
+/**
+ * A remote image or video a shown dot reply links to, fetched by the daemon from the public
+ * internet only. The reply is read again, so only a URL it lists now is ever fetched.
+ */
+const mediaRead = (db: Db, dot: Dot, id: string, mediaID: string, request: Request) =>
+  Effect.gen(function* () {
+    const sessionID = onlySession(request);
+    if (!sessionID) return error(400, "Use the message's sessionID.");
+    if (id.length > 255 || !/^[\da-f]{16}$/.test(mediaID))
+      return error(404, "There's no such media.");
+    if (dot.sessionState !== "ready" || sessionID !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh.");
+    const target = yield* (yield* OpenCode).message({ sessionID, messageID: id });
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    const message = target && visibleMessages(db, dot, [target])[0];
+    const link =
+      message?.kind === "dot" && !message.hidden
+        ? mediaLinks(message.text).find((entry) => entry.id === mediaID)
+        : undefined;
+    if (!link) return error(404, "There's no such media.");
+    const result = yield* Effect.promise(() => loadMedia(link));
+    return result.ok
+      ? new Response(new Uint8Array(result.bytes), {
+          headers: {
+            "content-type": result.mime,
+            "x-content-type-options": "nosniff",
+            "cache-control": "no-store",
+          },
+        })
+      : error(result.status, result.message);
   });
 
 /**
@@ -2448,6 +2485,15 @@ const route = (
     request.method === "GET"
   )
     return connect(toolRead(db, dot, id, index, request));
+  if (
+    rest === "messages" &&
+    part === "media" &&
+    id !== undefined &&
+    index !== undefined &&
+    more.length === 0 &&
+    request.method === "GET"
+  )
+    return connect(mediaRead(db, dot, id, index, request));
   if (rest === "pending" && id !== undefined && extra.length === 1 && request.method === "GET")
     return connect(receipt(db, dot, id, request));
   if (
