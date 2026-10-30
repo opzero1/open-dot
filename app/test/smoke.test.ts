@@ -229,6 +229,9 @@ class FakeDaemon {
   failing = new Set<string>();
   workers: object[] = [];
   busy = false;
+  // jojo's avatar: its listed revision, and how many reads of it fail before one answers.
+  avatar: { revision: string; failures: number } | null = null;
+  avatarReads = 0;
   capable = true;
   mismatch = false;
   pageDelay = 0;
@@ -336,7 +339,7 @@ class FakeDaemon {
           name: "jojo",
           purpose: "Second brain.",
           busy: this.busy,
-          avatar: null,
+          avatar: this.avatar ? { revision: this.avatar.revision } : null,
           workers: this.workers,
           sessions: [],
         },
@@ -349,6 +352,15 @@ class FakeDaemon {
           sessions: [],
         })),
       ]);
+    }
+    if (path === "/dots/jojo/avatar") {
+      this.avatarReads++;
+      if (!this.avatar) return json({ error: "No avatar." }, 404);
+      if (this.avatar.failures > 0) {
+        this.avatar.failures--;
+        return json({ error: "Try again." }, 500);
+      }
+      return new Response(png, { headers: { "content-type": "image/png" } });
     }
     const other = /^\/dots\/([^/]+)\/messages$/.exec(path)?.[1];
     const dot = other ? this.others.get(other) : undefined;
@@ -2220,3 +2232,31 @@ test("Slack: a typed token goes once and is cleared, and pickup takes only a mat
   const written = Bun.spawnSync(["grep", "-rl", "xoxb-", join(scratch, "slack", "app-data")]);
   expect(written.stdout.toString()).toBe("");
 }, 170_000);
+
+test("avatars: a failed read is asked for again, a deleted one clears, and Command-2 and Escape keep the draft", async () => {
+  await scenario(
+    "avatar",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+      fake.avatar = { revision: "a", failures: 1 };
+    },
+    async (app) => {
+      const { fake, js, until } = app;
+      const shown = `!!document.querySelector('[data-dot="jojo"] img.avatar')`;
+      await until(shown, "the avatar after a failed read");
+      expect(fake.avatarReads).toBe(2);
+      fake.avatar = null;
+      await until(`!${shown}`, "the deleted avatar cleared");
+      fake.avatar = { revision: "b", failures: 0 };
+      await until(shown, "the new avatar");
+      // Memory opens over the chat and Escape goes back with the draft as it was.
+      await until(`!!t.box()`, "the chat");
+      await js(`t.fill("textarea", "half a thought"), true`);
+      await js(`t.box().focus(), t.cmd("2"), true`);
+      await until(`!!document.querySelector('[data-pane="memory"]')`, "Memory");
+      await js(`t.key("Escape"), true`);
+      await until(`!document.querySelector('[data-pane="memory"]') && !!t.box()`, "the chat again");
+      expect(await js(`t.box().value`)).toBe("half a thought");
+    },
+  );
+}, 120_000);

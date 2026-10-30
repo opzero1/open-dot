@@ -70,7 +70,7 @@ import { Markdown } from "./Markdown";
 import { Memory } from "./Memory";
 import { Health, Library } from "./Panes";
 import { Slack } from "./SlackView";
-import { InstructionsState } from "./surfaces";
+import { AvatarState, InstructionsState } from "./surfaces";
 import { type Ask, bridge, Dialog } from "./ui";
 
 /** What the window shows for the selected dot; the Feed shows over any of them. */
@@ -138,10 +138,7 @@ const useLive = <T,>(initial: T) => {
   return [value, ref, update] as const;
 };
 
-const Avatar = ({ dot }: { dot: DotView }) => {
-  const { url } = useBlob(`avatar:${dot.name}:${dot.avatar?.revision ?? "none"}`, () =>
-    dot.avatar ? bridge.avatar(dot.name) : Promise.resolve({ ok: false, error: "none" }),
-  );
+const Avatar = ({ dot, url }: { dot: DotView; url: string | undefined }) => {
   return url ? (
     <img className="avatar" src={url} alt="" />
   ) : (
@@ -256,6 +253,8 @@ const without = <K, V>(map: ReadonlyMap<K, V>, key: K) => {
 const App = () => {
   const [dots, setDots] = useState<DotView[]>([]);
   const [dotsError, setDotsError] = useState<string>();
+  const avatarState = useRef(new AvatarState<string>());
+  const [avatars, setAvatars] = useState(new Map<string, string>());
   const [selected, setSelected] = useState<string>();
   const [conversations, conversationsRef, updateConversations] = useLive(
     new Map<string, Conversation>(),
@@ -526,12 +525,46 @@ const App = () => {
     const { receipts: receiptDue, receiptFailures } = clock;
     const start = (task: () => Promise<void>) => void task().catch(() => {});
 
+    // An avatar's bytes become a blob URL only once they decode; a failed read is asked for again.
+    const loadAvatar = async (name: string, revision: string) => {
+      const state = avatarState.current;
+      const result = await bridge.avatar(name).catch(() => undefined);
+      if (!result?.ok) return state.abandon(name, revision);
+      const blob = new Blob([new Uint8Array(result.value.data)], { type: result.value.mime });
+      const decodes = await createImageBitmap(blob).then(
+        (bitmap) => {
+          bitmap.close();
+          return true;
+        },
+        () => false,
+      );
+      const url = decodes ? URL.createObjectURL(blob) : undefined;
+      const previous = state.images.get(name);
+      if (!state.finish(name, revision, url)) {
+        if (url) URL.revokeObjectURL(url);
+        return;
+      }
+      if (previous && previous !== url) URL.revokeObjectURL(previous);
+      setAvatars(new Map(state.images));
+    };
+
+    const syncAvatars = (list: DotView[]) => {
+      const state = avatarState.current;
+      const before = [...state.images.values()];
+      for (const { name, revision } of state.update(list)) void loadAvatar(name, revision);
+      const kept = new Set(state.images.values());
+      const gone = before.filter((url) => !kept.has(url));
+      for (const url of gone) URL.revokeObjectURL(url);
+      if (gone.length) setAvatars(new Map(state.images));
+    };
+
     const readDots = async () => {
       const result = await bridge.dots();
       if (result.ok) {
         clock.dotFailures = 0;
         clock.dots = Date.now() + 2000;
         setDots(result.value);
+        syncAvatars(result.value);
         setDotsError(undefined);
         setSelected((current) =>
           current && result.value.some((item) => item.name === current)
@@ -1159,7 +1192,7 @@ const App = () => {
                     setDotMenu({ dot: item.name, x: event.clientX, y: event.clientY });
                   }}
                 >
-                  <Avatar dot={item} />
+                  <Avatar dot={item} url={avatars.get(item.name)} />
                   <span className="dot-name">{item.name}</span>
                   {editing ? (
                     <span className="badge unsaved" aria-label="Unsaved instructions" />

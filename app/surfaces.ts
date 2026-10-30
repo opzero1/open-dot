@@ -419,3 +419,60 @@ const asInstructions = (value: unknown): Instructions | undefined => {
     ? { content, revision, canRevert }
     : undefined;
 };
+
+// Avatars.
+
+/**
+ * Which avatar each dot shows. Each listed revision loads once. A replaced file keeps the old image
+ * until the new one loads, and a load for a revision no longer listed is dropped. A deleted file
+ * clears at once. Bytes that don't decode wait for a new revision, while a failed request is
+ * abandoned so the next dots poll asks again.
+ */
+export class AvatarState<Image> {
+  readonly images = new Map<string, Image>();
+  private listed = new Map<string, string>();
+  private done = new Map<string, string>();
+  private loading = new Map<string, string>();
+
+  /** Takes the dots poll's list and answers the loads to start. */
+  update(dots: readonly { name: string; avatar: { revision: string } | null }[]) {
+    const names = new Set(dots.map((dot) => dot.name));
+    for (const name of [...this.listed.keys(), ...this.images.keys()])
+      if (!names.has(name)) this.forget(name);
+    const loads: { name: string; revision: string }[] = [];
+    for (const { name, avatar } of dots) {
+      if (!avatar) {
+        this.forget(name);
+        continue;
+      }
+      const { revision } = avatar;
+      this.listed.set(name, revision);
+      if (this.done.get(name) === revision || this.loading.get(name) === revision) continue;
+      this.loading.set(name, revision);
+      loads.push({ name, revision });
+    }
+    return loads;
+  }
+
+  /** A load's result, `undefined` for bytes that don't decode; false when it's no longer wanted. */
+  finish(name: string, revision: string, image: Image | undefined) {
+    if (this.listed.get(name) !== revision || this.loading.get(name) !== revision) return false;
+    this.loading.delete(name);
+    this.done.set(name, revision);
+    if (image === undefined) this.images.delete(name);
+    else this.images.set(name, image);
+    return true;
+  }
+
+  /** A request that failed: the next poll asks for the same revision again. */
+  abandon(name: string, revision: string) {
+    if (this.loading.get(name) === revision) this.loading.delete(name);
+  }
+
+  private forget(name: string) {
+    this.listed.delete(name);
+    this.done.delete(name);
+    this.loading.delete(name);
+    this.images.delete(name);
+  }
+}
