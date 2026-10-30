@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, Result } from "effect";
@@ -79,4 +79,17 @@ test("a purpose's credential is never kept in the database or AGENTS.md", () => 
     expect(kept).not.toContain("t".repeat(20));
     expect(kept).not.toContain("ghp_");
   }
+});
+
+test("a valid name that looks like a credential is refused before anything is written", () => {
+  for (const name of [`sk-${"a1".repeat(12)}`, "sk-proj-0123456789abcdef"]) {
+    const result = Effect.runSync(Effect.result(createDot(db, name, "Help.")));
+    expect(Result.isFailure(result)).toBe(true);
+    const message = Result.isFailure(result) ? result.failure.message : "";
+    expect(message).toBe("That name looks like a credential. Choose another name.");
+    expect(message).not.toContain(name.slice(3));
+    expect(existsSync(join(process.env.OPEN_DOT_HOME ?? "", "dots", name))).toBe(false);
+  }
+  expect(db.$client.query("SELECT * FROM dots").all()).toEqual([]);
+  expect(existsSync(join(process.env.OPEN_DOT_HOME ?? "", "dots"))).toBe(false);
 });

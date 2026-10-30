@@ -5,7 +5,7 @@ import { asc, eq } from "drizzle-orm";
 import { Data, Effect } from "effect";
 import type { Db } from "./db";
 import { dotDirectory } from "./home";
-import { redact } from "./memory";
+import { looksSecret, redact } from "./memory";
 import { OpenCode } from "./opencode";
 import { requestPolicy } from "./requests";
 import { type Dot, dots } from "./schema";
@@ -33,6 +33,12 @@ You are ${name}, a durable personal agent. ${purpose}
 export function createDot(db: Db, name: string, given: string) {
   // The purpose is kept in AGENTS.md and the database, and shown to every other dot.
   const purpose = redact(given);
+  // A name is an identifier kept in the database, a directory and every dot's memory, so one
+  // that looks like a credential is refused, without echoing it, rather than redacted.
+  if (looksSecret(name))
+    return Effect.fail(
+      new DotError({ message: "That name looks like a credential. Choose another name." }),
+    );
   if (!validName.test(name)) {
     return Effect.fail(
       new DotError({
