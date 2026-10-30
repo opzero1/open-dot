@@ -25,6 +25,7 @@ import type {
   PendingView,
   ReceiptStatus,
   Result,
+  SendResult,
 } from "./bridge";
 import {
   afterSend,
@@ -653,19 +654,31 @@ const App = () => {
     }
     setComposerError(name, undefined);
     setSending((current) => new Set(current).add(name));
-    const result = await bridge.send({
-      dot: name,
-      sessionID: conversation.sessionID,
-      text: captured.text,
-      ...(captured.quote ? { replyTo: captured.quote.id } : {}),
-      images: captured.images,
-    });
-    setSending((current) => {
-      const next = new Set(current);
-      next.delete(name);
-      return next;
-    });
-    setSendAnyway(false);
+    let result: SendResult;
+    try {
+      result = await bridge.send({
+        dot: name,
+        sessionID: conversation.sessionID,
+        text: captured.text,
+        ...(captured.quote ? { replyTo: captured.quote.id } : {}),
+        images: captured.images,
+      });
+    } catch {
+      // Main failed without saying what became of it: any record it saved is reconciled.
+      setComposerError(
+        name,
+        "Couldn't tell whether open-dot got this message. The app is checking and won't send it again.",
+      );
+      setAttempts(await bridge.attempts().catch(() => []));
+      return;
+    } finally {
+      setSending((current) => {
+        const next = new Set(current);
+        next.delete(name);
+        return next;
+      });
+      setSendAnyway(false);
+    }
     const track = (id: string, state: Sent["state"]) =>
       updateSent((current) =>
         keepSentLimit(

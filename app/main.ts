@@ -358,10 +358,28 @@ const writeAttempts = (attempts: Attempt[]) => {
   renameSync(temporary, attemptsFile());
 };
 
-const forgetAttempt = (messageID: string) => {
-  const attempts = readAttempts();
-  if (attempts.some((attempt) => attempt.messageID === messageID))
-    writeAttempts(attempts.filter((attempt) => attempt.messageID !== messageID));
+// Sends with a known outcome whose records couldn't be removed yet: never reconciled or offered
+// again, and removed by the next write that succeeds. After a restart a leftover record is
+// reconciled by its receipt instead.
+const retired = new Set<string>();
+
+/** Every record still open, without those already settled. */
+const openAttempts = () => readAttempts().filter((attempt) => !retired.has(attempt.messageID));
+
+/**
+ * Retires a send whose outcome is known. Never throws: the outcome stands even if the record file
+ * can't be written, and the record stays for later cleanup.
+ */
+const retire = (messageID: string) => {
+  retired.add(messageID);
+  try {
+    const attempts = readAttempts();
+    if (attempts.some((attempt) => retired.has(attempt.messageID)))
+      writeAttempts(attempts.filter((attempt) => !retired.has(attempt.messageID)));
+    retired.clear();
+  } catch {
+    // Kept in `retired`; the next successful write drops it.
+  }
 };
 
 const isText = (value: unknown, max: number): value is string =>
@@ -427,14 +445,28 @@ const send = async (input: unknown): Promise<SendResult> => {
   posting.add(messageID);
   try {
     try {
-      writeAttempts([...readAttempts(), attempt]);
+      writeAttempts([...openAttempts(), attempt]);
+      retired.clear();
     } catch {
       return refused("Couldn't save the send record, so nothing was sent.");
     }
-    const outcome = await post(target, key, attempt, text, replyTo, images);
+    let outcome: SendResult;
+    try {
+      outcome = await post(target, key, attempt, text, replyTo, images);
+    } catch {
+      // Whatever failed, the POST may have reached the daemon: the record stays to reconcile.
+      return {
+        outcome: "unknown",
+        id: messageID,
+        error: "The app lost track of this send.",
+      };
+    }
     if (outcome.outcome !== "unknown") return outcome;
     // The answer was lost: ask about this ID at once, which settles it if the daemon has it.
-    const status = await receipt(attempt);
+    const status = await receipt(attempt).catch((): Result<ReceiptStatus> => ({
+      ok: false,
+      error: "No receipt.",
+    }));
     if (!status.ok || !settled(status.value)) return outcome;
     if (status.value === "cancelled")
       return refused(
@@ -485,18 +517,18 @@ const post = async (
   if (!result.ok) {
     if (sendOutcome(result) === "unknown")
       return { outcome: "unknown", id: messageID, error: result.error };
-    forgetAttempt(messageID);
+    retire(messageID);
     return refused(result.error);
   }
   const saved = isRecord(result.value) ? result.value.id : undefined;
   if (saved === messageID) {
-    forgetAttempt(messageID);
+    retire(messageID);
     return { outcome: "saved", id: messageID };
   }
   if (typeof saved === "string" && messageIDPattern.test(saved)) {
     // It saved the message under an ID of its own, so the app's ID tracks nothing: the message is
     // there, and the app sends nothing more to this daemon.
-    forgetAttempt(messageID);
+    retire(messageID);
     distrusted = key;
     capable = undefined;
     return {
@@ -533,12 +565,12 @@ const receipt = async (attempt: Attempt): Promise<Result<ReceiptStatus>> => {
   if (!result.ok) return result;
   const status = isRecord(result.value) ? result.value.status : undefined;
   if (!isReceipt(status)) return { ok: false, error: "The daemon's receipt wasn't understood." };
-  if (settled(status)) forgetAttempt(attempt.messageID);
+  if (settled(status)) retire(attempt.messageID);
   return { ok: true, value: status };
 };
 
 /** Sends whose answer is lost, not those whose POST is still out. */
-const unresolved = () => readAttempts().filter((attempt) => !posting.has(attempt.messageID));
+const unresolved = () => openAttempts().filter((attempt) => !posting.has(attempt.messageID));
 
 const reconcile = async (input: unknown): Promise<Result<ReceiptStatus>> => {
   const messageID = isRecord(input) ? input.messageID : undefined;
@@ -912,7 +944,7 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
   attempts: unresolved,
   reconcile,
   forget: (id) => {
-    if (isName(id) && !posting.has(id)) forgetAttempt(id);
+    if (isName(id) && !posting.has(id)) retire(id);
   },
   react: (dot, id, sessionID, emoji) => {
     if (!isName(dot) || !isName(id) || !isName(sessionID) || !(emoji === null || isText(emoji, 64)))
@@ -1019,7 +1051,7 @@ const smokeDriver = () => {
       const value =
         typeof command.eval === "string"
           ? await contents.executeJavaScript(command.eval, true)
-          : { recorded, attempts: readAttempts(), violations, errors };
+          : { recorded, attempts: readAttempts(), open: unresolved(), violations, errors };
       smokeAnswer({ id, ok: true, value });
       if (command.quit === true) app.quit();
     } catch (cause) {

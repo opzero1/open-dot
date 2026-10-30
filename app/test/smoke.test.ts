@@ -3,7 +3,15 @@
 // recorded instead of used, and every daemon is a fake on loopback with a throwaway token.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import electron from "electron";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -332,7 +340,9 @@ interface Recorded {
 
 interface State {
   recorded: Recorded;
+  // The send records on disk, and those still open to reconcile.
   attempts: { messageID: string }[];
+  open: { messageID: string }[];
   violations: string[];
   errors: string[];
 }
@@ -939,6 +949,65 @@ test("a send whose receipt the daemon has before its POST answers settles when t
       expect(fake.log.posts.map((post) => post.text)).toEqual(["Lost", "Next"]);
     },
   );
+}, 170_000);
+
+test("a send the daemon admitted stands when its record can't be removed, and nothing resends", async () => {
+  const data = join(scratch, "admitted", "app-data");
+  try {
+    await scenario(
+      "admitted",
+      (fake) => {
+        fake.messages = [{ id: "m1", kind: "dot", text: "Hi" }];
+      },
+      async ({ fake, js, until, state }) => {
+        await until(`!!t.msg("m1")`, "the first page");
+        // The daemon admits the send but holds its answer until the app's data can't be written.
+        const { promise: answer, resolve: release } = Promise.withResolvers<void>();
+        fake.onPost = (post) => {
+          if (post.text !== "Admitted") return undefined;
+          fake.receipts.set(post.messageID, "sent");
+          fake.pending.push({ id: post.messageID, status: "sent", delivery: "queue" });
+          return answer.then(() => Response.json({ id: post.messageID }, { status: 202 }));
+        };
+        await js(`t.type("Admitted"), t.enter(), true`);
+        for (let tick = 0; tick < 50 && !fake.log.posts.length; tick++) await delay(100);
+        const id = fake.log.posts[0]?.messageID;
+        if (!id) throw new Error("No post.");
+        chmodSync(data, 0o500);
+        release();
+        // The send is saved: the box clears and the composer is free, though the record stays.
+        await until(
+          `t.box().value === "" && t.button("Send")?.textContent === "Send"`,
+          "the admitted send to clear",
+        );
+        await delay(2500);
+        let current = await state();
+        expect(current.attempts.map((attempt) => attempt.messageID)).toEqual([id]);
+        expect(current.open).toEqual([]);
+        expect(
+          await js(`!!document.querySelector("[data-attempt-unknown]") ||
+            !!document.querySelector("[data-composer-error]")`),
+        ).toBe(false);
+        // While the record can't be written, the next send is refused before any POST.
+        await js(`t.type("Later"), t.enter(), true`);
+        await until(
+          `!!document.querySelector("[data-composer-error]")?.textContent.includes("nothing was sent")`,
+          "the refused send",
+        );
+        expect(fake.log.posts).toHaveLength(1);
+        // Once it can, the next send goes once and the old record is cleaned up, never resent.
+        chmodSync(data, 0o700);
+        await js(`t.enter(), true`);
+        await until(`t.box().value === ""`, "the later send");
+        await delay(1000);
+        current = await state();
+        expect(current.attempts).toEqual([]);
+        expect(fake.log.posts.map((post) => post.text)).toEqual(["Admitted", "Later"]);
+      },
+    );
+  } finally {
+    if (existsSync(data)) chmodSync(data, 0o700);
+  }
 }, 170_000);
 
 test("a change whose answer was lost stays blocked until a read shows it, and Try again asks for the same change", async () => {
