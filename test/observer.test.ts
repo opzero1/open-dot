@@ -1485,71 +1485,170 @@ test("a reported cost and the day's stop it reaches are saved together or not at
   );
 });
 
-/** An observer answer adding the owner's tea preference. */
-const tea = (sources: readonly string[], text = "The owner prefers green tea in the afternoon.") =>
-  JSON.stringify({
-    ops: [{ op: "add", kind: "preference", topic: "Drinks", text, priority: 2, sources }],
-  });
+/** An observer operation adding the owner's tea preference. */
+const tea = (
+  sources: readonly string[],
+  text = "The owner prefers green tea in the afternoon.",
+) => ({
+  op: "add",
+  kind: "preference",
+  topic: "Drinks",
+  text,
+  priority: 2,
+  sources,
+});
 
-test("a fact the owner forgot is never added back by a later job; the owner's own edit to it clears that", async () => {
-  observerOn();
-  const [first] = enough();
-  answering(() => tea([first ?? ""]));
+/** An observer operation adding a fact. */
+const fact = (topic: string, text: string, sources: readonly string[]) => ({
+  op: "add",
+  kind: "fact",
+  topic,
+  text,
+  priority: 2,
+  sources,
+});
+
+/** One later observer job over a new message, answering with the operations given its ID. */
+const laterJob = async (ops: (fresh: string) => unknown[]) => {
+  const fresh = message(`More talk about the day. ${"z".repeat(tokenJobChars)}`);
+  answering(() => JSON.stringify({ ops: ops(fresh) }));
   work();
   await pass();
   await pass();
-  const [preference] = rows();
-  expect(preference?.text).toBe("The owner prefers green tea in the afternoon.");
-  expect(forgetObservation(db, "jojo", preference?.id ?? 0, 1)).toEqual({ deleted: true });
+  expect(jobs().at(-1)?.state).toBe("done");
+  return fresh;
+};
 
-  // A later job reads new text and, say, the dot restating it: the same fact, reworded a little,
-  // citing the new message or the old one, isn't saved again.
-  const later = message(
-    `I'll keep green tea ready for the afternoon. ${"z".repeat(tokenJobChars)}`,
-  );
+test("a forgotten fact isn't observed again from its messages or in much the same words, even after a restart", async () => {
+  // A database on disk, so the restart below reopens it.
+  const file = join(process.env.OPEN_DOT_HOME ?? "", "open-dot.db");
+  db.$client.close();
+  db = openDatabase(file);
+  addDot("jojo");
+  observerOn();
+  const [first = "", second = ""] = enough();
   answering(() =>
     JSON.stringify({
       ops: [
-        {
-          op: "add",
-          kind: "preference",
-          topic: "Drinks",
-          text: "Owner prefers green tea in the afternoon",
-          priority: 2,
-          sources: [later],
-        },
-        {
-          op: "add",
-          kind: "fact",
-          topic: "Lisbon",
-          text: "The Lisbon offsite budget is 40k.",
-          priority: 1,
-          sources: [first],
-        },
+        tea([first]),
+        fact("Lisbon", "The Lisbon offsite budget is 40k.", [second]),
+        // Shares a message with the tea preference.
+        fact("Office", "The owner works from Porto on Fridays.", [first, second]),
       ],
     }),
   );
   work();
   await pass();
   await pass();
-  expect(jobs().at(-1)?.state).toBe("done");
-  expect(rows().map((each) => each.text)).toEqual(["The Lisbon offsite budget is 40k."]);
+  const [preference, lisbon, porto] = rows();
+  expect(forgetObservation(db, "jojo", preference?.id ?? 0, 1)).toEqual({ deleted: true });
+  db.$client.close();
+  db = openDatabase(file);
 
-  // The owner's own edit restating the fact clears its tombstone, so it may be observed again.
-  const lisbon = rows()[0];
-  const edited = editObservation(
-    db,
-    "jojo",
-    lisbon?.id ?? 0,
-    1,
-    "The owner prefers green tea in the afternoon.",
-  );
-  expect(edited).toMatchObject({ saved: { updatedBy: "owner" } });
-  message(`More tea talk. ${"w".repeat(tokenJobChars)}`);
-  answering(() => tea([later]));
+  await laterJob((fresh) => [
+    // Reworded, "prefers" to "likes", from a new message.
+    tea([fresh], "Owner likes green tea in the afternoon."),
+    // Qualifiers added, under another topic.
+    {
+      ...tea(
+        [fresh],
+        "The owner strongly prefers freshly brewed green tea every single afternoon.",
+      ),
+      topic: "Beverages",
+    },
+    // Anything at all from the forgotten row's own message.
+    fact("Release", "The release ships on Tuesday.", [first]),
+    // An update or a supersede that turns another row into the forgotten fact.
+    { op: "update", id: lisbon?.id, text: "The owner likes green tea in the afternoon." },
+    { ...tea([fresh], "Owner prefers afternoon green tea."), op: "supersede", id: lisbon?.id },
+    // A row sharing the forgotten row's message can't be reworded, though its priority can change.
+    { op: "update", id: porto?.id, text: "The owner works from Porto on Fridays and Mondays." },
+    { op: "update", id: porto?.id, priority: 1 },
+    // A different fact that shares a word or two is still observed.
+    fact("Garden", "The owner wants green tea leaves for the garden.", [fresh]),
+    fact("Release", "The release ships on Tuesday.", [fresh]),
+  ]);
+  expect(rows().map((each) => [each.text, each.priority, each.supersededBy])).toEqual([
+    ["The Lisbon offsite budget is 40k.", 2, null],
+    ["The owner works from Porto on Fridays.", 1, null],
+    ["The owner wants green tea leaves for the garden.", 2, null],
+    ["The release ships on Tuesday.", 2, null],
+  ]);
+  // The tombstone keeps message IDs and hashes, never the forgotten words.
+  const kept = JSON.stringify(db.$client.query("SELECT * FROM forgotten_observations").all());
+  expect(kept).toContain(first);
+  for (const word of ["tea", "green", "afternoon", "prefers"]) expect(kept).not.toContain(word);
+});
+
+test("the owner's own row brings a forgotten fact back, even with no row left to edit", async () => {
+  const { api } = await import("../src/api");
+  const add = (body: unknown) =>
+    api(
+      db,
+      "secret",
+      fake.layer,
+    )(
+      new Request("http://127.0.0.1/dots/jojo/memory/observations", {
+        method: "POST",
+        headers: { authorization: "Bearer secret" },
+        body: JSON.stringify(body),
+      }),
+    );
+  observerOn();
+  const [first = ""] = enough();
+  answering(() => JSON.stringify({ ops: [tea([first])] }));
   work();
   await pass();
   await pass();
+  expect(forgetObservation(db, "jojo", rows()[0]?.id ?? 0, 1)).toEqual({ deleted: true });
+  await laterJob((fresh) => [tea([fresh], "Owner likes green tea in the afternoon.")]);
+  expect(rows()).toEqual([]);
+
+  expect((await add({ text: "x".repeat(501) })).status).toBe(400);
+  expect((await add({ text: "Tea.", extra: 1 })).status).toBe(400);
+  const response = await add({ text: "The owner prefers green tea in the afternoon." });
+  expect(response.status).toBe(201);
+  expect(await response.json()).toMatchObject({
+    observation: { kind: "fact", topic: "owner", updatedBy: "owner", sources: [] },
+  });
+  expect(db.$client.query("SELECT * FROM forgotten_observations").all()).toEqual([]);
+  // Now it may be observed again, even from the message it was first observed in.
+  await laterJob(() => [tea([first], "Owner likes green tea in the afternoon.")]);
+  expect(rows().map((each) => [each.updatedBy, each.text])).toEqual([
+    ["owner", "The owner prefers green tea in the afternoon."],
+    ["observer", "Owner likes green tea in the afternoon."],
+  ]);
+  // The owner's own row keeps no credential either.
+  expect((await add({ text: `Deploy with ghp_${"A1b2".repeat(9)}` })).status).toBe(201);
+  expect(JSON.stringify(rows())).not.toContain("A1b2");
+});
+
+test("the owner's own edit restating a forgotten fact clears it too", async () => {
+  observerOn();
+  const [first = "", second = ""] = enough();
+  answering(() =>
+    JSON.stringify({
+      ops: [
+        tea([first]),
+        { ...tea([second], "The Lisbon offsite budget is 40k."), topic: "Lisbon" },
+      ],
+    }),
+  );
+  work();
+  await pass();
+  await pass();
+  const [preference, lisbon] = rows();
+  expect(forgetObservation(db, "jojo", preference?.id ?? 0, 1)).toEqual({ deleted: true });
+  expect(
+    editObservation(
+      db,
+      "jojo",
+      lisbon?.id ?? 0,
+      1,
+      "The owner prefers green tea in the afternoon.",
+    ),
+  ).toMatchObject({ saved: { updatedBy: "owner" } });
+  await laterJob((fresh) => [tea([fresh])]);
   expect(rows().map((each) => each.text)).toEqual([
     "The owner prefers green tea in the afternoon.",
     "The owner prefers green tea in the afternoon.",

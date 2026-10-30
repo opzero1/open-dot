@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "abfbfe17-f15b-4c66-9e0f-b5a2df1213bb",
+  "id": "67d11def-f0ec-40e9-9441-0342c3b7e4a5",
   "prevId": "a4a80a7e-9146-4ac9-b614-dc0c13649382",
   "tables": {
     "archive": {
@@ -682,6 +682,13 @@
         },
         "dot": {
           "name": "dot",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sources": {
+          "name": "sources",
           "type": "text",
           "primaryKey": false,
           "notNull": true,

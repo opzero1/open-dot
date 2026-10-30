@@ -12,6 +12,7 @@ import {
 } from "./archive";
 import { avatarRevision, readAvatar } from "./avatar";
 import {
+  addObservation,
   editObservation,
   forgetObservation,
   listLedger,
@@ -1840,12 +1841,18 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
     return value instanceof Response ? value : { read: value };
   };
   if (rawID === undefined) {
-    if (kind !== "notes" || method !== "POST") return error(404, "Not found");
+    if ((kind !== "notes" && kind !== "observations") || method !== "POST")
+      return error(404, "Not found");
     const input = await body();
     if (input instanceof Response) return input;
     const note = parseNote(input.read);
     if ("invalid" in note) return error(400, note.invalid);
-    return Response.json({ note: addNote(db, dot.name, note.text) }, { status: 201 });
+    if (kind === "notes")
+      return Response.json({ note: addNote(db, dot.name, note.text) }, { status: 201 });
+    // The owner's own row, such as a forgotten fact they want back.
+    if (note.text.length > observationTextLimit)
+      return error(400, `text must be at most ${observationTextLimit} characters.`);
+    return Response.json({ observation: addObservation(db, dot, note.text) }, { status: 201 });
   }
   if (!positive.test(rawID) || !Number.isSafeInteger(Number(rawID)))
     return error(404, "There's no such item for this dot.");

@@ -371,33 +371,68 @@ export function zoomObservation(db: Db, dot: string, id: number) {
 
 /**
  * A fact's words as a forget tombstone keeps them: letters and digits, three or more characters,
- * not common words, each once and hashed with the dot's name, so the forgotten text isn't kept.
+ * without a plural or third-person "s", not common words or "owner", each once and hashed with the
+ * dot's name, so the forgotten text isn't kept.
  */
 const factWords = (dot: string, text: string) => {
-  const words = [...new Set(loose(text).split(/[^\p{L}\p{N}]+/u))].filter(
-    (word) => Array.from(word).length >= 3 && !stopwords.has(word),
-  );
+  const words = [
+    ...new Set(
+      loose(text)
+        .split(/[^\p{L}\p{N}]+/u)
+        .map((word) => (/[^s]s$/.test(word) && word.length > 3 ? word.slice(0, -1) : word)),
+    ),
+  ].filter((word) => Array.from(word).length >= 3 && !stopwords.has(word) && word !== "owner");
   return (words.length ? words : [loose(text).trim()])
     .map((word) => createHash("sha256").update(`${dot}\0${word}`).digest("hex").slice(0, 16))
     .toSorted();
 };
 
-/** Two facts are the same when at least three quarters of all their words are shared. */
-const sameFact = (a: readonly string[], b: readonly string[]) => {
-  const left = new Set(a);
-  const all = new Set([...a, ...b]).size;
-  return all > 0 && b.filter((word) => left.has(word)).length / all >= 0.75;
+/**
+ * Whether a fact says much the same as a forgotten one: it has at least half the forgotten words,
+ * and at least two of them (or all, when only one was kept), whatever it adds or rewords.
+ */
+const sameFact = (forgotten: readonly string[], words: readonly string[]) => {
+  const shared = forgotten.filter((word) => words.includes(word)).length;
+  return shared >= Math.min(forgotten.length, Math.max(2, Math.ceil(forgotten.length / 2)));
 };
 
-/** The dot's forget tombstones that match `text`. */
-const tombstonesOf = (db: Db, dot: string, text: string) => {
+type Tombstone = typeof forgottenObservations.$inferSelect;
+
+/** Whether any of these messages is one a forgotten row came from. */
+const citesForgotten = (tombstones: readonly Tombstone[], sources: readonly string[]) =>
+  tombstones.some((tombstone) => sources.some((source) => tombstone.sources.includes(source)));
+
+/**
+ * Whether a row the observer would write brings a forgotten fact back: it cites a message a
+ * forgotten row came from, or says much the same in its topic and text.
+ */
+const bringsBack = (
+  tombstones: readonly Tombstone[],
+  dot: string,
+  row: { readonly topic: string; readonly text: string; readonly sources: readonly string[] },
+) => {
+  const words = factWords(dot, `${row.topic} ${row.text}`);
+  return (
+    citesForgotten(tombstones, row.sources) ||
+    tombstones.some((tombstone) => sameFact(tombstone.words, words))
+  );
+};
+
+/**
+ * The owner stating a forgotten fact again is their explicit re-add: tombstones whose words the
+ * text has, as `sameFact` counts them, are cleared, sources and all, so it may be observed again.
+ */
+const clearTombstones = (db: Db, dot: string, text: string) => {
   const words = factWords(dot, text);
-  return db
+  const cleared = db
     .select()
     .from(forgottenObservations)
     .where(eq(forgottenObservations.dot, dot))
     .all()
-    .filter((row) => sameFact(row.words, words));
+    .filter((row) => sameFact(row.words, words))
+    .map((row) => row.id);
+  if (cleared.length)
+    db.delete(forgottenObservations).where(inArray(forgottenObservations.id, cleared)).run();
 };
 
 const bump = (db: Db, dot: string) => {
@@ -427,13 +462,42 @@ export const editObservation = (db: Db, dot: string, id: number, version: number
         .where(and(eq(ledger.id, id), eq(ledger.dot, dot)))
         .get();
       if (!saved) return now ? { conflict: observationView(db, now) } : { missing: true };
-      // The owner stating a forgotten fact again is their explicit re-add: it may be observed again.
-      const cleared = tombstonesOf(db, dot, text).map((row) => row.id);
-      if (cleared.length)
-        tx.delete(forgottenObservations).where(inArray(forgottenObservations.id, cleared)).run();
+      clearTombstones(db, dot, text);
       bump(db, dot);
       suppressHead(db, dot);
       return { saved: observationView(db, saved) };
+    },
+    { behavior: "immediate" },
+  );
+
+/**
+ * The owner's own row, for something they want observed, such as a fact they forgot and now
+ * want back. It cites no message and clears the tombstones it matches, so the observer may note
+ * that fact again; it works with no other row left to edit.
+ */
+export const addObservation = (db: Db, dot: Dot, text: string) =>
+  db.transaction(
+    () => {
+      const now = Date.now();
+      const added = db
+        .insert(ledger)
+        .values({
+          dot: dot.name,
+          sessionID: dot.sessionID,
+          kind: "fact",
+          topic: "owner",
+          text,
+          priority: 2,
+          validFrom: now,
+          sources: [],
+          updatedBy: "owner",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning()
+        .get();
+      clearTombstones(db, dot.name, text);
+      return observationView(db, added);
     },
     { behavior: "immediate" },
   );
@@ -513,7 +577,12 @@ export const forgetObservation = (
       }
       if (sources) forgetMessages(db, dot, removed.sources, removed.sessionID);
       tx.insert(forgottenObservations)
-        .values({ dot, words: factWords(dot, removed.text), forgottenAt: Date.now() })
+        .values({
+          dot,
+          sources: removed.sources,
+          words: factWords(dot, `${removed.topic} ${removed.text}`),
+          forgottenAt: Date.now(),
+        })
         .run();
       bump(db, dot);
       suppressHead(db, dot);
@@ -702,23 +771,18 @@ export function applyJob(db: Db, job: ObserverJob, ops: readonly ObservationOp[]
           .returning()
           .get();
       };
-      // A fact the owner forgot is never written again, reworded or not, whatever it cites.
+      // A forgotten fact is never written again from its messages or in much the same words.
       const tombstones = tx
         .select()
         .from(forgottenObservations)
         .where(eq(forgottenObservations.dot, job.dot))
         .all();
-      const forgotten = (text: string | undefined) => {
-        if (text === undefined) return false;
-        const words = factWords(job.dot, text);
-        return tombstones.some((row) => sameFact(row.words, words));
-      };
       for (const op of ops) {
-        if (forgotten(op.text)) continue;
-        if (op.op === "add") insert(op);
-        else if (op.op === "supersede") {
+        if (op.op === "add") {
+          if (!bringsBack(tombstones, job.dot, op)) insert(op);
+        } else if (op.op === "supersede") {
           const old = target(op.id);
-          if (!old) continue;
+          if (!old || bringsBack(tombstones, job.dot, op)) continue;
           const added = insert(op);
           if (added)
             tx.update(ledger)
@@ -728,6 +792,17 @@ export function applyJob(db: Db, job: ObserverJob, ops: readonly ObservationOp[]
         } else {
           const old = target(op.id);
           if (!old) continue;
+          const after = {
+            topic: op.topic ?? old.topic,
+            text: op.text ?? old.text,
+            sources: op.sources ?? [],
+          };
+          // A row that shares a message with a forgotten one keeps its words: the observer
+          // can't reword it into the forgotten fact.
+          const rewords =
+            (op.text !== undefined || op.topic !== undefined) &&
+            citesForgotten(tombstones, old.sources);
+          if (rewords || bringsBack(tombstones, job.dot, after)) continue;
           const sources = op.sources ? archived(op.sources).sources : undefined;
           tx.update(ledger)
             .set({

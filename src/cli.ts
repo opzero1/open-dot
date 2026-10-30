@@ -5,6 +5,8 @@ import { eq } from "drizzle-orm";
 import { Effect, Schedule } from "effect";
 import { api, spawnRun } from "./api";
 import { deleteArchived } from "./archive";
+import { addObservation, observationTextLimit } from "./ledger";
+import { memoryText } from "./memory";
 import { avatarPath, iconSizeWarning, setAvatar } from "./avatar";
 import { daemonLoops } from "./daemon";
 import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
@@ -86,7 +88,9 @@ const usage = `Usage:
   open-dot grant list [name]         List active grants
   open-dot grant revoke <id>         Revoke a grant
   open-dot archive delete <name> <message ID>
-                                     Delete one archived message from a dot's memory, once you confirm`;
+                                     Delete one archived message from a dot's memory, once you confirm
+  open-dot observation add <name> <text>
+                                     Add your own observed row, such as a fact you forgot and want back, once you confirm`;
 
 const [command, ...args] = process.argv.slice(2);
 // Before anything opens the database, which would migrate it: doctor only reads.
@@ -364,6 +368,27 @@ const archiveDelete = (name: string, messageID: string) =>
     return deleteArchived(db, name, messageID)
       ? Effect.sync(() => console.log(`Deleted ${messageID} from ${name}'s archive.`))
       : fail(`${name} has no archived message ${messageID}.`);
+  });
+
+/** The owner adds their own observed row; one stating a forgotten fact lets it be observed again. */
+const observationAdd = (name: string, given: string) =>
+  Effect.suspend(() => {
+    const dot = findDot(db, name);
+    if (!dot) return fail(`No dot named "${name}".`);
+    const text = memoryText(given, "text");
+    if (typeof text !== "string") return fail(text.invalid);
+    if (text.length > observationTextLimit)
+      return fail(`The text must be at most ${observationTextLimit} characters.`);
+    if (!process.stdin.isTTY)
+      return fail("Run this in a terminal: adding a row needs you to confirm it. Nothing changed.");
+    if (
+      !confirmed(
+        `Add to ${name}'s observed memory: "${text}"? A forgotten fact in much the same words may then be observed again.`,
+      )
+    )
+      return Effect.sync(() => console.log("Nothing changed."));
+    const added = addObservation(db, dot, text);
+    return Effect.sync(() => console.log(`Added observation #${added.id} to ${name}.`));
   });
 
 const grantCommand = (sub: string | undefined, rest: string[]) => {
@@ -655,7 +680,13 @@ const program =
                           args[1] &&
                           args[2]
                         ? archiveDelete(args[1], args[2])
-                        : Effect.sync(() => console.log(usage));
+                        : command === "observation" &&
+                            args.length === 3 &&
+                            args[0] === "add" &&
+                            args[1] &&
+                            args[2]
+                          ? observationAdd(args[1], args[2])
+                          : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(
