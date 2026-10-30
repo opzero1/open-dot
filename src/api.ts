@@ -922,6 +922,8 @@ const conversation = (
       sessionID: dot.sessionID,
       next: next ? encodeCursor(token, dot, next) : null,
       pending: pendingSends(db, dot, entries),
+      // This daemon takes the app's own message IDs and answers GET /dots/<name>/pending/<id>.
+      clientMessageIDs: true,
       // The owner's, across every dot: the menu's second row.
       recentEmojis: recentEmojis(db),
       ...("refreshError" in page ? { refreshError: page.refreshError } : {}),
@@ -982,6 +984,45 @@ const pendingSends = (db: Db, dot: Dot, entries: readonly Entry[]) => {
 };
 
 /**
+ * Where one of the owner's sends with the app's own ID stands, so an app that lost the answer to
+ * its POST reconciles by ID instead of sending again: "unknown" when the daemon has no such row,
+ * else "sending", "confirming", "sent" (admitted), "delivered" (in the history), "held" or
+ * "cancelled". A row Start Fresh moved to the dot's new session is still found.
+ */
+const receipt = (db: Db, dot: Dot, id: string, request: Request) =>
+  Effect.gen(function* () {
+    const query = new URL(request.url).searchParams;
+    const sessionID = query.get("sessionID");
+    if (
+      !sessionID ||
+      sessionID.length > 255 ||
+      [...query.keys()].some((key) => key !== "sessionID" || query.getAll(key).length !== 1)
+    )
+      return error(400, "Use the message's sessionID.");
+    const unknown = Response.json({ id, sessionID, status: "unknown" });
+    if (!messageIDPattern.test(id)) return unknown;
+    const row = db
+      .select()
+      .from(outbox)
+      .where(and(eq(outbox.messageID, id), eq(outbox.fromOwner, true)))
+      .get();
+    // Only this dot's rows: its current session, or the one the app sent in if no dot has it now.
+    const owner = row && listDots(db).find((other) => other.sessionID === row.sessionID);
+    if (
+      !row ||
+      (row.sessionID !== dot.sessionID && (row.sessionID !== sessionID || owner !== undefined))
+    )
+      return unknown;
+    const answer = (status: string) => Response.json({ id, sessionID: row.sessionID, status });
+    if (row.state === "cancelled" || row.state === "held") return answer(row.state);
+    if (row.state === "pending") return answer(row.startedAt === null ? "sending" : "confirming");
+    if (dot.sessionState !== "ready" || row.sessionID !== dot.sessionID) return answer("sent");
+    const found = yield* (yield* OpenCode).message({ sessionID: row.sessionID, messageID: id });
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    return answer(found ? "delivered" : "sent");
+  });
+
+/**
  * Steers one of the owner's queued notch messages into the dot's running turn, or cancels it.
  * The ID is the message's own; only a message still waiting outside the history can change.
  */
@@ -1036,11 +1077,15 @@ const react = (db: Db, dot: Dot, id: string, request: Request) =>
       body === null ||
       Array.isArray(body) ||
       !("emoji" in body) ||
-      Object.keys(body).length !== 1 ||
-      !isReactionEmoji(body.emoji)
+      Object.keys(body).length !== ("sessionID" in body ? 2 : 1) ||
+      !isReactionEmoji(body.emoji) ||
+      ("sessionID" in body && (typeof body.sessionID !== "string" || !body.sessionID))
     )
-      return error(400, "Send {emoji: exactly one emoji, or null to remove}.");
+      return error(400, "Send {emoji: exactly one emoji, or null to remove, sessionID?}.");
     if (dot.sessionState !== "ready") return error(404, "There's no such dot message.");
+    // The app pins the session it saw the message in; the notch's older requests don't.
+    if ("sessionID" in body && body.sessionID !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh before reacting.");
     const target = yield* (yield* OpenCode).message({ sessionID: dot.sessionID, messageID: id });
     if (
       !target ||
@@ -1074,12 +1119,25 @@ const hide = (db: Db, dot: Dot, id: string, request: Request) =>
       !body.sessionID ||
       body.sessionID.length > 255 ||
       !("hidden" in body) ||
-      body.hidden !== true
+      typeof body.hidden !== "boolean"
     )
-      return error(400, "Send {sessionID, hidden: true}.");
+      return error(400, "Send {sessionID, hidden: true or false}.");
     if (id.length > 255) return error(404, "There's no such message in recent history.");
     if (dot.sessionState !== "ready" || body.sessionID !== dot.sessionID)
       return error(409, "The dot's conversation changed. Refresh before deleting.");
+    // Restoring removes only this session's marker; it needs no OpenCode read.
+    if (!body.hidden) {
+      db.delete(hiddenMessages)
+        .where(
+          and(
+            eq(hiddenMessages.dot, dot.name),
+            eq(hiddenMessages.sessionID, dot.sessionID),
+            eq(hiddenMessages.messageID, id),
+          ),
+        )
+        .run();
+      return Response.json({ hidden: null });
+    }
     const target = yield* (yield* OpenCode).message({ sessionID: dot.sessionID, messageID: id });
     if (rebound(db, dot))
       return error(409, "The dot's conversation changed. Refresh before deleting.");
@@ -1307,7 +1365,17 @@ const send = (db: Db, dot: Dot, request: Request) =>
       !(typeof feedID === "number" && Number.isSafeInteger(feedID) && feedID > 0)
     )
       return error(400, "feed must be a feed item's ID.");
+    const client = clientID(fields);
+    if (client instanceof Response) return client;
     if (dot.sessionState !== "ready") return error(400, `${dot.name} isn't ready yet.`);
+    if (client && client.sessionID !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh before sending.");
+    const payload = { text, files, replyTo, feedID };
+    // A repeat of a send the app already made answers with the saved row and creates nothing.
+    if (client) {
+      const known = sameSend(db, client.messageID, dot.sessionID, payload);
+      if (known) return known;
+    }
     let quote: QuoteSnapshot | undefined;
     if (typeof replyTo === "string") {
       const target = yield* (yield* OpenCode).message({
@@ -1349,7 +1417,7 @@ const send = (db: Db, dot: Dot, request: Request) =>
         .insert(outbox)
         .values({
           sessionID: dot.sessionID,
-          messageID: SessionMessage.ID.create(),
+          messageID: client?.messageID ?? SessionMessage.ID.create(),
           text: reply ? feedMessage(reply) : quote ? replyPrompt(quote) : text,
           files: files.length ? files : null,
           quote,
@@ -1360,8 +1428,11 @@ const send = (db: Db, dot: Dot, request: Request) =>
           feed: reply,
           createdAt: Date.now(),
         })
+        // The message ID is unique, so a concurrent repeat inserts nothing and is answered below.
+        .onConflictDoNothing({ target: outbox.messageID })
         .returning()
         .get();
+      if (!queued) return null;
       // Each dot is listed once. A dismissed item stays dismissed, so it's still marked read.
       if (item)
         tx.update(feed)
@@ -1373,9 +1444,63 @@ const send = (db: Db, dot: Dot, request: Request) =>
           .run();
       return queued;
     });
-    if (!row) return error(404, "There's no such feed item.");
+    if (row === undefined) return error(404, "There's no such feed item.");
+    if (row === null)
+      return (
+        (client && sameSend(db, client.messageID, dot.sessionID, payload)) ||
+        error(409, "That message ID is already used.")
+      );
     return Response.json({ id: row.messageID }, { status: 202 });
   });
+
+// The shape of the IDs `SessionMessage.ID.create()` makes.
+const messageIDPattern = /^msg_[0-9A-Za-z]{10,64}$/;
+
+/**
+ * The app's own message ID and the session it was made for, which come together or not at all.
+ * The app saves the ID before it sends, so a lost answer is looked up, never sent again.
+ */
+const clientID = (fields: object) => {
+  const messageID = "messageID" in fields ? fields.messageID : undefined;
+  const sessionID = "sessionID" in fields ? fields.sessionID : undefined;
+  if (messageID === undefined && sessionID === undefined) return undefined;
+  if (
+    typeof messageID !== "string" ||
+    !messageIDPattern.test(messageID) ||
+    typeof sessionID !== "string" ||
+    !sessionID ||
+    sessionID.length > 255
+  )
+    return error(400, "Send messageID and sessionID together, with a msg_ ID.");
+  return { messageID, sessionID };
+};
+
+interface SendPayload {
+  text: string;
+  files: readonly Attachment[];
+  replyTo: unknown;
+  feedID: unknown;
+}
+
+/**
+ * Answers a repeated send of the owner's own saved message: 202 with its ID when it's the same
+ * message for the same session, 409 when the ID names anything else, nothing when it's unused.
+ */
+const sameSend = (db: Db, messageID: string, sessionID: string, payload: SendPayload) => {
+  const row = db.select().from(outbox).where(eq(outbox.messageID, messageID)).get();
+  if (!row) return undefined;
+  const prompt = row.quote?.prompt ?? row.feed?.prompt ?? row.text;
+  const same =
+    row.sessionID === sessionID &&
+    row.fromOwner &&
+    prompt === payload.text &&
+    (row.quote?.parent.id ?? undefined) === payload.replyTo &&
+    (row.feed?.item.id ?? undefined) === payload.feedID &&
+    JSON.stringify(row.files ?? []) === JSON.stringify(payload.files);
+  return same
+    ? Response.json({ id: row.messageID }, { status: 202 })
+    : error(409, "That message ID is already used for another message.");
+};
 
 const card = ({ id, source, reason, title, context, url, updatedAt, handedTo }: FeedItem) => ({
   id,
@@ -1949,6 +2074,8 @@ const route = (
       : Effect.succeed(error(404, "Not found"));
   if (rest === "messages" && id !== undefined && extra.length === 1 && request.method === "GET")
     return conversationMessage(db, dot, id, request);
+  if (rest === "pending" && id !== undefined && extra.length === 1 && request.method === "GET")
+    return receipt(db, dot, id, request);
   if (
     rest === "pending" &&
     id !== undefined &&

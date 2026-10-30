@@ -1767,7 +1767,7 @@ test("hiding rejects bad auth, shapes, sessions, targets and undelivered rows wi
     "{}",
     { sessionID: "ses_jojo" },
     { hidden: true },
-    { sessionID: "ses_jojo", hidden: false },
+    { sessionID: "ses_jojo", hidden: null },
     { sessionID: "ses_jojo", hidden: "true" },
     { sessionID: 1, hidden: true },
     { sessionID: "", hidden: true },
@@ -1868,4 +1868,90 @@ test("POST /dots/<name>/fresh needs the token, takes only force, and refuses a b
   expect(body.previousSessionID).toBe("ses_jojo");
   expect(db.select().from(dots).where(eq(dots.name, "jojo")).get()?.sessionID).toBe(body.sessionID);
   expect((await call("/dots/nobody/fresh", { method: "POST" })).status).toBe(404);
+});
+
+const appSend = (body: Record<string, unknown>) =>
+  reply("jojo", { messageID: "msg_0123456789abcdefABCDEF", sessionID: "ses_jojo", ...body });
+
+const receipt = async (id: string, sessionID = "ses_jojo") =>
+  (await (await call(`/dots/jojo/pending/${id}?sessionID=${sessionID}`)).json()) as {
+    id: string;
+    status: string;
+    sessionID: string;
+  };
+
+const pinnedReaction = (sessionID: string) =>
+  call("/dots/jojo/messages/msg_answer/reaction", {
+    method: "PUT",
+    body: JSON.stringify({ emoji: "👍", sessionID }),
+  });
+
+test("an app send with its own ID is saved once, repeats answer the same row, and a different payload is refused", async () => {
+  const first = await appSend({ text: "Hello" });
+  expect(first.status).toBe(202);
+  expect(await first.json()).toEqual({ id: "msg_0123456789abcdefABCDEF" });
+  // The app never resends on its own, but a repeat after a lost answer must not duplicate.
+  expect((await appSend({ text: "Hello" })).status).toBe(202);
+  expect((await appSend({ text: "Something else" })).status).toBe(409);
+  expect((await appSend({ text: "Hello", sessionID: "ses_polnareff" })).status).toBe(409);
+  const rows = db.select().from(outbox).all();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ messageID: "msg_0123456789abcdefABCDEF", fromOwner: true });
+  // An ID with no session, a session with no ID, or a malformed ID is refused before anything.
+  for (const body of [
+    { text: "x", messageID: "msg_0123456789abcdefXYZ" },
+    { text: "x", sessionID: "ses_jojo" },
+    { text: "x", messageID: "nope", sessionID: "ses_jojo" },
+  ])
+    expect((await reply("jojo", body)).status).toBe(400);
+  // The notch still sends without an ID and gets one the daemon made.
+  expect((await reply("jojo", { text: "From the notch" })).status).toBe(202);
+  expect(db.select().from(outbox).all()).toHaveLength(2);
+  // The ID belongs to this dot's session, so another dot can't take it either.
+  const other = await reply("polnareff", {
+    text: "Hello",
+    messageID: "msg_0123456789abcdefABCDEF",
+    sessionID: "ses_polnareff",
+  });
+  expect(other.status).toBe(409);
+});
+
+test("a send receipt reconciles by ID through sending, confirming, sent, delivered and cancelled", async () => {
+  expect(await receipt("msg_0123456789abcdefABCDEF")).toMatchObject({ status: "unknown" });
+  await appSend({ text: "Hello" });
+  const page = (await (await call("/dots/jojo/messages")).json()) as { clientMessageIDs: boolean };
+  expect(page.clientMessageIDs).toBe(true);
+  const id = "msg_0123456789abcdefABCDEF";
+  expect(await receipt(id)).toEqual({ id, sessionID: "ses_jojo", status: "sending" });
+  db.update(outbox).set({ startedAt: 1 }).where(eq(outbox.messageID, id)).run();
+  expect((await receipt(id)).status).toBe("confirming");
+  db.update(outbox).set({ state: "sent" }).where(eq(outbox.messageID, id)).run();
+  expect((await receipt(id)).status).toBe("sent");
+  fake.state.history.set("ses_jojo", [entry(id, "user", "Hello")]);
+  expect((await receipt(id)).status).toBe("delivered");
+  db.update(outbox).set({ state: "cancelled" }).where(eq(outbox.messageID, id)).run();
+  expect((await receipt(id)).status).toBe("cancelled");
+  // Another dot's live session is never answered for this dot.
+  db.update(outbox).set({ sessionID: "ses_polnareff" }).where(eq(outbox.messageID, id)).run();
+  expect((await receipt(id, "ses_polnareff")).status).toBe("unknown");
+  expect((await call(`/dots/jojo/pending/${id}`)).status).toBe(400);
+  expect(fake.state.prompted).toEqual([]);
+});
+
+test("restoring a hidden message removes only its marker, and a pinned reaction refuses another session", async () => {
+  fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "answer")]);
+  expect((await hideMessage("msg_answer")).status).toBe(200);
+  db.insert(hiddenMessages)
+    .values({ dot: "jojo", sessionID: "ses_old", messageID: "msg_answer", hiddenAt: 1 })
+    .run();
+  const restored = await hideMessage("msg_answer", { sessionID: "ses_jojo", hidden: false });
+  expect(await restored.json()).toEqual({ hidden: null });
+  expect(db.select().from(hiddenMessages).all()).toMatchObject([{ sessionID: "ses_old" }]);
+  expect((await listed())[0]).toMatchObject({ id: "msg_answer", hidden: false });
+  const stale = await hideMessage("msg_answer", { sessionID: "ses_other", hidden: false });
+  expect(stale.status).toBe(409);
+  expect((await pinnedReaction("ses_other")).status).toBe(409);
+  expect(db.select().from(reactions).all()).toEqual([]);
+  expect((await pinnedReaction("ses_jojo")).status).toBe(200);
+  expect((await putReaction("❤️")).status).toBe(200);
 });
