@@ -694,13 +694,6 @@
           "notNull": true,
           "autoincrement": false
         },
-        "words": {
-          "name": "words",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
         "fingerprint": {
           "name": "fingerprint",
           "type": "text",

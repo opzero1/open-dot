@@ -1520,7 +1520,7 @@ const laterJob = async (ops: (fresh: string) => unknown[]) => {
   return fresh;
 };
 
-test("a forgotten fact isn't observed again from its messages or in much the same words, even after a restart", async () => {
+test("a forgotten fact isn't observed again from its messages or with its text, even after a restart", async () => {
   // A database on disk, so the restart below reopens it.
   const file = join(process.env.OPEN_DOT_HOME ?? "", "open-dot.db");
   db.$client.close();
@@ -1547,38 +1547,94 @@ test("a forgotten fact isn't observed again from its messages or in much the sam
   db = openDatabase(file);
 
   await laterJob((fresh) => [
-    // Reworded, "prefers" to "likes", from a new message.
-    tea([fresh], "Owner likes green tea in the afternoon."),
-    // Qualifiers added, under another topic.
-    {
-      ...tea(
-        [fresh],
-        "The owner strongly prefers freshly brewed green tea every single afternoon.",
-      ),
-      topic: "Beverages",
-    },
+    // The same text, whatever its case, accents and punctuation, under another topic.
+    { ...tea([fresh], "the owner PREFERS green tea, in the afternoon"), topic: "Beverages" },
     // Anything at all from the forgotten row's own message.
     fact("Release", "The release ships on Tuesday.", [first]),
-    // An update or a supersede that turns another row into the forgotten fact.
-    { op: "update", id: lisbon?.id, text: "The owner likes green tea in the afternoon." },
-    { ...tea([fresh], "Owner prefers afternoon green tea."), op: "supersede", id: lisbon?.id },
+    // An update or a supersede that turns another row into the forgotten text.
+    { op: "update", id: lisbon?.id, text: "The owner prefers green tea in the afternoon." },
+    { ...tea([fresh]), op: "supersede", id: lisbon?.id },
     // A row sharing the forgotten row's message can't be reworded, though its priority can change.
     { op: "update", id: porto?.id, text: "The owner works from Porto on Fridays and Mondays." },
     { op: "update", id: porto?.id, priority: 1 },
-    // A different fact that shares a word or two is still observed.
-    fact("Garden", "The owner wants green tea leaves for the garden.", [fresh]),
     fact("Release", "The release ships on Tuesday.", [fresh]),
   ]);
   expect(rows().map((each) => [each.text, each.priority, each.supersededBy])).toEqual([
     ["The Lisbon offsite budget is 40k.", 2, null],
     ["The owner works from Porto on Fridays.", 1, null],
-    ["The owner wants green tea leaves for the garden.", 2, null],
     ["The release ships on Tuesday.", 2, null],
   ]);
-  // The tombstone keeps message IDs and hashes, never the forgotten words.
+  // The tombstone keeps message IDs and a hash, never the forgotten words.
   const kept = JSON.stringify(db.$client.query("SELECT * FROM forgotten_observations").all());
   expect(kept).toContain(first);
   for (const word of ["tea", "green", "afternoon", "prefers"]) expect(kept).not.toContain(word);
+});
+
+test("a forgotten fact said again in other words in a new message is new information", async () => {
+  // The owner's ruling: the observer can't bring a forgotten fact back from its own messages or
+  // with its text under any topic, by ADD, UPDATE or SUPERSEDE, across a reopen; the owner saying
+  // it again later, put another way, may be observed. Erasing it completely means forgetting it
+  // and deleting its source messages.
+  const file = join(process.env.OPEN_DOT_HOME ?? "", "open-dot.db");
+  db.$client.close();
+  db = openDatabase(file);
+  addDot("jojo");
+  observerOn();
+  const [first = "", second = ""] = enough();
+  answering(() =>
+    JSON.stringify({
+      ops: [
+        fact("Tea", "Prefers it green.", [first]),
+        fact("Lisbon", "The Lisbon offsite budget is 40k.", [second]),
+        fact("Release", "The release ships on Tuesday.", [second]),
+      ],
+    }),
+  );
+  work();
+  await pass();
+  await pass();
+  const [green, lisbon, release] = rows();
+  expect(forgetObservation(db, "jojo", green?.id ?? 0, 1)).toEqual({ deleted: true });
+  db.$client.close();
+  db = openDatabase(file);
+  const restated = "The owner likes green tea.";
+
+  // From the forgotten message, or with the forgotten text from a new one: nothing comes back.
+  await laterJob((fresh) => [
+    fact("Drinks", restated, [first]),
+    fact("Drinks", "prefers it GREEN", [fresh]),
+    { op: "update", id: lisbon?.id, topic: "Drinks", text: restated, sources: [first] },
+    { op: "update", id: lisbon?.id, topic: "Drinks", text: "Prefers it green!", sources: [fresh] },
+    { ...fact("Drinks", restated, [first]), op: "supersede", id: release?.id },
+    { ...fact("Drinks", "Prefers it green.", [fresh]), op: "supersede", id: release?.id },
+  ]);
+  expect(rows().map((each) => [each.topic, each.text, each.supersededBy])).toEqual([
+    ["Lisbon", "The Lisbon offsite budget is 40k.", null],
+    ["Release", "The release ships on Tuesday.", null],
+  ]);
+  db.$client.close();
+  db = openDatabase(file);
+
+  // Said again in other words in a new message: ADD, UPDATE and SUPERSEDE may each note it.
+  await laterJob((fresh) => [
+    fact("Drinks", restated, [fresh]),
+    { op: "update", id: lisbon?.id, text: `${restated} Iced, at the offsite.`, sources: [fresh] },
+    {
+      ...fact("Drinks", `${restated} Hot, after lunch.`, [fresh]),
+      op: "supersede",
+      id: release?.id,
+    },
+  ]);
+  expect(rows().map((each) => [each.text, each.supersededBy !== null])).toEqual([
+    ["The owner likes green tea. Iced, at the offsite.", false],
+    ["The release ships on Tuesday.", true],
+    ["The owner likes green tea.", false],
+    ["The owner likes green tea. Hot, after lunch.", false],
+  ]);
+  // The tombstone stays: the forgotten text is still refused.
+  expect(db.$client.query("SELECT COUNT(*) AS n FROM forgotten_observations").get()).toEqual({
+    n: 1,
+  });
 });
 
 test("the owner's own row brings a forgotten fact back, even with no row left to edit", async () => {
@@ -1602,7 +1658,7 @@ test("the owner's own row brings a forgotten fact back, even with no row left to
   await pass();
   await pass();
   expect(forgetObservation(db, "jojo", rows()[0]?.id ?? 0, 1)).toEqual({ deleted: true });
-  await laterJob((fresh) => [tea([fresh], "Owner likes green tea in the afternoon.")]);
+  await laterJob((fresh) => [tea([fresh], "The owner prefers green tea, in the afternoon!")]);
   expect(rows()).toEqual([]);
 
   expect((await add({ text: "x".repeat(501) })).status).toBe(400);
