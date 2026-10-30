@@ -5,7 +5,5 @@ dist/
 *.db-shm
 *.db-wal
 .DS_Store
-mac/.build/
-mac/.swiftpm/
 app/build/
 app/dist/
