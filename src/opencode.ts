@@ -433,7 +433,12 @@ export interface HistoryItem {
   readonly time: number;
   /** A completed compaction OpenCode kept as a provider's native window, not text. */
   readonly native?: boolean;
+  /** What an assistant message, one model step, reports using, when it reports anything. */
+  readonly tokens?: Tokens;
 }
+
+/** One step's five disjoint counts, as in `Usage`. */
+export type Tokens = Omit<Usage, "complete">;
 
 const historyItem = (item: SessionMessage.Info): HistoryItem => {
   const base = { id: item.id, time: DateTime.toEpochMillis(item.time.created), complete: true };
@@ -447,6 +452,17 @@ const historyItem = (item: SessionMessage.Info): HistoryItem => {
         .join("\n")
         .trim(),
       complete: item.time.completed !== undefined,
+      ...(item.tokens
+        ? {
+            tokens: {
+              input: item.tokens.input,
+              output: item.tokens.output,
+              reasoning: item.tokens.reasoning,
+              cacheRead: item.tokens.cache.read,
+              cacheWrite: item.tokens.cache.write,
+            },
+          }
+        : {}),
     };
   if (item.type === "compaction")
     return {

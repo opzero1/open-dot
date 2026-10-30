@@ -227,7 +227,7 @@ test("a database a connection holds is never opened, and every side file stays b
   expect(check(report, "database").status).toBe("unknown");
   expect(check(report, "database").summary).toContain("in use");
   expect(report.sampledAt).toBeUndefined();
-  for (const id of ["sessions", "deliveries", "slack.apps", "slack.notices"])
+  for (const id of ["sessions", "deliveries", "cache", "slack.apps", "slack.notices"])
     expect(check(report, id).summary).toStartWith("Not checked");
   expect(sessions.calls).toEqual([[]]);
   expect(files()).toEqual(before);
@@ -353,9 +353,16 @@ test("the daemon's health requests read only its pinned snapshot, never the data
         expect(report.sampleUnavailable).toBe(reason);
         expect(check(report, "database")).toMatchObject({ status: "unknown" });
         expect(check(report, "database").summary).toContain(words);
-        for (const id of ["database", "sessions", "deliveries", "slack.apps", "slack.notices"])
+        for (const id of [
+          "database",
+          "sessions",
+          "deliveries",
+          "cache",
+          "slack.apps",
+          "slack.notices",
+        ])
           expect(check(report, id).counts).toBeUndefined();
-        for (const id of ["sessions", "deliveries", "slack.apps", "slack.notices"])
+        for (const id of ["sessions", "deliveries", "cache", "slack.apps", "slack.notices"])
           expect(check(report, id).summary).toStartWith("Not checked");
       }
     }
@@ -577,7 +584,14 @@ test("the CLI carries the daemon's missing, expired or failed sample to its repo
       expect(check(report, "database").status).toBe("unknown");
       expect(check(report, "database").summary).toContain(words);
       expect(check(report, "database").summary).toContain("The running daemon reported this.");
-      for (const id of ["database", "sessions", "deliveries", "slack.apps", "slack.notices"])
+      for (const id of [
+        "database",
+        "sessions",
+        "deliveries",
+        "cache",
+        "slack.apps",
+        "slack.notices",
+      ])
         expect(check(report, id).counts).toBeUndefined();
       expect(check(report, "sessions").summary).toBe(
         "Not checked: the daemon has no usable database sample.",
@@ -872,7 +886,7 @@ test("an unsupported schema is reported without reading its tables", async () =>
     status: "failed",
     counts: { unknown: 1, pending: 0 },
   });
-  for (const id of ["sessions", "deliveries", "slack.apps", "slack.notices"])
+  for (const id of ["sessions", "deliveries", "cache", "slack.apps", "slack.notices"])
     expect(check(report, id).summary).toStartWith("Not checked");
   expect(sessions.calls).toEqual([[]]);
   expect(files()).toEqual(before);
@@ -888,7 +902,7 @@ test("pending migrations are counted exactly and never applied", async () => {
   const report = await run();
   expect(check(report, "database")).toMatchObject({
     status: "stale",
-    counts: { pending: 1, applied: 38, known: 39 },
+    counts: { pending: 1, applied: 39, known: 40 },
   });
   expect(files()).toEqual(before);
 });
@@ -945,7 +959,7 @@ test("0015's draft hash passes over its real reordered slack_threads, and the ot
   const report = await run({ opencode: sessions.run });
   expect(check(report, "database")).toMatchObject({
     status: "healthy",
-    counts: { changed: 0, unknown: 0, skipped: 0, pending: 0, applied: 39, known: 39 },
+    counts: { changed: 0, unknown: 0, skipped: 0, pending: 0, applied: 40, known: 40 },
   });
   expect(check(report, "sessions").status).toBe("healthy");
   expect(check(report, "deliveries").status).toBe("healthy");
@@ -1036,7 +1050,7 @@ test("with 0015's draft accepted, duplicate, unknown, skipped and pending migrat
         `INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('${draftHash}', ${when0015})`,
       );
     }),
-  ).toMatchObject({ status: "failed", counts: { changed: 0, applied: 40 } });
+  ).toMatchObject({ status: "failed", counts: { changed: 0, applied: 41 } });
   expect(
     schemaAfter((db) => {
       draftThreads(db, rescan);
@@ -1188,6 +1202,7 @@ test("the report is machine-readable, versioned and free of secrets", async () =
     "opencode",
     "sessions",
     "deliveries",
+    "cache",
     "feed.github",
     "feed.linear",
     "feed.slack",

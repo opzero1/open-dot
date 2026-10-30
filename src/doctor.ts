@@ -9,6 +9,7 @@ import { FetchHttpClient } from "effect/http";
 import journal from "../drizzle/meta/_journal.json";
 import { apiPath, databasePath } from "./home";
 import { connect, type Endpoint, OpenCodeError } from "./opencode";
+import { alarmSteps, dayStart, heavyWrite, hitPercent } from "./usage";
 
 /**
  * A read-only health report shared by `open-dot doctor` and the daemon's `GET /health`. It never
@@ -56,7 +57,7 @@ export const sampleReasons = ["missing", "expired", "failed"] as const;
 export type SampleUnavailable = (typeof sampleReasons)[number];
 
 /** The checks a database sample gives. */
-const fromDatabase = ["database", "sessions", "deliveries", "slack.apps", "slack.notices"];
+const fromDatabase = ["database", "sessions", "deliveries", "cache", "slack.apps", "slack.notices"];
 
 /** How long the CLI waits for the daemon's report. */
 export const transportTimeout = 5_000;
@@ -224,6 +225,20 @@ const deliveriesText = (status: HealthStatus, counts?: Counts): Text => {
   };
 };
 
+const cacheText = (status: HealthStatus, counts?: Counts): Text => {
+  if (!counts) return { summary: "Couldn't read the dots' model steps.", nextStep: again };
+  const steps = count(counts, "steps");
+  const today = steps
+    ? `Today ${count(counts, "dots")} dots took ${steps} model steps, reading ${count(counts, "cacheRead")} prompt tokens from the cache, writing ${count(counts, "cacheWrite")} to it and sending ${count(counts, "input")} uncached${counts.hitPercent === undefined ? "" : `: a ${count(counts, "hitPercent")}% cache hit ratio`}, with ${count(counts, "output")} output and ${count(counts, "reasoning")} reasoning tokens.`
+    : "No dot has finished a model step today, so there's no cache hit ratio yet.";
+  if (status !== "failed") return { summary: today };
+  return {
+    summary: `On ${count(counts, "alarmed")} dots, each of the latest ${alarmSteps} or more steps after a turn's first wrote at least ${heavyWrite} tokens to the prompt cache, and more than it read, so the conversation is being cached again on every step. ${today}`,
+    nextStep:
+      'An OpenCode upgrade may have changed how cache hints are ordered, so the breakpoint open-dot puts before its memory tail no longer holds. See "The message before the tail is a cache breakpoint" in docs/PLAN.md. doctor changes nothing.',
+  };
+};
+
 const slackStatus = "For each app's state, problem and next step, run: open-dot slack status";
 
 const slackAppsText = (_status: HealthStatus, counts?: Counts): Text => {
@@ -278,6 +293,20 @@ const shared: Record<
   deliveries: {
     text: deliveriesText,
     counts: ["outboxQueued", "outboxUnknown", "outboxHeld", "slackQueued", "slackUnknown"],
+  },
+  cache: {
+    text: cacheText,
+    counts: [
+      "dots",
+      "steps",
+      "input",
+      "output",
+      "reasoning",
+      "cacheRead",
+      "cacheWrite",
+      "hitPercent",
+      "alarmed",
+    ],
   },
   "slack.apps": {
     text: slackAppsText,
@@ -853,6 +882,57 @@ function deliveriesCheck(sqlite: Database, now: number): HealthCheck {
 }
 
 /**
+ * Today's model steps of every dot, summed from `usage_days`, and how many ready dots' latest steps
+ * after a turn's first keep writing more to the prompt cache than they read: `alarmSteps` heavy
+ * ones in a row, on the session the dot is bound to now.
+ */
+function cacheCheck(sqlite: Database, now: number): HealthCheck {
+  const day =
+    sqlite
+      .query<
+        {
+          dots: number;
+          steps: number | null;
+          input: number | null;
+          output: number | null;
+          reasoning: number | null;
+          cacheRead: number | null;
+          cacheWrite: number | null;
+        },
+        [number]
+      >(
+        `SELECT count(*) AS dots, sum(steps) AS steps, sum(input) AS input, sum(output) AS output,
+          sum(reasoning) AS reasoning, sum(cache_read) AS cacheRead, sum(cache_write) AS cacheWrite
+        FROM usage_days WHERE day = ? AND steps > 0`,
+      )
+      .get(dayStart(now)) ?? undefined;
+  const alarmed =
+    sqlite
+      .query<{ n: number }, [number]>(
+        `SELECT count(*) AS n FROM usage_state JOIN dots ON dots.name = usage_state.dot
+        WHERE dots.session_state = 'ready' AND dots.session_id = usage_state.session_id
+          AND usage_state.streak >= ?`,
+      )
+      .get(alarmSteps)?.n ?? 0;
+  const totals = {
+    input: day?.input ?? 0,
+    cacheRead: day?.cacheRead ?? 0,
+    cacheWrite: day?.cacheWrite ?? 0,
+  };
+  const hit = hitPercent(totals);
+  const counts = {
+    dots: day?.dots ?? 0,
+    steps: day?.steps ?? 0,
+    ...totals,
+    output: day?.output ?? 0,
+    reasoning: day?.reasoning ?? 0,
+    ...(hit === null ? {} : { hitPercent: hit }),
+    alarmed,
+  };
+  return make("cache", alarmed ? "failed" : counts.steps ? "healthy" : "unknown", counts);
+}
+
+/**
  * Each dot's own Slack app by saved state, and whether the daemon saved a problem for it, never
  * the problem's words or any ID. A saved "active" isn't a working connection, so the best this
  * says is unknown; `open-dot slack status` gives the full explanation.
@@ -903,6 +983,7 @@ export interface DatabaseSnapshot {
   readonly schema: HealthCheck;
   readonly dots?: readonly BoundDot[];
   readonly deliveries?: HealthCheck;
+  readonly cache?: HealthCheck;
   readonly slack?: readonly HealthCheck[];
 }
 
@@ -917,6 +998,7 @@ export const captureDatabase = (sqlite: Database, sampledAt: number): DatabaseSn
         schema,
         dots: boundDots(sqlite),
         deliveries: deliveriesCheck(sqlite, sampledAt),
+        cache: cacheCheck(sqlite, sampledAt),
         slack: slackChecks(sqlite),
       };
     })
@@ -1036,6 +1118,7 @@ export async function diagnose(input: Diagnosis): Promise<HealthReport> {
     local.set("database", sample.schema);
     if (sample.dots) local.set("sessions", sessionsCheck(sample.dots, found));
     if (sample.deliveries) local.set("deliveries", sample.deliveries);
+    if (sample.cache) local.set("cache", sample.cache);
     for (const check of sample.slack ?? []) local.set(check.id, check);
   } else if (unavailable) {
     const check = unavailableDatabase(unavailable);
@@ -1066,6 +1149,7 @@ export async function diagnose(input: Diagnosis): Promise<HealthReport> {
       opencodeCheck(found),
       stored("sessions"),
       stored("deliveries"),
+      stored("cache"),
       ...input.feeds,
       stored("slack.apps"),
       stored("slack.notices"),

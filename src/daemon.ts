@@ -55,6 +55,7 @@ import {
 import { hasOpenRuns, observeRuns } from "./runs";
 import { queueReport } from "./slack-agents";
 import { fireTriggers, wakeAllowed } from "./triggers";
+import { readyDots, usageAll } from "./usage";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Message = typeof outbox.$inferSelect;
@@ -1431,7 +1432,8 @@ const report = (error: { readonly message: string }) =>
  * OpenCode. The worker, supervision and delivery pass, the answer pass, the Threads pass, the
  * scheduled run pass and the archive pass each connect on their own, the answer pass only when an
  * answer is queued, the run pass only while a run is open and the archive pass only while some
- * dot's archive is on, and the observer pass only for a job of a dot whose observer is on. Only
+ * dot's archive is on, and the observer pass only for a job of a dot whose observer is on. The
+ * usage pass reads each ready dot's new model steps. Only
  * the answer loop sends answers, one at a time, so none is sent twice.
  */
 export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>) => {
@@ -1484,6 +1486,15 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
   ).pipe(
     Effect.catchDefect((defect) => Effect.sync(() => console.error(`Observer: ${String(defect)}`))),
   );
+  // Only reads OpenCode: each ready dot's model steps, for the prompt cache's health.
+  const usage = Effect.suspend(() =>
+    readyDots(db).length
+      ? usageAll(db).pipe(
+          Effect.provide(layer),
+          Effect.catch(() => Effect.void),
+        )
+      : Effect.void,
+  );
   return Effect.all(
     [
       Effect.repeat(work, Schedule.spaced("1 second")),
@@ -1493,6 +1504,7 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
       Effect.repeat(runs, Schedule.spaced("5 seconds")),
       Effect.repeat(archiving, Schedule.spaced("10 seconds")),
       Effect.repeat(observing, Schedule.spaced("10 seconds")),
+      Effect.repeat(usage, Schedule.spaced("10 seconds")),
     ],
     { concurrency: "unbounded", discard: true },
   );

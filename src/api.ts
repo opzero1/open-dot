@@ -126,6 +126,7 @@ import {
   type TriggerChange,
   triggerView,
 } from "./triggers";
+import { dotUsage } from "./usage";
 import {
   type Dot,
   feed,
@@ -277,6 +278,21 @@ const auditPage = 100;
  * `next`, when there may be more, is the `before` of the next older page. Kept after workers
  * finish.
  */
+/** `GET /dots/<name>/usage`: the dot's model steps per day this week and its cache alarm. */
+const usageRoute = (db: Db, request: Request, path: string[]) => {
+  if (path.length !== 3 || request.method !== "GET") return error(404, "Not found");
+  if (new URL(request.url).search) return error(400, "This route takes no parameters.");
+  let name: string;
+  try {
+    name = decodeURIComponent(path[1] ?? "");
+  } catch {
+    return error(400, "Bad dot name.");
+  }
+  const dot = findDot(db, name);
+  if (!dot) return error(404, `There's no dot named "${name}".`);
+  return Response.json(dotUsage(db, dot.name, Date.now()));
+};
+
 const requestAudit = (db: Db, request: Request, path: string[]) => {
   if (path.length !== 3 || request.method !== "GET") return error(404, "Not found");
   const name = (() => {
@@ -3113,6 +3129,8 @@ export const api = (
     if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);
     if (path[0] === "dots" && path[2] === "requests")
       return Promise.resolve(requestAudit(db, request, path));
+    if (path[0] === "dots" && path[2] === "usage")
+      return Promise.resolve(usageRoute(db, request, path));
     if (path[0] === "dots" && path[2] === "avatar")
       return Promise.resolve(avatarRoute(db, request, path));
     if (path[0] === "dots" && path[2] === "library")

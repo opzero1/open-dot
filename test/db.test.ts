@@ -114,7 +114,9 @@ const ledgerTables = [
 const grantTables = ["grants"];
 // 0037 and 0038 add the forget tombstones.
 const forgetTables = ["forgotten_messages", "forgotten_observations"];
-// 0026, 0027, 0028, 0030, 0032, 0035, 0037 and 0038 add these tables, so earlier migrations' tests leave them out.
+// 0039 adds the dots' model step usage.
+const usageTables = ["usage_days", "usage_state"];
+// 0026, 0027, 0028, 0030, 0032, 0035, 0037, 0038 and 0039 add these tables, so earlier migrations' tests leave them out.
 const later = [
   "feed_triggers",
   "trigger_occurrences",
@@ -125,6 +127,7 @@ const later = [
   ...ledgerTables,
   ...grantTables,
   ...forgetTables,
+  ...usageTables,
 ];
 
 type LedgerRow = { seq: number; id: unknown; hash: string; created_at: number };
@@ -1584,6 +1587,7 @@ test("0027 adds only the run tables, keeps every 0026 table, row and trigger, an
         ...ledgerTables,
         ...grantTables,
         ...forgetTables,
+        ...usageTables,
       ].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
@@ -1650,6 +1654,7 @@ test("0028 adds only the artifacts table, keeps every 0027 table, row and trigge
         ...ledgerTables,
         ...grantTables,
         ...forgetTables,
+        ...usageTables,
       ].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
@@ -1709,7 +1714,14 @@ test("0029 appends only nullable icon columns to slack_apps and keeps every 0028
   let db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, ...archiveTables, ...ledgerTables, ...grantTables, ...forgetTables].toSorted(),
+      [
+        ...tables,
+        ...archiveTables,
+        ...ledgerTables,
+        ...grantTables,
+        ...forgetTables,
+        ...usageTables,
+      ].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     const added = db.$client
@@ -1783,7 +1795,14 @@ test("0030 adds the archive and an index of every note, kept by triggers for leg
       .map((row) => row.id);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, ...archiveTables, ...ledgerTables, ...grantTables, ...forgetTables].toSorted(),
+      [
+        ...tables,
+        ...archiveTables,
+        ...ledgerTables,
+        ...grantTables,
+        ...forgetTables,
+        ...usageTables,
+      ].toSorted(),
     );
     for (const name of tables) sameColumns(db.$client, name, columns.get(name) ?? []);
     expect(withoutFresh(rows(db.$client))).toEqual(before);
@@ -1890,7 +1909,9 @@ test("0031 appends only auto_recall, off, to memory_settings and keeps every 003
   try {
     expect(
       tableNames(db.$client).filter(
-        (name) => !ledgerTables.includes(name) && ![...grantTables, ...forgetTables].includes(name),
+        (name) =>
+          !ledgerTables.includes(name) &&
+          ![...grantTables, ...forgetTables, ...usageTables].includes(name),
       ),
     ).toEqual(tables);
     for (const name of tables) {
@@ -1961,7 +1982,7 @@ test("0032 adds the ledger and observer tables, every new switch off, and keeps 
   const db = openDatabase(path);
   try {
     expect(tableNames(db.$client)).toEqual(
-      [...tables, ...ledgerTables, ...grantTables, ...forgetTables].toSorted(),
+      [...tables, ...ledgerTables, ...grantTables, ...forgetTables, ...usageTables].toSorted(),
     );
     expect(withoutFresh(rows(db.$client))).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
@@ -2037,7 +2058,7 @@ test("0037 and 0038 add only the forget tables to a 0036 database, and a forget 
   old.close();
   let db = openDatabase(path);
   try {
-    expect(tableNames(db.$client)).toEqual([...tables, ...forgetTables].toSorted());
+    expect(tableNames(db.$client)).toEqual([...tables, ...forgetTables, ...usageTables].toSorted());
     expect(rows(db.$client)).toEqual(before);
     expect(triggerSQL(db.$client)).toEqual(triggers);
     expectLedger(db.$client, ledgerOld, "0037");

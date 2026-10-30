@@ -389,6 +389,49 @@ export const archiveCursors = sqliteTable("archive_cursors", {
 });
 
 /**
+ * How far the usage walk has read a dot's bound session: the cursor its current page starts at,
+ * and the last item of that page already counted. `previous` is the type of that item, so the next
+ * step knows whether it opens a turn. `streak` counts the latest steps after a turn's first that
+ * wrote more to the prompt cache than they read.
+ */
+export const usageState = sqliteTable("usage_state", {
+  dot: text()
+    .primaryKey()
+    .references(() => dots.name),
+  sessionID: text("session_id").notNull(),
+  cursor: text(),
+  // The item the cursor follows, to tell the history's end from a cursor whose item is gone.
+  anchor: text(),
+  last: text(),
+  previous: text(),
+  // False until the walk first reaches the end of the history; nothing before that is counted.
+  counting: integer({ mode: "boolean" }).notNull().default(false),
+  streak: integer().notNull().default(0),
+  // When the newest step of the streak started.
+  streakAt: integer("streak_at"),
+  revision: integer().notNull().default(0),
+});
+
+/** A dot's model steps per local day, summed from what OpenCode reports for each. */
+export const usageDays = sqliteTable(
+  "usage_days",
+  {
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    // Local midnight of the day the steps started.
+    day: integer().notNull(),
+    steps: integer().notNull().default(0),
+    input: integer().notNull().default(0),
+    output: integer().notNull().default(0),
+    reasoning: integer().notNull().default(0),
+    cacheRead: integer("cache_read").notNull().default(0),
+    cacheWrite: integer("cache_write").notNull().default(0),
+  },
+  (table) => [primaryKey({ columns: [table.dot, table.day] })],
+);
+
+/**
  * The owner's and the dot's own text from a dot's bound conversation, copied from OpenCode's
  * public history: no reasoning, tool calls, attachments, notices or other dots' messages. Rows are
  * never changed, only deleted by the owner; a rebound dot reads only its current session's rows.
