@@ -48,8 +48,162 @@ interface Post {
   messageID: string;
   text: string;
   replyTo?: string;
+  feed?: number;
   files: number;
 }
+
+interface Call {
+  method: string;
+  path: string;
+  body: unknown;
+}
+
+const now = Date.now();
+const versioned = (id: number, version = 1) => ({
+  id,
+  version,
+  createdAt: now - 3_600_000,
+  updatedAt: now - 60_000,
+  updatedBy: "dot",
+});
+const feedItem = (id: number, title: string) => ({
+  id,
+  source: "github",
+  reason: "Mentioned",
+  title,
+  context: "acme/app",
+  url: null,
+  time: now - id * 1000,
+  handedTo: null,
+});
+
+const json = (value: unknown, status = 200) => Response.json(value, { status });
+
+/** The daemon's other surfaces: feed, memory, instructions, Library, health, Slack and fresh. */
+const surfaces = () => ({
+  feed: [feedItem(1, "Fix the build"), feedItem(2, "Review the docs"), feedItem(3, "Ship it")],
+  memory: {
+    notes: [{ ...versioned(1), text: "Likes tea", source: null }],
+    responsibilities: [
+      {
+        ...versioned(2, 3),
+        goal: "Ship v1",
+        nextAction: "Write docs",
+        status: "active",
+        schedule: { kind: "interval", everyMinutes: 60 },
+        nextRunAt: now + 3_600_000,
+      },
+    ],
+    reminders: [
+      {
+        ...versioned(3),
+        text: "Stand up",
+        dueAt: now + 86_400_000,
+        everyMinutes: null,
+        state: "pending",
+      },
+    ],
+    observations: [
+      {
+        ...versioned(4),
+        kind: "fact",
+        topic: "tea",
+        text: "Prefers green tea",
+        priority: 1,
+        sessionID: "ses_jojo",
+        sources: [
+          {
+            messageID: "msg_a",
+            sessionID: "ses_jojo",
+            from: "owner",
+            date: "2026-10-01",
+            excerpt: "I like green tea",
+          },
+        ],
+      },
+    ],
+    observationsNext: null,
+    supervisions: [
+      {
+        id: 5,
+        sessionID: "ses_w",
+        directory: "/tmp/w",
+        mode: "watch",
+        state: "requested",
+        busyMinutes: 30,
+        createdAt: now - 60_000,
+        activatedAt: null,
+      },
+    ],
+    grants: [
+      {
+        id: 6,
+        operation: "merge",
+        summary: "merge acme/app",
+        expiresAt: now + 7_200_000,
+        createdAt: now,
+      },
+    ],
+    triggers: [
+      {
+        id: 7,
+        responsibility: 2,
+        sessionID: "ses_jojo",
+        repository: "acme/app",
+        reasons: ["mention"],
+        task: "Look at it",
+        revision: "a".repeat(64),
+        state: "draft",
+        createdAt: now,
+        confirmedAt: null,
+        baselineAt: null,
+        lastWake: null,
+        baselined: 0,
+        skippedCount: 0,
+        skipped: [],
+      },
+    ],
+  },
+  instructions: { content: "# jojo\n", revision: "1".repeat(64), canRevert: false },
+  // A save of this content is refused once, as if the file changed meanwhile.
+  instructionsConflict: {
+    content: "# jojo\nFrom disk.\n",
+    revision: "2".repeat(64),
+    canRevert: true,
+  },
+  conflictOnce: true,
+  noteConflictOnce: true,
+  freshBusyOnce: true,
+  slack: {
+    config: { state: "ready", problem: null, saved: true },
+    login: { state: "ready", team: "Acme" },
+    manifestLink: "https://api.slack.com/apps?new_app=1",
+    app: {
+      state: "created",
+      appID: "AJOJO01",
+      botUser: null,
+      problem: null,
+      install: null,
+      manifestOutdated: false,
+      updateState: null,
+      updateNote: null,
+      icon: null,
+    },
+  },
+  library: [
+    {
+      id: 9,
+      name: "report.md",
+      mime: "text/markdown",
+      size: 5,
+      sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      createdAt: now,
+      worker: 1,
+      status: "present",
+    },
+  ],
+  calls: [] as Call[],
+});
 
 const worker = (id: number, state: string, needs: string[] = []) => ({
   id,
@@ -276,6 +430,7 @@ class FakeDaemon {
         text: body.text,
         files: body.files?.length ?? 0,
         ...(body.replyTo ? { replyTo: body.replyTo } : {}),
+        ...(body.feed ? { feed: body.feed } : {}),
       };
       this.log.posts.push(post);
       const hook = this.onPost?.(post);
@@ -334,7 +489,147 @@ class FakeDaemon {
       return Response.json({ ok: true });
     }
     if (/^\/workers\/\d+\/open$/.test(path)) return Response.json({ opened: true });
-    return Response.json({ error: "Not found" }, { status: 404 });
+    return this.surface(method, path, url, request);
+  }
+
+  data = surfaces();
+
+  async surface(method: string, path: string, url: URL, request: Request): Promise<Response> {
+    const text = await request.text();
+    const body: unknown = text ? JSON.parse(text) : null;
+    const call = { method, path: path + url.search, body };
+    const d = this.data;
+    const memory = d.memory;
+    const mutation = method !== "GET";
+    if (mutation) d.calls.push(call);
+    if (path === "/feed") return json({ items: d.feed, remaining: 0, handedOff: [] });
+    if (path === "/feed/dismiss") {
+      const ids = (body as { ids: number[] }).ids;
+      d.feed = d.feed.filter((item) => !ids.includes(item.id));
+      return json({ dismissed: ids, missing: [] });
+    }
+    const dismissed = /^\/feed\/(\d+)\/dismiss$/.exec(path)?.[1];
+    if (dismissed) {
+      d.feed = d.feed.filter((item) => item.id !== Number(dismissed));
+      return json({ ok: true });
+    }
+    if (path === "/health")
+      return json({
+        schemaVersion: 1,
+        checkedAt: now,
+        checks: [{ id: "daemon", status: "healthy", summary: "Running." }],
+      });
+    if (path === "/dots/jojo/memory") return json(memory);
+    if (path === "/dots/jojo/memory/archive" && method === "GET")
+      return json({
+        archive: true,
+        observerStatus: {
+          budget: 1,
+          spentToday: 0,
+          stoppedToday: false,
+          budgetNote: "Daily budget note.",
+        },
+      });
+    if (path === "/dots/jojo/memory/recall")
+      return json({
+        query: url.searchParams.get("q"),
+        archive: true,
+        results: [
+          {
+            kind: "message",
+            message: "msg_a",
+            sessionID: "ses_jojo",
+            from: "owner",
+            date: "2026-10-01",
+            snippet: "I like green tea",
+          },
+        ],
+        next: null,
+      });
+    if (path === "/dots/jojo/memory/notes/1" && method === "PATCH") {
+      if (d.noteConflictOnce) {
+        d.noteConflictOnce = false;
+        const current = { ...memory.notes[0], version: 2, text: "Likes coffee" };
+        memory.notes = [current as (typeof memory.notes)[number]];
+        return json({ error: "Changed since you loaded it.", current }, 409);
+      }
+      return json({ ...memory.notes[0], text: (body as { text: string }).text });
+    }
+    if (path === "/dots/jojo/requests")
+      return json(
+        url.searchParams.get("before")
+          ? {
+              requests: [
+                {
+                  id: 1,
+                  source: "worker",
+                  worker: 1,
+                  sessionID: "s",
+                  title: "Older ask",
+                  kind: "permission",
+                  requestID: "r1",
+                  detailText: "detail",
+                  answerText: null,
+                  state: "answered",
+                  needsYou: false,
+                  createdAt: now,
+                },
+              ],
+              next: null,
+            }
+          : {
+              requests: [
+                {
+                  id: 2,
+                  source: "worker",
+                  worker: 1,
+                  sessionID: "s",
+                  title: "Newer ask",
+                  kind: "question",
+                  requestID: "r2",
+                  detailText: "detail",
+                  answerText: "yes",
+                  state: "answered",
+                  needsYou: false,
+                  createdAt: now,
+                },
+              ],
+              next: 2,
+            },
+      );
+    if (path.startsWith("/dots/jojo/memory/") && mutation) return json({ ok: true });
+    if (path === "/dots/jojo/instructions" && method === "GET") return json(d.instructions);
+    if (path === "/dots/jojo/instructions" && method === "PUT") {
+      const { content, revision } = body as { content: string; revision: string };
+      if (d.conflictOnce) {
+        d.conflictOnce = false;
+        d.instructions = d.instructionsConflict;
+        return json({ error: "Changed.", current: d.instructions }, 409);
+      }
+      if (revision !== d.instructions.revision)
+        return json({ error: "Changed.", current: d.instructions }, 409);
+      d.instructions = {
+        content,
+        revision: String(d.calls.length + 3).repeat(64),
+        canRevert: true,
+      };
+      return json(d.instructions);
+    }
+    if (path === "/dots/jojo/library") return json({ artifacts: d.library, next: null });
+    if (/^\/dots\/jojo\/library\/9\/content$/.test(path))
+      return new Response("hello", { headers: { "content-type": "text/markdown" } });
+    if (path === "/dots/jojo/slack" && method === "GET") return json(d.slack);
+    if (path.startsWith("/dots/jojo/slack/") || path.startsWith("/slack/")) return json(d.slack);
+    if (path === "/dots/jojo/fresh") {
+      if (d.freshBusyOnce && !(body as { force?: boolean }).force) {
+        d.freshBusyOnce = false;
+        return json({ error: "jojo is in the middle of a turn." }, 409);
+      }
+      this.sessionID = "ses_fresh";
+      this.messages = [];
+      return json({ name: "jojo", sessionID: "ses_fresh", previousSessionID: "ses_jojo" }, 201);
+    }
+    return json({ error: "Not found" }, 404);
   }
 }
 
@@ -369,6 +664,17 @@ const prelude = `window.t = {
   },
   key(key) {
     document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+  },
+  cmd(key) {
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key, metaKey: true, bubbles: true, cancelable: true }));
+  },
+  fill(selector, text) {
+    const field = document.querySelector(selector);
+    if (!field) throw new Error("No field " + selector);
+    const proto = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(field, text);
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
   },
   scroll(top) {
     t.list().scrollTop = top;
@@ -505,7 +811,9 @@ const launch = async (name: string, setup: (fake: FakeDaemon) => void) => {
   };
   /** Tells the page its window was shown, as the tray and shortcut do, without showing it. */
   const shown = () => call({ emit: "shown" });
-  return { fake, js, until, state, press, menu, found, close, temporary, shown };
+  /** A copy to main's fake clipboard, never the owner's. */
+  const clipboard = (text: string) => call({ clipboard: text });
+  return { fake, js, until, state, press, menu, found, close, temporary, shown, clipboard };
 };
 
 type App = Awaited<ReturnType<typeof launch>>;
@@ -1592,4 +1900,306 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
   expect(readdirSync(app.temporary).filter((name) => name.startsWith("open-dot-share-"))).toEqual(
     [],
   );
+}, 170_000);
+
+/** Opens a pane of jojo's from its dot menu. */
+const openPane = async (app: App, label: string) => {
+  await app.until(`!!document.querySelector('[data-dot-menu="jojo"]')`, "jojo's menu button");
+  await app.js(`document.querySelector('[data-dot-menu="jojo"]').click(), true`);
+  await app.press("[role=menu]", label);
+};
+
+const mutations = (fake: FakeDaemon, prefix: string) =>
+  fake.data.calls.filter((call) => call.path.startsWith(prefix));
+
+test("Feed: dismiss and Clear all; a reply sends once per dot with the feed ID and keeps only the refused dot", async () => {
+  await scenario(
+    "feed",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+      fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+    },
+    async ({ fake, js, until, press, state }) => {
+      await until(`!!document.querySelector("[data-open-feed]")`, "the Feed button");
+      await js(`document.querySelector("[data-open-feed]").click(), true`);
+      await until(`document.querySelectorAll("[data-feed-item]").length === 3`, "three feed items");
+      await press('[data-feed-item="1"]', "Dismiss");
+      await until(`!document.querySelector('[data-feed-item="1"]')`, "the dismissed item to go");
+      await press('[data-feed-item="2"]', "Reply");
+      await until(`!!document.querySelector(".reply-box")`, "the reply box");
+      // jojo is picked; pick dio too.
+      await js(
+        `[...document.querySelectorAll(".reply-dots label")].find((l) => l.textContent.includes("dio")).querySelector("input").click(), true`,
+      );
+      await press(".reply-box", "Start on it");
+      await until(
+        `document.querySelector(".reply-box textarea").value.startsWith("Take this on")`,
+        "the prompt",
+      );
+      await press(".reply-box", "Send");
+      await until(`!!document.querySelector("[data-reply-problems]")`, "dio's refusal");
+      expect(fake.log.posts.length).toBe(1);
+      expect(fake.log.posts[0]).toMatchObject({ feed: 2 });
+      expect(fake.log.posts[0]?.text).toStartWith("Take this on");
+      // Only dio, whose send was refused, stays picked: sending again never reaches jojo.
+      expect(
+        await js(
+          `[...document.querySelectorAll(".reply-dots input")].map((input) => input.checked)`,
+        ),
+      ).toEqual([false, true]);
+      await press(".reply-box", "Send");
+      await until(
+        `!!document.querySelector("[data-reply-problems]") && !t.button("Sending…")`,
+        "the second refusal",
+      );
+      expect(fake.log.posts.length).toBe(1);
+      await press(".reply-box", "Cancel");
+      await press(".feed", "Clear all");
+      await until(`!document.querySelector("[data-feed-item]")`, "an empty feed");
+      expect(mutations(fake, "/feed/dismiss").map((call) => call.body)).toEqual([{ ids: [3, 2] }]);
+      // The feed open over jojo's chat never marked it read.
+      expect((await state()).recorded.show).toBe(0);
+    },
+  );
+}, 170_000);
+
+test("Memory: a refused edit shows beside the value now, edits send only changed fields, and confirmations gate every change", async () => {
+  await scenario(
+    "memory",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      await openPane(app, "Memory");
+      await until(`!!document.querySelector('[data-note="1"]')`, "the note");
+      await until(`document.body.innerText.includes("Daily budget note.")`, "the budget note");
+      // A note edit refused with 409 keeps the owner's text beside the current one, unretried.
+      await press('[data-note="1"]', "Edit");
+      await js(`t.fill('[data-note="1"] textarea', "Likes green tea")`);
+      await press('[data-note="1"]', "Save");
+      await until(`!!document.querySelector('[data-rejected="note:1"]')`, "the rejected edit");
+      const rejected = await js(`document.querySelector('[data-rejected="note:1"]').innerText`);
+      expect(rejected).toContain("Your rejected edit (not saved)");
+      expect(rejected).toContain("Likes green tea");
+      expect(rejected).toContain("Likes coffee");
+      expect(mutations(fake, "/dots/jojo/memory/notes/1")).toEqual([
+        {
+          method: "PATCH",
+          path: "/dots/jojo/memory/notes/1",
+          body: { version: 1, text: "Likes green tea" },
+        },
+      ]);
+      await press('[data-rejected="note:1"]', "Discard rejected edit");
+      // A responsibility edit sends only the field the owner changed, with its version.
+      await press('[data-responsibility="2"]', "Edit");
+      await js(`t.fill('[data-responsibility="2"] textarea', "Publish docs")`);
+      await press('[data-responsibility="2"]', "Save");
+      for (
+        let tick = 0;
+        tick < 50 && !mutations(fake, "/dots/jojo/memory/responsibilities/2").length;
+        tick++
+      )
+        await delay(100);
+      expect(mutations(fake, "/dots/jojo/memory/responsibilities/2")[0]?.body).toEqual({
+        version: 3,
+        nextAction: "Publish docs",
+      });
+      // Forget asks first; Forget and Delete Sources deletes from the archive too.
+      await press('[data-observation="4"]', "Forget…");
+      await until(
+        `document.querySelector("[role=alertdialog]")?.innerText.includes("Forget this observation?")`,
+        "the forget dialog",
+      );
+      await press("[role=alertdialog]", "Cancel");
+      expect(mutations(fake, "/dots/jojo/memory/observations")).toEqual([]);
+      await press('[data-observation="4"]', "Forget…");
+      await press("[role=alertdialog]", "Forget and Delete Sources");
+      for (
+        let tick = 0;
+        tick < 50 && !mutations(fake, "/dots/jojo/memory/observations").length;
+        tick++
+      )
+        await delay(100);
+      expect(
+        mutations(fake, "/dots/jojo/memory/observations").map((call) => [call.method, call.path]),
+      ).toEqual([["DELETE", "/dots/jojo/memory/observations/4?version=1&sources=true"]]);
+      // Watch approval, grant revoke and trigger enable each wait for their confirmation.
+      await press('[data-supervision="5"]', "Approve…");
+      await press("[role=alertdialog]", "Approve");
+      await press('[data-grant="6"]', "Revoke…");
+      await press("[role=alertdialog]", "Revoke");
+      await press('[data-trigger="7"]', "Enable…");
+      await until(
+        `document.querySelector("[role=alertdialog]")?.innerText.includes("sent unchanged")`,
+        "the trigger text",
+      );
+      await press("[role=alertdialog]", "Enable");
+      for (
+        let tick = 0;
+        tick < 50 && mutations(fake, "/dots/jojo/memory/triggers").length < 1;
+        tick++
+      )
+        await delay(100);
+      expect(fake.data.calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+        "PATCH /dots/jojo/memory/notes/1",
+        "PATCH /dots/jojo/memory/responsibilities/2",
+        "DELETE /dots/jojo/memory/observations/4?version=1&sources=true",
+        "POST /dots/jojo/memory/supervisions/5/approve",
+        "DELETE /dots/jojo/memory/grants/6",
+        "POST /dots/jojo/memory/triggers/7/enable",
+      ]);
+      expect(fake.data.calls.at(-1)?.body).toEqual({ revision: "a".repeat(64) });
+      // Requests load older by their cursor; recall finds an archived message to delete.
+      await press('[data-section="requests"]', "Show requests");
+      await press('[data-section="requests"]', "Load older");
+      await until(`document.querySelectorAll("[data-request]").length === 2`, "both requests");
+      await js(`t.fill('[role=search] input', "tea")`);
+      await press("[role=search]", "Search");
+      await press('[data-recall="message"]', "Delete from Archive…");
+      await press("[role=alertdialog]", "Delete");
+      for (let tick = 0; tick < 50 && !mutations(fake, "/dots/jojo/memory/archive").length; tick++)
+        await delay(100);
+      expect(mutations(fake, "/dots/jojo/memory/archive")).toEqual([
+        { method: "DELETE", path: "/dots/jojo/memory/archive/msg_a", body: null },
+      ]);
+    },
+  );
+}, 170_000);
+
+test("Instructions: the draft survives panes and Escape, a conflict keeps it, and Overwrite uses the conflict's revision", async () => {
+  await scenario(
+    "instructions",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      await until(`!!t.box()`, "the chat");
+      await js(`t.box().focus(), t.cmd("3"), true`);
+      await until(`!!document.querySelector(".instructions-editor")`, "the editor");
+      await js(`t.fill(".instructions-editor", "# jojo\\nBe brief.\\n")`);
+      await until(`!!document.querySelector("[data-unsaved]")`, "Unsaved changes");
+      await js(`document.querySelector(".instructions-editor").focus(), t.key("Escape"), true`);
+      await until(`!document.querySelector(".instructions-editor") && !!t.box()`, "the chat again");
+      await js(`t.box().focus(), t.cmd("3"), true`);
+      await until(
+        `document.querySelector(".instructions-editor")?.value === "# jojo\\nBe brief.\\n"`,
+        "the kept draft",
+      );
+      await press(".instructions .pane-head", "Save");
+      await until(`!!document.querySelector(".conflict")`, "the conflict");
+      expect(await js(`document.querySelector(".instructions-editor").value`)).toBe(
+        "# jojo\nBe brief.\n",
+      );
+      await press(".conflict", "Overwrite");
+      await until(
+        `!document.querySelector(".conflict") && !document.querySelector("[data-unsaved]")`,
+        "the save",
+      );
+      expect(mutations(fake, "/dots/jojo/instructions").map((call) => call.body)).toEqual([
+        { content: "# jojo\nBe brief.\n", revision: "1".repeat(64) },
+        { content: "# jojo\nBe brief.\n", revision: "2".repeat(64) },
+      ]);
+    },
+  );
+}, 170_000);
+
+test("Library exports through the save dialog only, Health reads, and Start Fresh forces only after a second answer", async () => {
+  await scenario(
+    "library",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { fake, js, until, press, state } = app;
+      await openPane(app, "Library");
+      await press('[data-artifact="9"]', "Export…");
+      await until(
+        `document.querySelector('[data-artifact="9"]').innerText.includes("It wasn't opened.")`,
+        "the export",
+      );
+      const recorded = (await state()).recorded as Recorded & {
+        saves: { name: string; bytes: number }[];
+      };
+      expect(recorded.saves).toEqual([{ name: "report.md", bytes: 5 }]);
+      expect(recorded.openExternal).toEqual([]);
+      await openPane(app, "Health");
+      await until(`!!document.querySelector('[data-health="daemon"]')`, "the health check");
+      await openPane(app, "Start Fresh…");
+      await press("[role=alertdialog]", "Start Fresh");
+      await until(
+        `document.querySelector("[role=alertdialog]")?.innerText.includes("in the middle of a turn")`,
+        "the busy refusal",
+      );
+      expect(mutations(fake, "/dots/jojo/fresh").map((call) => call.body)).toEqual([{}]);
+      await press("[role=alertdialog]", "Start Fresh Anyway");
+      for (let tick = 0; tick < 50 && mutations(fake, "/dots/jojo/fresh").length < 2; tick++)
+        await delay(100);
+      expect(mutations(fake, "/dots/jojo/fresh").map((call) => call.body)).toEqual([
+        {},
+        { force: true },
+      ]);
+      await js(`t.cmd("1"), true`);
+      await until(
+        `!!t.box() && !document.querySelector('[data-message="m1"]')`,
+        "the fresh session",
+      );
+    },
+  );
+}, 170_000);
+
+test("Slack: a typed token goes once and is cleared, and pickup takes only a matching copy made after arming", async () => {
+  const bot = ["xoxb", "1111111111", "2222222222222", "a".repeat(24)].join("-");
+  const typed = ["xoxb", "3333333333", "4444444444444", "c".repeat(24)].join("-");
+  await scenario(
+    "slack",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { fake, js, until, press, state } = app;
+      await openPane(app, "Slack");
+      await until(`!!document.querySelector('[data-secret="bot"]')`, "the bot token field");
+      await js(`t.fill('[data-secret="bot"]', ${JSON.stringify(typed)})`);
+      await js(
+        `t.button("Save", document.querySelector('[data-secret="bot"]').parentElement).click(), true`,
+      );
+      for (let tick = 0; tick < 50 && !mutations(fake, "/dots/jojo/slack/tokens").length; tick++)
+        await delay(100);
+      expect(mutations(fake, "/dots/jojo/slack/tokens")).toEqual([
+        { method: "POST", path: "/dots/jojo/slack/tokens", body: { kind: "bot", token: typed } },
+      ]);
+      expect(await js(`document.querySelector('[data-secret="bot"]').value`)).toBe("");
+      // A copy made before arming isn't taken; after arming, a wrong copy is ignored and the bot
+      // token is taken once and cleared.
+      await app.clipboard("before");
+      await press('[data-pane="slack"]', "Pick up bot token");
+      await until(`!!document.querySelector("[data-pickup-status]")`, "the armed pickup");
+      await app.clipboard("not a token");
+      await until(
+        `document.querySelector("[data-pickup-status]")?.innerText.includes("wasn't one")`,
+        "the ignored copy",
+      );
+      await app.clipboard(bot);
+      for (let tick = 0; tick < 80 && mutations(fake, "/dots/jojo/slack/tokens").length < 2; tick++)
+        await delay(100);
+      expect(mutations(fake, "/dots/jojo/slack/tokens").at(-1)?.body).toEqual({
+        kind: "bot",
+        token: bot,
+      });
+      const clipboard = (
+        (await state()) as State & { clipboard: { clears: number; text?: string } }
+      ).clipboard;
+      expect(clipboard.clears).toBe(1);
+      expect(mutations(fake, "/dots/jojo/slack/tokens").length).toBe(2);
+      // No token reached the page.
+      expect(await js(`document.documentElement.outerHTML.includes(${JSON.stringify(bot)})`)).toBe(
+        false,
+      );
+    },
+  );
+  // Nothing the app wrote holds a token.
+  const written = Bun.spawnSync(["grep", "-rl", "xoxb-", join(scratch, "slack", "app-data")]);
+  expect(written.stdout.toString()).toBe("");
 }, 170_000);

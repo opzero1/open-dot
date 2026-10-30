@@ -864,11 +864,6 @@ button:disabled {
   color: var(--muted);
 }
 
-.dot-menu .shortcut {
-  float: right;
-  color: var(--muted);
-}
-
 .dot-menu hr {
   border: none;
   border-top: 1px solid var(--line);

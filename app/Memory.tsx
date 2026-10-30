@@ -74,17 +74,11 @@ const fieldsOf = (value: unknown): string | undefined => {
 const local = (time: number) =>
   new Date(time - new Date(time).getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
 
-export const Memory = ({
-  dot,
-  sessionID,
-  ask,
-}: {
-  dot: string;
-  sessionID: string | undefined;
-  ask: AskOwner;
-}) => {
+export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   const fence = useRef(new Fence());
-  const key = `${dot}:${sessionID ?? ""}`;
+  // The window remounts this pane for each session of the dot, as Start Fresh makes, so a read
+  // or page begun for one session never shows in another.
+  const key = dot;
   const keyRef = useRef(key);
   keyRef.current = key;
   const [memory, setMemory] = useState<MemoryData>();

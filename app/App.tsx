@@ -284,6 +284,8 @@ const App = () => {
   const [ask, setAsk] = useState<Ask>();
   const [dotMenu, setDotMenu] = useState<{ dot: string; x: number; y: number }>();
   const [freshening, setFreshening] = useState(new Set<string>());
+  // How many times each dot started fresh here: its Memory pane starts over for each session.
+  const [freshCounts, setFreshCounts] = useState(new Map<string, number>());
   // Each dot's instructions editor, kept while the window lives so no pane switch drops a draft.
   const editors = useRef(new Map<string, InstructionsState>());
   const [, setEditorTick] = useState(0);
@@ -339,6 +341,8 @@ const App = () => {
   });
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
+  // Whether the owner sees the selected chat: the Feed and other panes don't mark it read.
+  const lookingRef = useRef(true);
   const dotsRef = useRef(dots);
   dotsRef.current = dots;
 
@@ -414,7 +418,11 @@ const App = () => {
       setSeen((current) => {
         const last = page.messages.at(-1)?.id;
         // The first successful read is the baseline: nothing before it counts as unread.
-        if (!last || (current.has(name) && !(name === selectedRef.current && document.hasFocus())))
+        if (
+          !last ||
+          (current.has(name) &&
+            !(name === selectedRef.current && lookingRef.current && document.hasFocus()))
+        )
           return current;
         return new Map(current).set(name, last);
       });
@@ -665,6 +673,7 @@ const App = () => {
 
   // Looking at a chat marks it read; the Feed and a dot's other panes don't.
   const looking = pane === "chat" && !feedOpen;
+  lookingRef.current = looking;
   useEffect(() => {
     const last = conversation?.latest.at(-1)?.id;
     if (looking && selected && last && seen.get(selected) !== last && document.hasFocus())
@@ -1030,6 +1039,7 @@ const App = () => {
         return next;
       });
       if (result.ok) {
+        setFreshCounts((current) => new Map(current).set(name, (current.get(name) ?? 0) + 1));
         // The old session's window goes; drafts stay, and the next read shows the new session.
         epochs.current.set(name, (epochs.current.get(name) ?? 0) + 1);
         updateConversations((current) => without(current, name));
@@ -1193,7 +1203,11 @@ const App = () => {
             onOpenChat={(name) => show(name, "chat")}
           />
         ) : dot && pane === "memory" ? (
-          <Memory key={dot.name} dot={dot.name} sessionID={conversation?.sessionID} ask={setAsk} />
+          <Memory
+            key={`${dot.name}:${freshCounts.get(dot.name) ?? 0}`}
+            dot={dot.name}
+            ask={setAsk}
+          />
         ) : dot && pane === "instructions" ? (
           <Instructions
             key={dot.name}
@@ -1516,9 +1530,15 @@ const DotMenu = ({
         onKeyDown={onKeyDown}
       >
         {paneNames.map(([pane, label], index) => (
-          <button key={pane} type="button" role="menuitem" onClick={() => onPick(pane)}>
+          <button
+            key={pane}
+            type="button"
+            role="menuitem"
+            aria-keyshortcuts={index < 3 ? `Meta+${index + 1}` : undefined}
+            title={index < 3 ? `⌘${index + 1}` : undefined}
+            onClick={() => onPick(pane)}
+          >
             {label}
-            {index < 3 ? <span className="shortcut">⌘{index + 1}</span> : null}
           </button>
         ))}
         <hr />
