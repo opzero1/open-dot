@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { FeedItem, Instructions } from "../bridge";
+import type { FeedItem, Instructions, OwnerFact } from "../bridge";
 import { linkAppID, tokenMatches } from "../slack";
 import {
   changedFields,
@@ -8,6 +8,7 @@ import {
   FeedState,
   Fence,
   InstructionsState,
+  ownerOrphans,
   Searches,
 } from "../surfaces";
 
@@ -396,4 +397,31 @@ test("a search begun before or during a change is dropped, and the change's end 
   ).toBe(true);
   expect(searches.error).toBe("The search must be at most 200 characters.");
   expect(searches.searching).toBe(false);
+});
+
+const fact = (id: string, state: OwnerFact["state"]): OwnerFact => ({
+  id,
+  state,
+  text: state === "pending" || state === "approved" ? "Likes tea" : null,
+  version: 2,
+  createdAt: 1,
+  updatedAt: 2,
+  origin: null,
+  lastMutationID: null,
+});
+
+test("an owner's unsaved text stays reachable once its fact is rejected, deleted or gone", () => {
+  const memory = {
+    pending: [fact("a", "pending")],
+    approved: [fact("b", "approved")],
+    removed: [fact("c", "rejected"), fact("d", "deleted")],
+    entryBytes: 0,
+    entryLimit: 8192,
+  };
+  const rows = ["owner:new", "owner:e", "owner:d", "owner:a", "owner:c", "owner:b", "owner:c"];
+  expect(ownerOrphans(memory, rows)).toEqual([
+    { row: "owner:c", factID: "c", state: "rejected" },
+    { row: "owner:d", factID: "d", state: "deleted" },
+    { row: "owner:e", factID: "e", state: "missing" },
+  ]);
 });

@@ -3613,3 +3613,118 @@ test("About you: suggestions show as plain untrusted text, one change goes at a 
     },
   );
 }, 170_000);
+
+/** An owner fact's row, pending or approved. */
+const factRow = (id: string) => `[data-owner-pending="${id}"], [data-owner-approved="${id}"]`;
+
+test("About you: text typed for a fact rejected or deleted before or during its save stays shown across refreshes and dots until discarded, and nothing is sent again", async () => {
+  const [p1, p2, a1, a2] = ["1", "2", "3", "4"].map(
+    (digit) =>
+      `${digit.repeat(8)}-${digit.repeat(4)}-4${digit.repeat(3)}-8${digit.repeat(3)}-${digit.repeat(12)}`,
+  ) as [string, string, string, string];
+  await scenario(
+    "owner-orphans",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+      fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+      const [base] = fake.data.owner.facts;
+      if (!base) throw new Error("No suggestion to start from.");
+      fake.data.owner.facts.push(
+        { ...base, id: p2, text: "Works late", origin: { ...base.origin, messageID: "msg_late" } },
+        { ...base, id: a1, state: "approved", text: "Lives in KL", origin: null as never },
+        { ...base, id: a2, state: "approved", text: "Drinks coffee", origin: null as never },
+      );
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      // What the owner's CLI or API does meanwhile: the fact moves on and its text is cleared.
+      const elsewhere = (id: string, state: "rejected" | "deleted") => {
+        const fact = fake.data.owner.facts.find((known) => known.id === id);
+        if (!fact) throw new Error(`No fact ${id}.`);
+        Object.assign(fact, { state, text: null, version: fact.version + 1, lastMutationID: null });
+      };
+      const draft = async (id: string, label: string, text: string) => {
+        await press(factRow(id), label);
+        await js(
+          `t.fill(${JSON.stringify(`[data-editing="owner:${id}"] textarea`)}, ${JSON.stringify(text)})`,
+        );
+      };
+      const orphans = `[...document.querySelectorAll("[data-owner-orphan]")].map((li) => [li.dataset.ownerOrphan, li.dataset.state, [...li.querySelectorAll("[data-owner-orphan-text]")].map((pre) => pre.textContent)])`;
+      const showDot = async (dot: string) => {
+        await js(`document.querySelector('[data-dot="${dot}"]').click(), true`);
+        await js(`t.cmd("2"), true`);
+        await until(`!!document.querySelector('[data-section="owner"]')`, `${dot}'s memory`);
+      };
+      await openPane(app, "Memory");
+      await until(`!!document.querySelector(${JSON.stringify(factRow(a2))})`, "the facts");
+      await draft(p1, "Edit and approve", "Prefers green tea.");
+      await draft(p2, "Edit and approve", "Works early.");
+      await draft(a1, "Edit", "Lives in Penang.");
+      await draft(a2, "Edit", "Drinks decaf.");
+
+      // Deleted before Save, saved before the next read: refused, and the text stays shown.
+      elsewhere(a2, "deleted");
+      await press(factRow(a2), "Save for every dot");
+      await until(
+        `document.querySelector('[data-owner-orphan="${a2}"]')?.dataset.state === "deleted"`,
+        "the text of the deleted fact",
+      );
+      // Rejected and deleted while their saves are out.
+      for (const [id, label, state] of [
+        [p1, "Approve this text for every dot", "rejected"],
+        [a1, "Save for every dot", "deleted"],
+      ] as const) {
+        const held = Promise.withResolvers<void>();
+        fake.data.owner.hold = held.promise;
+        const before = mutations(fake, "/owner/facts").length;
+        await press(factRow(id), label);
+        for (let tick = 0; tick < 100 && mutations(fake, "/owner/facts").length === before; tick++)
+          await Bun.sleep(50);
+        elsewhere(id, state);
+        held.resolve();
+        fake.data.owner.hold = undefined;
+        await until(
+          `document.querySelector('[data-owner-orphan="${id}"]')?.dataset.state === ${JSON.stringify(state)}`,
+          `the text of the ${state} fact`,
+        );
+      }
+      // Rejected before Save: the next read, here from showing another dot, keeps the draft's text.
+      elsewhere(p2, "rejected");
+      await showDot("dio");
+      await until(`!!document.querySelector('[data-owner-orphan="${p2}"]')`, "the rejected draft");
+      expect(await js(`!!document.querySelector('[data-editing="owner:${p2}"]')`)).toBe(false);
+      const shown = [
+        [p1, "rejected", ["Prefers green tea."]],
+        [p2, "rejected", ["Works early."]],
+        [a1, "deleted", ["Lives in Penang."]],
+        [a2, "deleted", ["Drinks decaf."]],
+      ];
+      expect(await js(orphans)).toEqual(shown);
+      await showDot("jojo");
+      await until(`${orphans}.length === 4`, "the texts in jojo's memory");
+      expect(await js(orphans)).toEqual(shown);
+      // Each save went once, at the version its edit started from; nothing was sent again.
+      expect(
+        mutations(fake, "/owner/facts").map((call) => [
+          call.method,
+          call.path,
+          (call.body as { action?: string; version?: number }).action,
+          (call.body as { version?: number }).version,
+        ]),
+      ).toEqual([
+        ["PATCH", `/owner/facts/${a2}`, "edit", 1],
+        ["PATCH", `/owner/facts/${p1}`, "approve", 1],
+        ["PATCH", `/owner/facts/${a1}`, "edit", 1],
+      ]);
+      // Only the owner ends one: Discard drops it, and Put in Add a fact fills the field unsent.
+      await press(`[data-owner-orphan="${a2}"]`, "Discard your text");
+      await press(`[data-owner-orphan="${p1}"]`, "Put in Add a fact");
+      await until(
+        `document.querySelector('[aria-label="New fact about you, shared with every dot"]').value === "Prefers green tea." && !document.querySelector('[data-owner-orphan="${a2}"]')`,
+        "the discarded text and the filled field",
+      );
+      expect(await js(`${orphans}.length`)).toBe(3);
+      expect(mutations(fake, "/owner/facts")).toHaveLength(3);
+    },
+  );
+}, 170_000);

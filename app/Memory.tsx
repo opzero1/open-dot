@@ -39,6 +39,7 @@ import {
   nextRunLine,
   ownerActionWords,
   ownerFailure,
+  ownerOrphans,
   ownerOutcome,
   requestAsked,
   requestLine,
@@ -1801,7 +1802,9 @@ const changeOwner = async (
       current:
         "text" in current && typeof current.text === "string"
           ? current.text
-          : "(no longer pending or approved)",
+          : "state" in current && (current.state === "rejected" || current.state === "deleted")
+            ? `(${current.state}: no dot sees it)`
+            : "(no longer pending or approved)",
     });
   void readOwner();
   return result;
@@ -1909,6 +1912,20 @@ export const OwnerFacts = ({ ask }: { ask: AskOwner }) => {
 
   const pending = memory?.pending ?? [];
   const approved = memory?.approved ?? [];
+  // Text the owner typed for a fact that was rejected or deleted meanwhile, from any dot, CLI or
+  // API: kept here until the owner discards it, and never restored or sent again on its own.
+  const orphans = ownerOrphans(memory, [...drafts.rows.keys(), ...ownerStore.rejected.keys()]);
+  const discard = (row: string) => {
+    drafts.cancel(row);
+    ownerStore.rejected.delete(row);
+    ownerStore.errors.delete(row);
+    drawOwner();
+  };
+  const orphanState = {
+    rejected: "This fact was rejected meanwhile, so no dot sees it.",
+    deleted: "This fact was deleted meanwhile, so no dot sees it.",
+    missing: "This fact is no longer in your facts.",
+  };
   return (
     <Section
       title="About you — shared with every dot"
@@ -1930,6 +1947,59 @@ export const OwnerFacts = ({ ask }: { ask: AskOwner }) => {
           </button>
         </div>
       ))}
+      {orphans.length ? (
+        <>
+          <h4>Your unsaved text</h4>
+          <ul className="items">
+            {orphans.map(({ row, factID, state }) => {
+              const draft = drafts.get(row);
+              const out = draft?.sending !== undefined;
+              const texts = [draft?.edited, ownerStore.rejected.get(row)?.mine].filter(
+                (text, index, all): text is string =>
+                  text !== undefined && all.indexOf(text) === index,
+              );
+              return (
+                <li key={row} className="item" data-owner-orphan={factID} data-state={state}>
+                  <div className="note">
+                    {orphanState[state]} Your text below wasn't saved and isn't sent again.
+                  </div>
+                  {ownerStore.errors.get(row) ? (
+                    <div className="item-error" role="alert" data-row-error={row}>
+                      {ownerStore.errors.get(row)}
+                    </div>
+                  ) : null}
+                  {texts.map((text) => (
+                    <div key={text}>
+                      <pre className="conflict-text" data-owner-orphan-text>
+                        {text}
+                      </pre>
+                      <div className="item-actions">
+                        <button
+                          type="button"
+                          disabled={
+                            out || ownerStore.adding.trim() !== "" || sending === "owner:new"
+                          }
+                          onClick={() => {
+                            ownerStore.adding = text;
+                            drawOwner();
+                          }}
+                        >
+                          Put in Add a fact
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  <div className="item-actions">
+                    <button type="button" disabled={out} onClick={() => discard(row)}>
+                      Discard your text
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      ) : null}
       <h4>Suggested by dots</h4>
       {pending.length ? null : <p className="empty-line">No suggestions waiting.</p>}
       <ul className="items">

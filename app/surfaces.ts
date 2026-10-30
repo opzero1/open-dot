@@ -7,6 +7,7 @@ import type {
   Instructions,
   MemoryResponsibility,
   NoteSourceRead,
+  OwnerMemory,
   OwnerMutation,
   ReceiptStatus,
   Reply,
@@ -926,6 +927,30 @@ export const ownerFailure = (result: Extract<Reply<unknown>, { ok: false }>) =>
   result.lost
     ? "Couldn't confirm this change. It may have been saved; the app checks it by its ID and never sends it again."
     : result.error;
+
+/**
+ * Owner fact rows holding the owner's unsaved text whose fact the last read no longer lists as
+ * pending or approved, with what it is now: rejected or deleted, or `missing` when the read has no
+ * such fact. Their text stays shown apart from the lists until the owner discards it.
+ */
+export const ownerOrphans = (memory: OwnerMemory | undefined, rows: Iterable<string>) => {
+  const listed = new Set(
+    [...(memory?.pending ?? []), ...(memory?.approved ?? [])].map((f) => f.id),
+  );
+  const removed = new Map<string, "rejected" | "deleted">();
+  for (const fact of memory?.removed ?? [])
+    if (fact.state === "rejected" || fact.state === "deleted") removed.set(fact.id, fact.state);
+  return [...new Set(rows)]
+    .filter((row) => row.startsWith("owner:") && row !== "owner:new")
+    .map((row) => ({ row, factID: row.slice("owner:".length) }))
+    .filter(({ factID }) => !listed.has(factID))
+    .toSorted((a, b) => (a.row < b.row ? -1 : a.row > b.row ? 1 : 0))
+    .map(({ row, factID }) => ({
+      row,
+      factID,
+      state: removed.get(factID) ?? ("missing" as const),
+    }));
+};
 
 /** How a change is described while its outcome is unknown. */
 export const ownerActionWords: Record<OwnerMutation["action"], string> = {
