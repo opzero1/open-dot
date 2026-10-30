@@ -2192,6 +2192,82 @@ test("Feed: a receipt the chat's poll settles while the Feed is closed still set
   );
 }, 170_000);
 
+test("Memory: a new note, observation and feed trigger survive Escape, the Feed and another dot, and go only by Add or Cancel", async () => {
+  await scenario(
+    "memory-new",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+      fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      const drafts = `(() => ({
+        note: document.querySelector('[aria-label="New note"]')?.value,
+        observation: document.querySelector('[aria-label="New observation"]')?.value,
+        instruction: document.querySelector('[aria-label="Instruction"]')?.value,
+        repository: document.querySelector('[aria-label="Repository"]')?.value,
+      }))()`;
+      const typed = {
+        note: "Buy tea",
+        observation: "Prefers mornings",
+        instruction: "Look at it",
+        repository: "acme/app",
+      };
+      const reopen = async () => {
+        await js(`t.cmd("2"), true`);
+        await until(`!!document.querySelector('[aria-label="New note"]')`, "jojo's memory");
+        expect(await js(drafts)).toEqual(typed);
+      };
+      await openPane(app, "Memory");
+      await until(`!!document.querySelector('[aria-label="New note"]')`, "the memory");
+      await js(`t.fill('[aria-label="New note"]', "Buy tea")`);
+      await js(`t.fill('[aria-label="New observation"]', "Prefers mornings")`);
+      await press('[data-section="triggers"]', "New feed trigger…");
+      await js(`t.fill('[aria-label="Repository"]', "acme/app")`);
+      await js(`t.fill('[aria-label="Instruction"]', "Look at it")`);
+      expect(await js(drafts)).toEqual(typed);
+      // Escape goes back to the chat.
+      await js(`document.querySelector('[aria-label="New note"]').focus(), t.key("Escape"), true`);
+      await until(`!document.querySelector('[data-pane="memory"]') && !!t.box()`, "the chat");
+      await reopen();
+      // The Feed.
+      await js(`document.querySelector("[data-open-feed]").click(), true`);
+      await until(`!!document.querySelector('[data-pane="feed"]')`, "the Feed");
+      await reopen();
+      // Another dot, then back.
+      await js(`document.querySelector('[data-dot="dio"]').click(), true`);
+      await until(
+        `!document.querySelector('[aria-label="New note"]')?.value`,
+        "dio's pane without jojo's drafts",
+      );
+      await js(`document.querySelector('[data-dot="jojo"]').click(), true`);
+      await reopen();
+      expect(mutations(fake, "/dots/jojo/memory")).toEqual([]);
+      // Add sends the note once and clears it; Cancel discards the trigger; the observation stays.
+      await press('[data-section="notes"]', "Add");
+      await until(
+        `document.querySelector('[aria-label="New note"]').value === ""`,
+        "the sent note",
+      );
+      await press('[data-section="triggers"]', "Cancel");
+      await until(`!document.querySelector('[aria-label="Instruction"]')`, "the discarded trigger");
+      expect(mutations(fake, "/dots/jojo/memory").map((call) => [call.method, call.body])).toEqual([
+        ["POST", { text: "Buy tea" }],
+      ]);
+      await js(`t.cmd("1"), true`);
+      await until(`!document.querySelector('[data-pane="memory"]')`, "the chat");
+      await js(`t.cmd("2"), true`);
+      await until(`!!document.querySelector('[aria-label="New note"]')`, "jojo's memory");
+      expect(await js(drafts)).toEqual({
+        note: "",
+        observation: "Prefers mornings",
+        instruction: undefined,
+        repository: undefined,
+      });
+    },
+  );
+}, 170_000);
+
 test("Memory: a refused edit shows beside the value now, edits send only changed fields, and confirmations gate every change", async () => {
   await scenario(
     "memory",

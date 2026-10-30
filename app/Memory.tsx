@@ -54,16 +54,19 @@ const short = (text: string, limit = 200) =>
 
 type Fields = { goal: string; nextAction: string; status: string };
 type ReminderFields = { due: string; every: string };
+type TriggerDraft = { responsibility: string; repository: string; reasons: string[]; task: string };
 
 interface Kept {
   texts: Drafts<string>;
   fields: Drafts<Fields>;
   reminders: Drafts<ReminderFields>;
   rejected: Map<string, { mine: string; current: string }>;
+  /** Unsent new rows. Only Cancel, or the daemon confirming the text as it was sent, clears one. */
+  creating: { note: string; observation: string; trigger?: TriggerDraft | undefined };
 }
 
-// Unsent edits per dot, kept while the window lives so switching panes, dots or sessions doesn't
-// drop them. Each keeps the version it started from.
+// Unsent edits and new rows per dot, kept while the window lives so switching panes, dots or
+// sessions doesn't drop them. Each edit keeps the version it started from.
 const kept = new Map<string, Kept>();
 
 const keptFor = (dot: string) => {
@@ -74,6 +77,7 @@ const keptFor = (dot: string) => {
       fields: new Drafts(),
       reminders: new Drafts(),
       rejected: new Map(),
+      creating: { note: "", observation: "" },
     };
     kept.set(dot, known);
   }
@@ -312,7 +316,12 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   // Notes.
 
   const [sources, setSources] = useState(new Map<number, string>());
-  const [newNote, setNewNote] = useState("");
+  const creating = drafts.creating;
+  const create = (change: Partial<Kept["creating"]>) => {
+    Object.assign(creating, change);
+    render();
+  };
+  const newNote = creating.note;
 
   const toggleSource = async (note: MemoryNote) => {
     if (sources.has(note.id)) {
@@ -744,7 +753,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
 
   const [older, setOlder] = useState<{ rows: Observation[]; next: number | null }>();
   const [opened, setOpened] = useState(new Map<string, SourceText | string>());
-  const [newObservation, setNewObservation] = useState("");
+  const newObservation = creating.observation;
 
   useEffect(() => setOlder(undefined), [key]);
 
@@ -1034,12 +1043,8 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   };
 
   const [previews, setPreviews] = useState(new Map<number, TriggerPreview | string>());
-  const [draft, setDraft] = useState<{
-    responsibility: string;
-    repository: string;
-    reasons: string[];
-    task: string;
-  }>();
+  const draft = creating.trigger;
+  const setDraft = (trigger: TriggerDraft | undefined) => create({ trigger });
 
   const triggerText = (trigger: FeedTrigger) => {
     const goal = memory?.responsibilities.find((row) => row.id === trigger.responsibility)?.goal;
@@ -1216,7 +1221,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
       }),
     ).then(({ result }) => {
       // Only the draft as it was sent goes; one changed meanwhile stays.
-      if (result?.ok) setDraft((current) => (current === sent ? undefined : current));
+      if (result?.ok && creating.trigger === sent) setDraft(undefined);
     });
   };
 
@@ -1428,7 +1433,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               if (!text) return;
               void mutate("note:new", () => bridge.call("addNote", dot, text)).then(
                 ({ result }) => {
-                  if (result?.ok) setNewNote((current) => (current.trim() === text ? "" : current));
+                  if (result?.ok && creating.note.trim() === text) create({ note: "" });
                 },
               );
             }}
@@ -1437,7 +1442,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               aria-label="New note"
               placeholder="Add a note"
               value={newNote}
-              onChange={(event) => setNewNote(event.target.value)}
+              onChange={(event) => create({ note: event.target.value })}
             />
             <button type="submit" disabled={!newNote.trim() || busy.has("note:new")}>
               Add
@@ -1476,8 +1481,8 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               if (!text) return;
               void mutate("observation:new", () => bridge.call("addObservation", dot, text)).then(
                 ({ result }) => {
-                  if (result?.ok)
-                    setNewObservation((current) => (current.trim() === text ? "" : current));
+                  if (result?.ok && creating.observation.trim() === text)
+                    create({ observation: "" });
                 },
               );
             }}
@@ -1486,7 +1491,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               aria-label="New observation"
               placeholder="Add an observation"
               value={newObservation}
-              onChange={(event) => setNewObservation(event.target.value)}
+              onChange={(event) => create({ observation: event.target.value })}
             />
             <button type="submit" disabled={!newObservation.trim()}>
               Add
