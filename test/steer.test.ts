@@ -47,7 +47,7 @@ const call = (path: string, body?: unknown) =>
     }),
   );
 
-/** Posts the owner's notch message, as the notch does, and returns its saved ID. */
+/** Posts the owner's app message and returns its saved ID. */
 const post = async (body: unknown) => {
   const response = await call("/dots/jojo/messages", body);
   expect(response.status).toBe(202);
@@ -415,7 +415,7 @@ test("over the public client, the saved mode reaches OpenCode, and only the hist
       pending: { id: string; status: string; delivery: string | null }[];
     };
   try {
-    // A turn started in the TUI is running before the owner sends anything from the notch.
+    // A turn started in the TUI is running before the owner sends anything from the app.
     busy = true;
     const opening = await post({ text: "While the TUI works." });
     await poll();

@@ -310,7 +310,7 @@ test("a reply is saved before it is posted under the dot's name, and a lost post
   expect(row(third)?.state).toBe("unknown");
   expect(fake.state.posts).toHaveLength(2);
 
-  // Slack refused: the reply stays in the notch only.
+  // Slack refused: the reply stays in the app only.
   fake.state.post = "refused";
   const fourth = say("last one");
   await pass();

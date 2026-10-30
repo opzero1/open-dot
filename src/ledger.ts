@@ -80,7 +80,7 @@ export const sourcesOf = (db: Db, row: Observation, length = 240) => {
   });
 };
 
-/** A row as the owner's API and the notch show it, with its sources. */
+/** A row as the owner's API and the app show it, with its sources. */
 export const observationView = (db: Db, row: Observation) => ({
   id: row.id,
   version: row.version,
@@ -100,7 +100,7 @@ export const observationView = (db: Db, row: Observation) => ({
 export const ledgerPage = 50;
 
 /**
- * A page of the notch's ledger view: current rows, newest first, older than `before`, with
+ * A page of the app's ledger view: current rows, newest first, older than `before`, with
  * `next` for the page after, and how many rows were superseded.
  */
 export const listLedger = (db: Db, dot: string, before?: number) => {

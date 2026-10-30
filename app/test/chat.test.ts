@@ -453,7 +453,7 @@ test("a send's capture goes once it's delivered, cancelled, from an old session 
 const actions = (status: "sending" | "confirming" | "sent", delivery: string | null) =>
   pendingActions({ id: "p", status, delivery });
 
-test("pending, worker and attachment actions match the notch", () => {
+test("pending, worker and attachment actions follow their state", () => {
   expect(actions("sending", "auto")).toEqual({ sendNow: true, cancel: true });
   expect(actions("sent", "queue")).toEqual({ sendNow: true, cancel: true });
   expect(actions("sent", "steer")).toEqual({ sendNow: false, cancel: true });

@@ -265,7 +265,7 @@ test("the CLI makes a grant only after a yes typed at a terminal", () => {
   }
 });
 
-test("the notch lists a dot's active grants and revokes them, but can't make one", async () => {
+test("the app lists a dot's active grants and revokes them, but can't make one", async () => {
   const db = openDatabase(":memory:");
   for (const name of ["jojo", "dio"])
     db.insert(dots)

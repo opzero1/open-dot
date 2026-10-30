@@ -397,7 +397,7 @@ const noPair = "save your app configuration tokens first, with: open-dot slack c
 
 /** What a dot's app waits for when there's neither a Slack login nor a configuration pair. */
 const loginFirst =
-  "log in to Slack once in the notch's Slack view (Connectors → Slack → Log in to Slack), or create the app yourself from the prefilled link there. A configuration token pair saved with open-dot slack config works too.";
+  "log in to Slack once in the app's Slack view (the dot's ⋯ menu → Slack → Log in to Slack), or create the app yourself from the prefilled link there. A configuration token pair saved with open-dot slack config works too.";
 
 /**
  * A fresh app configuration token for the owner, rotated just now so Slack says whose it is.
@@ -561,7 +561,7 @@ const Exchanged = Schema.Struct({
   is_enterprise_install: Schema.optionalKey(Schema.Boolean),
 });
 
-/** What the notch shows of the Slack login: never a token, a refresh token or a ticket. */
+/** What the app shows of the Slack login: never a token, a refresh token or a ticket. */
 export interface LoginView {
   // "unknown": not read since the daemon started. "relogin": it can't be used; log in again.
   readonly state: "unknown" | "none" | "ready" | "relogin";
@@ -977,7 +977,7 @@ async function installApp(db: Db, setup: Setup, app: SlackApp) {
   const appID = app.appID;
   const token = await cliLogin(setup).token({ id: app.ownerID, team: app.teamID });
   if (!token) {
-    const problem = `log in to Slack in the notch's Slack view to install it, or ${manualInstall(appID).replace(/^Retry install, or /, "")}`;
+    const problem = `log in to Slack in the app's Slack view to install it, or ${manualInstall(appID).replace(/^Retry install, or /, "")}`;
     if (app.problem !== problem) setSeen(db, app, ["created"], { problem });
     return;
   }
@@ -1490,7 +1490,7 @@ export async function provision(db: Db, shared: Slack, setup: Setup = realSetup)
       (app.state === "created" && installOf(app)?.phase === "queued"),
   );
   const login = cliLogin(setup);
-  // Once a daemon start, while some app isn't connected, the login's state is read for the notch.
+  // Once a daemon start, while some app isn't connected, the login's state is read for the app.
   const unsure =
     login.view().state === "unknown" &&
     rows.some((app) => ["unknown", "failed", "created"].includes(app.state));
@@ -1505,7 +1505,7 @@ export async function provision(db: Db, shared: Slack, setup: Setup = realSetup)
         else if (app.state === "attaching") await attach(db, setup, app, { id, team });
         else await installApp(db, setup, app);
       } catch (error) {
-        // Only open-dot's own words are saved, where the notch shows them; anything else is
+        // Only open-dot's own words are saved, where the app shows them; anything else is
         // logged in fixed words and left to the daemon's log line from the setup loop.
         const problem =
           error instanceof Blocked
@@ -1709,7 +1709,7 @@ const looksLike = (token: string, prefix: string) =>
 
 /**
  * Saves the owner's configuration token pair in its Keychain item, which ends a blocked rotation.
- * The CLI and the notch share it. A save and a rotation both write that item, so a save claims
+ * The CLI and the app share it. A save and a rotation both write that item, so a save claims
  * the same "rotating" state a rotation does, only from the row as it read it: idle, blocked, or a
  * claim over a minute old that a stopped process left. It's refused while a rotation runs, which
  * renews its claim just before saving its own pair, so, among open-dot's own processes within
@@ -1933,7 +1933,7 @@ function iconLine(app: SlackApp, appID: string, blocked: string | null) {
     case "refused":
       break;
   }
-  const manual = `Open ${appURL(appID)}/general, scroll to Display Information, upload ${path} under App icon & Preview (square, 512 to 2000 pixels), then click Save Changes. A new avatar, or Retry icon in the notch's Slack view, tries apps.icon.set again.`;
+  const manual = `Open ${appURL(appID)}/general, scroll to Display Information, upload ${path} under App icon & Preview (square, 512 to 2000 pixels), then click Save Changes. A new avatar, or Retry icon in the app's Slack view, tries apps.icon.set again.`;
   return app.iconError === unknownOutcome
     ? `apps.icon.set got no clear answer (${unknownOutcome}), so it may or may not have set the icon, and it's never sent again on its own. Check the icon in Slack. If it isn't the avatar, set it yourself: ${manual}`
     : `Slack refused apps.icon.set (${app.iconError ?? "slack_error"}), so set it yourself. ${manual}`;
@@ -1949,7 +1949,7 @@ export function describe(db: Db, app: SlackApp) {
   switch (app.state) {
     case "requested":
       lines.push(
-        "  The daemon creates the app with your Slack login from the notch's Slack view, and installs it. Without one it uses a configuration token pair saved with open-dot slack config; without either, create the app from the prefilled link in the notch's Slack view.",
+        "  The daemon creates the app with your Slack login from the app's Slack view, and installs it. Without one it uses a configuration token pair saved with open-dot slack config; without either, create the app from the prefilled link in the app's Slack view.",
       );
       break;
     case "creating":
@@ -1980,7 +1980,7 @@ export function describe(db: Db, app: SlackApp) {
         );
         break;
       }
-      if (install) lines.push("  Retry install in the notch's Slack view, or:");
+      if (install) lines.push("  Retry install in the app's Slack view, or:");
       lines.push(
         `  1. Install it: open ${appURL(app.appID)}/install-on-team, click Install, then Allow.`,
         `  2. Under App-Level Tokens at ${appURL(app.appID)}/general, generate a token with the connections:write scope.`,

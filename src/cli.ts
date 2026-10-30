@@ -92,10 +92,10 @@ const usage = `Usage:
   open-dot observation add <name> <text>
                                      Add your own observed row, such as a fact you forgot and want back, once you confirm
 
-Forgetting: forget an observed row in the notch's Memory view. The observer won't note it again
+Forgetting: forget an observed row in the app's Memory view. The observer won't note it again
 from the messages it came from, or with the same text under any topic, but may if you say it again
 in a new message. To erase it completely, forget it and delete its source messages: choose Forget
-and Delete Sources in the notch, or run archive delete for each source message.`;
+and Delete Sources in the app, or run archive delete for each source message.`;
 
 const [command, ...args] = process.argv.slice(2);
 // Before anything opens the database, which would migrate it: doctor only reads.
@@ -488,7 +488,7 @@ const avatar = (name: string, file: string) =>
       return fail(`Couldn't use ${file}: ${image} ${name}'s avatar is unchanged.`);
     return Effect.sync(() => {
       console.log(
-        `Saved ${name}'s avatar (${image.mime === "image/png" ? "PNG" : "JPEG"}, ${image.width}×${image.height}) at ${avatarPath(name)}. The notch shows it within a few seconds.`,
+        `Saved ${name}'s avatar (${image.mime === "image/png" ? "PNG" : "JPEG"}, ${image.width}×${image.height}) at ${avatarPath(name)}. The app shows it within a few seconds.`,
       );
       const warning = iconSizeWarning(image);
       if (warning) console.log(warning);
@@ -580,7 +580,7 @@ const list = Effect.sync(() => {
     );
 });
 
-/** Serves the notch app's API on a fresh port and token, then saves both where only the owner can read them. */
+/** Serves the app's API on a fresh port and token, then saves both where only the owner can read them. */
 const apiToken = randomBytes(32).toString("hex");
 /** Each feed source's latest finished pass, for GET /health. Kept in memory only. */
 const feedPasses: Observations = new Map();

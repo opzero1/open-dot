@@ -28,7 +28,7 @@ export const isReactionEmoji = (value: unknown): value is Reaction["emoji"] =>
 
 const isClassic = (emoji: string) => reactionEmojis.some((classic) => classic === emoji);
 
-/** Fills the notch's second row until the owner has chosen five non-classic emoji of their own. */
+/** Fills the app's second row until the owner has chosen five non-classic emoji of their own. */
 export const fallbackEmojis = ["🧐", "✋", "👀", "🧠", "🔥"] as const;
 
 /** The second row: the owner's five latest non-classic choices, newest first, then fallbacks. */
@@ -43,7 +43,7 @@ export const recentEmojis = (db: Db) => {
   return [...used, ...fallbackEmojis.filter((emoji) => !used.includes(emoji))].slice(0, 5);
 };
 
-/** The notch and the plugin use the same provenance, scoped to the bound conversation. */
+/** The app and the plugin use the same provenance, scoped to the bound conversation. */
 export const messageSources = (db: Db, sessionID: string, ids: string[]) =>
   new Map(
     (ids.length

@@ -1039,7 +1039,7 @@ test("reaction snapshots declare their bounded window and do not leak other bind
   db.$client.close();
 });
 
-test("messages hidden in the notch change nothing the dot sees or can react to", async () => {
+test("messages hidden in the app change nothing the dot sees or can react to", async () => {
   const db = openDatabase(databasePath());
   db.update(dots).set({ sessionState: "ready" }).run();
   const history = [{ id: "msg_owner", type: "user", text: "owner text", time: { created: 0 } }];

@@ -37,7 +37,7 @@ const failure = (error: unknown) => (error instanceof Error ? error.message : St
 
 /**
  * The Slack error codes open-dot repeats, saves or logs. Any other answer is "slack_error", so
- * nothing Slack sends back, which could be anything, reaches the database, a log or the notch.
+ * nothing Slack sends back, which could be anything, reaches the database, a log or the app.
  */
 const slackErrors = new Set([
   "access_denied",
@@ -1305,7 +1305,7 @@ export function slackFeed(client: Slack): Source {
         updatedAt: Math.round(Number(match.ts) * 1000),
       }));
     },
-    // Dismissing hides the item in the notch only.
+    // Dismissing hides the item in the app only.
     markRead: async () => {},
   };
 }

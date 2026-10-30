@@ -28,7 +28,7 @@ export const dots = sqliteTable("dots", {
 export type Dot = typeof dots.$inferSelect;
 
 /**
- * Who last changed a note, responsibility or reminder: the dot, the owner in the notch, or the
+ * Who last changed a note, responsibility or reminder: the dot, the owner in the app, or the
  * daemon's schedule moving or sending a reminder.
  */
 export const memoryActors = ["dot", "owner", "scheduler"] as const;
@@ -114,7 +114,7 @@ export const routeKey = (route: Route | null | undefined) =>
 
 /**
  * The message the owner replied to, as the daemon read it when the reply was sent: from the dot's
- * own conversation in the notch, or a Slack thread's first message. Never taken from the request.
+ * own conversation in the app, or a Slack thread's first message. Never taken from the request.
  */
 export interface QuoteSnapshot {
   // The owner's own words, shown without the framing the dot gets.
@@ -144,7 +144,7 @@ export const outbox = sqliteTable("outbox", {
   state: text({ enum: ["pending", "sent", "cancelled", "held"] }).notNull(),
   // The dot that wrote a dot_message or dot_send. Null for reminders and worker reports.
   fromDot: text("from_dot"),
-  // Typed by the owner in the notch app, as opposed to a notice from open-dot.
+  // Typed by the owner in the app, as opposed to a notice from open-dot.
   fromOwner: integer("from_owner", { mode: "boolean" }).notNull().default(false),
   // A reply to a feed item: the owner's prompt and the item as the daemon read it from its own DB.
   // `text` holds both, with the item framed as data.
@@ -152,7 +152,7 @@ export const outbox = sqliteTable("outbox", {
   route: text({ mode: "json" }).$type<Route>(),
   quote: text({ mode: "json" }).$type<QuoteSnapshot>(),
   ownerText: text("owner_text"),
-  // How OpenCode gets the message. The owner's notch messages start as "auto", and the daemon saves
+  // How OpenCode gets the message. The owner's app messages start as "auto", and the daemon saves
   // "steer" (into a running turn) or "queue" with startedAt, before its first call. Null is "queue":
   // Slack and other notices never steer; a worker request notice does, outside a Slack turn.
   // A dot_send asks for "auto" with steer, or with a later promote;
@@ -168,7 +168,7 @@ export const outbox = sqliteTable("outbox", {
 
 /**
  * A dot's binding to an OpenCode session its owner started. Only the owner makes one active, with
- * `open-dot watch` or in the notch; a dot can only ask ("requested") or let its own go. The daemon
+ * `open-dot watch` or in the app; a dot can only ask ("requested") or let its own go. The daemon
  * reports each turn end, permission or question and long busy spell once, after activation.
  */
 export const supervisions = sqliteTable(
@@ -258,7 +258,7 @@ export interface FeedSnapshot {
   };
 }
 
-/** The classic Tapbacks, in the order of the notch's first row. Any single emoji is allowed. */
+/** The classic Tapbacks, in the order of the app's first row. Any single emoji is allowed. */
 export const reactionEmojis = ["❤️", "👍", "👎", "😂", "‼️", "❓"] as const;
 
 /**
@@ -287,7 +287,7 @@ export const reactions = sqliteTable(
 export type Reaction = typeof reactions.$inferSelect;
 
 /**
- * The non-classic emoji the owner last chose in the notch, newest with the highest `seq`, for the
+ * The non-classic emoji the owner last chose in the app, newest with the highest `seq`, for the
  * menu's second row. Only the owner's choices are kept, never a dot's, and a choice stays here
  * after its reaction is replaced or removed. Only the latest five are kept.
  */
@@ -298,7 +298,7 @@ export const recentReactions = sqliteTable("recent_reactions", {
 });
 
 /**
- * Messages the owner deleted from the notch chat, in the session they were seen in. Only the notch
+ * Messages the owner deleted from the app chat, in the session they were seen in. Only the app
  * hides them: OpenCode history, the dot's context, reactions and delivery are unchanged.
  */
 export const hiddenMessages = sqliteTable(
@@ -1041,7 +1041,7 @@ export const slackConfig = sqliteTable("slack_config", {
   id: integer().primaryKey(),
   // "rotating": a rotation, or the owner's save of a new pair (with from_iat -1), may be writing
   // the Keychain item. "blocked": a rotation's outcome or its save was lost, and the owner saves a
-  // new token pair with `open-dot slack config` or the notch.
+  // new token pair with `open-dot slack config` or the app.
   state: text({ enum: ["idle", "rotating", "blocked"] }).notNull(),
   // When the saved pair was issued, so a recovered rotation can tell whether its pair was saved.
   fromIat: integer("from_iat"),

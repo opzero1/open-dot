@@ -17,7 +17,7 @@ export interface Endpoint {
 }
 
 /**
- * Plain http to 127.0.0.1 or [::1] with a port and nothing else, like the notch's `API.loopback`,
+ * Plain http to 127.0.0.1 or [::1] with a port and nothing else,
  * so the token never leaves this Mac's daemon.
  */
 export const loopbackEndpoint = (input: unknown): Endpoint | undefined => {
@@ -565,7 +565,7 @@ export const keepSent = (
   return new Map([...next].toSorted(([, a], [, b]) => b.at - a.at).slice(0, sentLimit));
 };
 
-/** Send now and Cancel, as the notch offers them: nothing while open-dot confirms a send. */
+/** Send now and Cancel: nothing while open-dot confirms a send. */
 export const pendingActions = (pending: PendingView) => ({
   sendNow:
     pending.status === "sending" || (pending.status === "sent" && pending.delivery === "queue"),

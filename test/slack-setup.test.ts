@@ -602,7 +602,7 @@ test("Slack's own words, odd error codes and IDs are never saved, logged or show
     await pass();
     expect(app()).toMatchObject({ iconState: "refused", iconError: "slack_error" });
 
-    // An export refused with odd words, through the notch's update.
+    // An export refused with odd words, through the app's update.
     db.update(slackApps).set({ manifestVersion: null }).run();
     fake.state.exportAnswer = { ok: false, error: leak };
     const update = await call("/dots/jojo/slack/update", { method: "POST" });
@@ -743,7 +743,7 @@ test("a rotation that outlives its claim saves nothing over the owner's pair and
   expect(db.select().from(slackConfig).get()?.state).toBe("idle");
 });
 
-test("the notch's config save is refused while a rotation runs, echoing nothing", async () => {
+test("the app's config save is refused while a rotation runs, echoing nothing", async () => {
   savePair();
   const before = fake.state.keychain.get(configItem);
   db.insert(slackConfig).values({ id: 1, state: "rotating", fromIat: 0, updatedAt: time }).run();
@@ -966,7 +966,7 @@ test("the Slack routes need the token, check every body, save tokens only in the
   expect((await send("/dots/jojo/slack?x=1")).status).toBe(400);
 });
 
-test("the notch's view shows the icon's refusal, and its retry sets the icon again", async () => {
+test("the app's view shows the icon's refusal, and its retry sets the icon again", async () => {
   created("jojo");
   savePair();
   setAvatarFile("jojo", png(1024, 1));
@@ -1006,7 +1006,7 @@ test("the notch's view shows the icon's refusal, and its retry sets the icon aga
   expect((await call("/dots/jojo/slack/icon", { method: "POST" })).status).toBe(409);
 });
 
-test("the notch's manifest update shows the changes first and sends only the ones the owner approved", async () => {
+test("the app's manifest update shows the changes first and sends only the ones the owner approved", async () => {
   created("jojo");
   db.update(slackApps).set({ manifestVersion: null }).run();
   savePair();
@@ -2032,7 +2032,7 @@ test("issue50: concurrent uses of the login refresh it once, a login finished me
 
 test("issue50: a replacement the owner confirmed for one app is refused once another is bound, before any call or write", async () => {
   userToken();
-  // The notch showed AJOJO01 and the owner confirmed replacing it; meanwhile AMIDDLE01 was bound.
+  // The app showed AJOJO01 and the owner confirmed replacing it; meanwhile AMIDDLE01 was bound.
   created("jojo", "active");
   db.update(slackApps).set({ appID: "AMIDDLE01", botID: "BMID", botUser: "UMID" }).run();
   fake.state.answers.set("bots.info", { ok: true, bot: { app_id: "ANEWAPP01", user_id: "UBOT" } });

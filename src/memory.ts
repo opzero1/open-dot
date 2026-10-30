@@ -210,7 +210,7 @@ export const reminderView = (row: Reminder) => ({
   state: row.state,
 });
 
-/** What the dot's memory snapshot draws from, as the notch shows it. */
+/** What the dot's memory snapshot draws from, as the app shows it. */
 export const readMemory = (db: Db, dot: string) => ({
   notes: db
     .select()

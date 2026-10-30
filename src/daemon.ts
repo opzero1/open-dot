@@ -379,7 +379,7 @@ export const deliver = (db: Db, queued: Message) =>
   );
 
 /**
- * How an owner's notch message joins its session: steered into a running turn, or queued when the
+ * How an owner's app message joins its session: steered into a running turn, or queued when the
  * session is idle. OpenCode delivers every steer before any queued input, so a queued input still
  * waiting in the inbox, such as a worker report, keeps the owner's message queued behind it.
  */
@@ -828,7 +828,7 @@ export const advanceWorkers = (db: Db) =>
   });
 
 const stopNotice = (worker: Worker) =>
-  `Your owner stopped worker #${worker.id} from the notch. Its session is ${worker.sessionID} in ${worker.directory}${onBranch(worker)}. Nothing queued for it will be sent, and it won't report back. Don't start it again unless your owner asks.
+  `Your owner stopped worker #${worker.id} from the app. Its session is ${worker.sessionID} in ${worker.directory}${onBranch(worker)}. Nothing queued for it will be sent, and it won't report back. Don't start it again unless your owner asks.
 Task: ${headline(worker.task)}`;
 
 /**

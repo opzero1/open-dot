@@ -161,7 +161,7 @@ const serveAsset = async (request: Request) => {
   }
 };
 
-// The daemon, found from api.json the way the notch finds it.
+// The daemon, found from api.json the way the app finds it.
 
 const home = process.env.OPEN_DOT_HOME
   ? resolve(process.env.OPEN_DOT_HOME.replace(/^~(?=$|\/)/, homedir()))

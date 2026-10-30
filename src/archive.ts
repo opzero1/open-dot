@@ -157,7 +157,7 @@ export const saveArchiveSettings = (db: Db, dot: string, change: Switches, now: 
     { behavior: "immediate" },
   );
 
-/** What the notch shows about a dot's archive: its switches and how far it has got. */
+/** What the app shows about a dot's archive: its switches and how far it has got. */
 export const archiveStatus = (db: Db, dot: Dot) => {
   const settings = settingsOf(db, dot.name);
   const cursor = db.select().from(archiveCursors).where(eq(archiveCursors.dot, dot.name)).get();

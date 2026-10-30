@@ -19,7 +19,7 @@ import { validName } from "./dots";
 import { home } from "./home";
 import { redact } from "./memory";
 
-/** The most UTF-8 bytes of instructions the notch reads or saves. */
+/** The most UTF-8 bytes of instructions the app reads or saves. */
 export const instructionsLimit = 64 * 1024;
 /** How many earlier versions are kept for revert. */
 export const historyLimit = 10;
@@ -115,7 +115,7 @@ const readText = (path: string, label: string): Text | undefined | Failure => {
     if (!info.isFile() || info.ino !== before.ino || info.dev !== before.dev) return refused;
     const tooLarge = {
       status: 413,
-      error: `${label} is over 64 KiB, so the notch can't edit it. Edit the file in an editor instead.`,
+      error: `${label} is over 64 KiB, so the app can't edit it. Edit the file in an editor instead.`,
     } as const;
     if (info.size > instructionsLimit) return tooLarge;
     // One byte past the limit, so growth since the stat is noticed rather than cut off.
@@ -132,10 +132,10 @@ const readText = (path: string, label: string): Text | undefined | Failure => {
     try {
       text = decoder.decode(bytes);
     } catch {
-      return { status: 422, error: `${label} isn't UTF-8 text, so the notch can't edit it.` };
+      return { status: 422, error: `${label} isn't UTF-8 text, so the app can't edit it.` };
     }
     if (text.includes("\0"))
-      return { status: 422, error: `${label} contains NUL bytes, so the notch can't edit it.` };
+      return { status: 422, error: `${label} contains NUL bytes, so the app can't edit it.` };
     return { bytes: Buffer.from(bytes), mode: info.mode & 0o777 };
   } finally {
     closeSync(fd);

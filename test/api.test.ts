@@ -946,12 +946,12 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
 test("messages say who wrote each one, and hide the mechanics", async () => {
   queued("msg_2", "Reminder: stretch.", {});
   queued("msg_3", "framed", { fromDot: "polnareff" });
-  queued("msg_4", "From the notch", { fromOwner: true });
+  queued("msg_4", "From the app", { fromOwner: true });
   fake.state.history.set("ses_jojo", [
     entry("msg_1", "user", "Typed in OpenCode"),
     entry("msg_2", "user", "Reminder: stretch."),
     entry("msg_3", "user", "framed"),
-    entry("msg_4", "user", "From the notch"),
+    entry("msg_4", "user", "From the app"),
     entry("msg_5", "assistant", "", ["shell", "dot_delegate"]),
     entry("msg_6", "assistant", "", ["context_compact", "read"]),
     entry("msg_7", "assistant", "Done.", ["read"]),
@@ -1067,7 +1067,7 @@ test("Clear all dismisses exactly the shown IDs, after checking the whole reques
   db.$client.run("drop trigger refuse");
   expect(states()).toEqual(before);
 
-  // An item that arrived after the notch's read stays; the handed-off one is unchanged.
+  // An item that arrived after the app's read stays; the handed-off one is unchanged.
   db.insert(feed)
     .values({ ...at, sourceID: "c", title: "Later", updatedAt: 30, state: "unread" })
     .run();
@@ -1208,7 +1208,7 @@ test("a session-pinned image read refuses a wrong or rebinding session, and unpi
   for (const query of ["?sessionID=", `?sessionID=${"s".repeat(256)}`])
     expect((await pinnedImage(query)).status).toBe(400);
 
-  // The notch captured ses_jojo, but the dot was rebound before it asked.
+  // The app captured ses_jojo, but the dot was rebound before it asked.
   db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
   let reads = 0;
   fake.state.onMessage = () => {
@@ -1718,7 +1718,7 @@ test("hiding works for every visible kind, keeps its first time, and changes no 
   }
   const markers = db.select().from(hiddenMessages).all();
   expect(markers).toHaveLength(4);
-  // Hidden messages stay in the response, so the notch can still match pending sends by ID.
+  // Hidden messages stay in the response, so the app can still match pending sends by ID.
   expect(await listed()).toMatchObject([
     { id: "msg_owner", kind: "owner", sessionID: "ses_jojo", hidden: true },
     { id: "msg_notice", kind: "notice", sessionID: "ses_jojo", hidden: true },
@@ -1904,8 +1904,8 @@ test("an app send with its own ID is saved once, repeats answer the same row, an
     { text: "x", messageID: "nope", sessionID: "ses_jojo" },
   ])
     expect((await reply("jojo", body)).status).toBe(400);
-  // The notch still sends without an ID and gets one the daemon made.
-  expect((await reply("jojo", { text: "From the notch" })).status).toBe(202);
+  // The app still sends without an ID and gets one the daemon made.
+  expect((await reply("jojo", { text: "From the app" })).status).toBe(202);
   expect(db.select().from(outbox).all()).toHaveLength(2);
   // The ID belongs to this dot's session, so another dot can't take it either.
   const other = await reply("polnareff", {

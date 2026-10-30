@@ -144,7 +144,7 @@ const framed = /<dot-message from="[^"]*">\n([\s\S]*)\n<\/dot-message>$/;
 const kinds = (rows: readonly WorkerRequest[]) => [...new Set(rows.map((row) => row.kind))];
 
 /**
- * What a worker's requests mean for the notch: `needs`, the kinds its owner should look at now
+ * What a worker's requests mean for the app: `needs`, the kinds its owner should look at now
  * (an unknown answer, even once the request is gone, or a waiting request escalated or past the
  * grace period); `waiting`, the kinds its dot is handling; and `answered`, a few words about the
  * dot's latest answer.
@@ -168,7 +168,7 @@ const requestsView = (rows: readonly WorkerRequest[], now: number) => {
 };
 
 /**
- * A worker as the notch shows it. A stopping or finished worker waits on nothing, but an answer
+ * A worker as the app shows it. A stopping or finished worker waits on nothing, but an answer
  * whose outcome is unknown still needs its owner.
  */
 const workerView = (worker: Worker, rows: readonly WorkerRequest[] = [], now = Date.now()) => {
@@ -211,7 +211,7 @@ const sessionsView = (rows: readonly WorkerRequest[], now: number) =>
       : [];
   });
 
-/** Whether the dot has an avatar, and a revision the notch reloads it on whenever it changes. */
+/** Whether the dot has an avatar, and a revision the app reloads it on whenever it changes. */
 const avatarView = (name: string) => {
   const revision = avatarRevision(name);
   return revision ? { revision } : null;
@@ -486,7 +486,7 @@ const slackBody = async (
 };
 
 /**
- * A dot's Slack app as `open-dot slack status` sees it, for the notch: its state, problem, the
+ * A dot's Slack app as `open-dot slack status` sees it, for the app: its state, problem, the
  * manifest and icon, and the configuration token's state. Never a token: none is kept here.
  * `config.saved` says open-dot once saved or rotated a pair, not that one is in the Keychain now.
  * `ownerFeed` is what the owner's own Slack feed saved, apart from the dot's bot, and `dmCheck`
@@ -602,7 +602,7 @@ const slackLoginRoute = async (request: Request, path: string[], setup: Setup) =
 };
 
 /**
- * A dot's Slack app from the notch, sharing the CLI's code: `GET /dots/<name>/slack` reads its
+ * A dot's Slack app from the app, sharing the CLI's code: `GET /dots/<name>/slack` reads its
  * state, and POST `…/slack/connect` (`{retry?}`), `…/attach` (`{appID}`), `…/tokens`
  * (`{kind: "bot" | "app", token}`), `…/install` (`{}`, the owner's Retry install with the Slack
  * login), `…/link` (`{bot, app, replaceAppID?}`, an app the owner made, checked with Slack,
@@ -681,7 +681,7 @@ const slackRoute = async (
           approve.length > 20 ||
           !approve.every((change) => typeof change === "string" && change.length <= 4000))
       )
-        return error(400, "approve must be the list of changes the notch showed.");
+        return error(400, "approve must be the list of changes the app showed.");
       const approved = (changes: readonly string[]) =>
         approve !== undefined && Bun.deepEquals([...changes], approve);
       const asked: { changes?: readonly string[] } = {};
@@ -774,8 +774,8 @@ const hiddenIDs = (db: Db, dot: Dot, ids: string[]) =>
   );
 
 /**
- * The messages the notch can show, newest last: who wrote each one (the owner, the dot, another
- * dot, or open-dot itself, a notice), with its reactions and whether the owner hid it in the notch.
+ * The messages the app can show, newest last: who wrote each one (the owner, the dot, another
+ * dot, or open-dot itself, a notice), with its reactions and whether the owner hid it in the app.
  */
 const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
   const ids = entries.map((item) => item.id);
@@ -786,11 +786,11 @@ const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
     const base = {
       id: item.id,
       sessionID: dot.sessionID,
-      // Hidden messages stay listed, so the notch can still match its pending sends by ID.
+      // Hidden messages stay listed, so the app can still match its pending sends by ID.
       hidden: hidden.has(item.id),
       text: item.text,
       tools: item.tools,
-      // Metadata only: the notch loads each image's bytes on its own.
+      // Metadata only: the app loads each image's bytes on its own.
       attachments: item.files.map((file, index) => ({
         index,
         mime: file.mime,
@@ -956,7 +956,7 @@ const conversationMessage = (db: Db, dot: Dot, id: string, request: Request) =>
   });
 
 /**
- * Where each of the owner's notch messages stands before it reaches the history: "sending" while
+ * Where each of the owner's app messages stands before it reaches the history: "sending" while
  * open-dot holds it, "confirming" once a call began whose outcome it is still checking by ID, and
  * "sent" once OpenCode admitted it. A message in the history has been delivered to the dot.
  * Nothing says whether the model has read it: OpenCode reports no such thing.
@@ -1029,7 +1029,7 @@ const receipt = (db: Db, dot: Dot, id: string, request: Request) =>
   });
 
 /**
- * Steers one of the owner's queued notch messages into the dot's running turn, or cancels it.
+ * Steers one of the owner's queued app messages into the dot's running turn, or cancels it.
  * The ID is the message's own; only a message still waiting outside the history can change.
  */
 const changePending = (db: Db, dot: Dot, id: string, request: Request) =>
@@ -1122,7 +1122,7 @@ const react = (db: Db, dot: Dot, id: string, request: Request, commit: () => boo
     )
       return error(400, "Send {emoji: exactly one emoji, or null to remove, sessionID?}.");
     if (dot.sessionState !== "ready") return error(404, "There's no such dot message.");
-    // The app pins the session it saw the message in; the notch's older requests don't.
+    // The app pins the session it saw the message in; the app's older requests don't.
     if ("sessionID" in body && body.sessionID !== dot.sessionID)
       return error(409, "The dot's conversation changed. Refresh before reacting.");
     const target = yield* (yield* OpenCode).message({ sessionID: dot.sessionID, messageID: id });
@@ -1140,7 +1140,7 @@ const react = (db: Db, dot: Dot, id: string, request: Request, commit: () => boo
   });
 
 /**
- * Hides a message in the notch only, for the session the owner saw it in. A repeat keeps the first
+ * Hides a message in the app only, for the session the owner saw it in. A repeat keeps the first
  * time. Nothing is sent, and OpenCode history, the dot's context and reactions are unchanged.
  */
 const hide = (db: Db, dot: Dot, id: string, request: Request, commit: () => boolean) =>
@@ -1205,7 +1205,7 @@ const hide = (db: Db, dot: Dot, id: string, request: Request, commit: () => bool
     return Response.json({ hidden: marker });
   });
 
-// The raster types the notch may decode, by the bytes each file starts with. Undefined matches any
+// The raster types the app may decode, by the bytes each file starts with. Undefined matches any
 // byte. SVG and other types aren't served, so they show only as a name.
 const images = new Map<string, readonly (number | undefined)[]>(
   Object.entries({
@@ -1565,7 +1565,7 @@ const isFeedID = (id: unknown): id is number =>
   typeof id === "number" && Number.isSafeInteger(id) && id > 0;
 
 /**
- * Dismisses exactly the unread items the notch showed when the owner chose Clear all, never every
+ * Dismisses exactly the unread items the app showed when the owner chose Clear all, never every
  * unread item, so ones that arrived since stay. Each ID is answered as a single dismiss would be.
  */
 const dismissShown = async (db: Db, request: Request) => {
@@ -2236,7 +2236,7 @@ const route = (
 };
 
 /**
- * Moves the dot to a new session, keeping its memory: the owner's own action, from the notch's
+ * Moves the dot to a new session, keeping its memory: the owner's own action, from the app's
  * confirmed menu item or `open-dot fresh`. Takes `{}` or `{ "force": true }`, at most 1 KiB.
  */
 const freshRoute = (db: Db, dot: Dot, request: Request) =>
@@ -2277,7 +2277,7 @@ export const spawnRun: Run = async (argv, input) => {
       stdin: input === undefined ? "ignore" : Buffer.from(input),
       stdout: "ignore",
       stderr: "pipe",
-      // A macOS Automation prompt waits for the owner. Give up before the notch's 10 s request does,
+      // A macOS Automation prompt waits for the owner. Give up before the app's 10 s request does,
       // so it hears the clipboard fallback rather than nothing.
       timeout: 8_000,
     });
@@ -2473,7 +2473,7 @@ const healthRoute = (request: Request, health: (() => Promise<HealthReport>) | u
       );
 
 /**
- * The daemon's local API for the notch app. Every request needs the token, which only the owner's
+ * The daemon's local API for the app. Every request needs the token, which only the owner's
  * account can read from api.json, so other local users and web pages can't call it.
  * The feed doesn't need OpenCode, so it works while OpenCode is down.
  */
@@ -2635,7 +2635,7 @@ export const api = (
       });
     if (path[0] === "dots" && path[2] === "slack")
       return slackRoute(db, request, path, setup, dmChecks).catch(() => {
-        console.error("Slack setup: a request from the notch failed.");
+        console.error("Slack setup: a request from the app failed.");
         return error(
           500,
           "Couldn't confirm the change to the dot's Slack app. Check its state before trying again.",

@@ -33,7 +33,7 @@ const answerWait = 30 * 60_000;
 const unknownBusy = 2 * 60 * 60_000;
 const ledgerRows = 150;
 
-/** The owner's words for the daily budget, in the notch and the docs alike. */
+/** The owner's words for the daily budget, in the app and the docs alike. */
 export const dailyBudgetNote =
   "Daily budget. One in-flight job can overshoot it, and then the observer stops until tomorrow.";
 /** Model calls one chunk gets in a day: the first and its retries, each charged. */

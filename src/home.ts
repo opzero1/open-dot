@@ -5,7 +5,7 @@ export const home = () => process.env.OPEN_DOT_HOME ?? join(homedir(), ".opendot
 
 export const databasePath = () => join(home(), "open-dot.db");
 
-/** Where the daemon writes its local API's URL and token for the notch app. */
+/** Where the daemon writes its local API's URL and token for the app. */
 export const apiPath = () => join(home(), "api.json");
 
 export const dotDirectory = (name: string) => join(home(), "dots", name);
