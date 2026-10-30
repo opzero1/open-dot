@@ -1129,3 +1129,80 @@ button:disabled {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* GitHub alerts, folded code and file-type badges. */
+.markdown blockquote.markdown-alert {
+  border-left-width: 3px;
+  border-left-style: solid;
+  padding: 4px 10px;
+  color: inherit;
+}
+
+.markdown-alert-title {
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+.markdown-alert-note {
+  border-left-color: #0969da;
+}
+.markdown-alert-note .markdown-alert-title {
+  color: #0969da;
+}
+.markdown-alert-tip {
+  border-left-color: #1a7f37;
+}
+.markdown-alert-tip .markdown-alert-title {
+  color: #1a7f37;
+}
+.markdown-alert-important {
+  border-left-color: #8250df;
+}
+.markdown-alert-important .markdown-alert-title {
+  color: #8250df;
+}
+.markdown-alert-warning {
+  border-left-color: #9a6700;
+}
+.markdown-alert-warning .markdown-alert-title {
+  color: #9a6700;
+}
+.markdown-alert-caution {
+  border-left-color: #cf222e;
+}
+.markdown-alert-caution .markdown-alert-title {
+  color: #cf222e;
+}
+
+.code-language {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.file-icon {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 0 3px;
+  border-radius: 3px;
+  color: #fff;
+  font: 600 9px/14px var(--mono);
+  text-align: center;
+  margin-right: 4px;
+}
+
+.code-fold {
+  display: block;
+  width: 100%;
+  border: none;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  padding: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+}
+
+.code-block.folded pre {
+  mask-image: linear-gradient(to bottom, #000 70%, transparent);
+}
