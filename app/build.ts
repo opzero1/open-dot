@@ -21,6 +21,26 @@ for (const name of ["main", "preload"]) {
   if (!result.success) throw new AggregateError(result.logs, `The ${name} build failed.`);
 }
 
+// The clipboard helper Slack pickup needs, built from source; packaging keeps it outside the ASAR
+// archive, where it can run, and signs it ad hoc with the app.
+const helper = Bun.spawnSync(
+  [
+    "xcrun",
+    "--sdk",
+    "macosx",
+    "clang",
+    "-fobjc-arc",
+    "-O2",
+    "-framework",
+    "AppKit",
+    "-o",
+    join(out, "clipboard-helper"),
+    join(root, "clipboard.m"),
+  ],
+  { stdout: "inherit", stderr: "inherit" },
+);
+if (helper.exitCode !== 0) throw new Error("The clipboard helper build failed.");
+
 const manifest: unknown = await Bun.file(join(root, "..", "package.json")).json();
 const version =
   typeof manifest === "object" && manifest !== null && "version" in manifest

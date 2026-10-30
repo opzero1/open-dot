@@ -14,5 +14,6 @@
     "identity": "-",
     "category": "public.app-category.productivity",
     "hardenedRuntime": false
-  }
+  },
+  "asarUnpack": ["clipboard-helper"]
 }

@@ -6,6 +6,7 @@ import {
   BrowserWindow,
   clipboard,
   ClipboardItem,
+  dialog,
   globalShortcut,
   ipcMain,
   type IpcMainInvokeEvent,
@@ -30,8 +31,11 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
+import { type ChildProcessByStdio, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import type { Readable, Writable } from "node:stream";
 import { homedir, tmpdir } from "node:os";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import {
@@ -42,6 +46,10 @@ import {
   channels,
   type DraftImage,
   eventChannel,
+  type Operation,
+  type PickupState,
+  type PickupStep,
+  type Reply,
   type ReceiptStatus,
   type Result,
   type SendResult,
@@ -59,6 +67,14 @@ import {
   sendOutcome,
   settled,
 } from "./chat";
+import {
+  isSlackAppID,
+  linkAppID,
+  pickupAfter,
+  pickupMilliseconds,
+  pickupNames,
+  tokenMatches,
+} from "./slack";
 
 // The smoke test runs the app hidden against a fake daemon, with native integrations recorded
 // instead of used; it never shows or focuses a window.
@@ -71,6 +87,8 @@ const recorded = {
   openExternal: [] as string[],
   clipboard: [] as { text?: string; images?: number }[],
   shares: [] as { texts: number; files: number; directory: string }[],
+  saves: [] as { name: string; bytes: number }[],
+  quitPrompts: 0,
 };
 
 if (process.env.OPEN_DOT_APP_DATA) app.setPath("userData", resolve(process.env.OPEN_DOT_APP_DATA));
@@ -256,7 +274,7 @@ const exchange = (
 const unreached = ({ failed, lost }: { failed: string; lost: boolean }): Result<never> =>
   lost ? { ok: false, error: failed, lost } : { ok: false, error: failed, status: 0 };
 
-const failure = (answer: Answer): Result<never> => {
+const failure = (answer: Answer): { ok: false; error: string; status: number } => {
   let text = `The daemon answered ${answer.status}.`;
   try {
     const parsed: unknown = JSON.parse(answer.body.toString("utf8"));
@@ -420,12 +438,13 @@ const messageIDPattern = /^msg_[\w-]{1,100}$/;
 
 const send = async (input: unknown): Promise<SendResult> => {
   if (!isRecord(input)) return refused("Bad send.");
-  const { dot, sessionID, text, replyTo, images } = input;
+  const { dot, sessionID, text, replyTo, feed, images } = input;
   if (
     !isName(dot) ||
     !isName(sessionID) ||
     !isText(text, 1_000_000) ||
     (replyTo !== undefined && !isName(replyTo)) ||
+    (feed !== undefined && (!isID(feed) || replyTo !== undefined)) ||
     !Array.isArray(images) ||
     images.length > imageLimits.count ||
     !images.every(validImage)
@@ -458,7 +477,7 @@ const send = async (input: unknown): Promise<SendResult> => {
     }
     let outcome: SendResult;
     try {
-      outcome = await post(target, key, attempt, text, replyTo, images);
+      outcome = await post(target, key, attempt, text, replyTo, feed, images);
     } catch {
       // Whatever failed, the POST may have reached the daemon: the record stays to reconcile.
       return {
@@ -496,6 +515,7 @@ const post = async (
   { dot, sessionID, messageID }: Attempt,
   text: string,
   replyTo: string | undefined,
+  feed: number | undefined,
   images: DraftImage[],
 ): Promise<SendResult> => {
   const result = await json(
@@ -506,6 +526,7 @@ const post = async (
       messageID,
       sessionID,
       ...(replyTo ? { replyTo } : {}),
+      ...(feed !== undefined ? { feed } : {}),
       ...(images.length
         ? {
             files: images.map((image) => ({
@@ -780,6 +801,885 @@ const openLink = async (raw: unknown) => {
   return true;
 };
 
+// The daemon's other surfaces: each operation the renderer names becomes one request main builds
+// from checked arguments. A 409 keeps the daemon's `current` value; a 204 is success.
+
+/** One request whose answer keeps a conflict's current value and treats an empty success as done. */
+const reply = async (
+  method: string,
+  path: string,
+  body?: unknown,
+  timeout?: number,
+  limit?: number,
+): Promise<Reply<unknown>> => {
+  const answer = await exchange(current(), method, path, body, timeout, limit);
+  if ("failed" in answer) return unreached(answer);
+  if (answer.status >= 200 && answer.status < 300) {
+    if (answer.status === 204 || answer.body.length === 0) return { ok: true, value: true };
+    try {
+      return { ok: true, value: JSON.parse(answer.body.toString("utf8")) as unknown };
+    } catch {
+      return {
+        ok: false,
+        error: "The daemon's answer wasn't understood.",
+        status: answer.status,
+        lost: true,
+      };
+    }
+  }
+  const failed = failure(answer);
+  if (answer.status !== 409) return failed;
+  try {
+    const parsed: unknown = JSON.parse(answer.body.toString("utf8"));
+    if (isRecord(parsed) && "current" in parsed) return { ...failed, current: parsed.current };
+  } catch {}
+  return failed;
+};
+
+const isVersion = (value: unknown): value is number => isID(value);
+const isQuery = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0 && value.length <= 200;
+const isOffset = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000;
+const isMessageID = (value: unknown): value is string =>
+  typeof value === "string" && /^msg_[\w-]{1,100}$/.test(value);
+const isRevision = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+const memoryText = (value: unknown): value is string =>
+  typeof value === "string" && value.length <= 2000;
+const optionalID = (value: unknown) => value === null || isID(value);
+
+interface Built {
+  method: string;
+  path: string;
+  body?: unknown;
+  timeout?: number;
+}
+
+/** The request for an operation, or undefined when its arguments aren't what it takes. */
+const build = (op: Operation, args: unknown[]): Built | undefined => {
+  const [dot, a, b, c] = args;
+  const base = isName(dot) ? `/dots/${segment(dot)}` : undefined;
+  const memory = base && `${base}/memory`;
+  switch (op) {
+    case "feed":
+      return { method: "GET", path: "/feed" };
+    case "dismiss":
+      return isID(dot) ? { method: "POST", path: `/feed/${dot}/dismiss` } : undefined;
+    case "dismissAll":
+      return Array.isArray(dot) && dot.length > 0 && dot.length <= 1000 && dot.every(isID)
+        ? { method: "POST", path: "/feed/dismiss", body: { ids: dot } }
+        : undefined;
+    case "health":
+      return { method: "GET", path: "/health", timeout: 30_000 };
+    case "slackLogin":
+      return { method: "POST", path: "/slack/login", body: {}, timeout: 30_000 };
+  }
+  if (!base || !memory) return undefined;
+  switch (op) {
+    case "memory":
+      return { method: "GET", path: memory };
+    case "observations":
+      return isID(a) ? { method: "GET", path: `${memory}/observations?before=${a}` } : undefined;
+    case "observationSource":
+      return isID(a) && isMessageID(b)
+        ? { method: "GET", path: `${memory}/observations/${a}/sources/${segment(b)}` }
+        : undefined;
+    case "noteSource":
+      return isID(a)
+        ? { method: "GET", path: `${memory}/notes/${a}/source`, timeout: 30_000 }
+        : undefined;
+    case "search":
+      return isQuery(a)
+        ? { method: "GET", path: `${memory}/search?q=${segment(a.trim())}` }
+        : undefined;
+    case "recall":
+      return isQuery(a) && isOffset(b)
+        ? { method: "GET", path: `${memory}/recall?q=${segment(a.trim())}&offset=${b}` }
+        : undefined;
+    case "archived":
+      return isMessageID(a) && isOffset(b)
+        ? { method: "GET", path: `${memory}/archive/${segment(a)}?offset=${b}` }
+        : undefined;
+    case "archiveStatus":
+      return { method: "GET", path: `${memory}/archive` };
+    case "runs":
+      return isID(a) && optionalID(b)
+        ? {
+            method: "GET",
+            path: `${memory}/responsibilities/${a}/runs${b === null ? "" : `?before=${b}`}`,
+          }
+        : undefined;
+    case "requests":
+      return optionalID(a)
+        ? { method: "GET", path: `${base}/requests${a === null ? "" : `?before=${a}`}` }
+        : undefined;
+    case "addNote":
+      return memoryText(a)
+        ? { method: "POST", path: `${memory}/notes`, body: { text: a } }
+        : undefined;
+    case "addObservation":
+      return memoryText(a)
+        ? { method: "POST", path: `${memory}/observations`, body: { text: a } }
+        : undefined;
+    case "editNote":
+    case "editObservation":
+      return isID(a) && isVersion(b) && memoryText(c)
+        ? {
+            method: "PATCH",
+            path: `${memory}/${op === "editNote" ? "notes" : "observations"}/${a}`,
+            body: { version: b, text: c },
+          }
+        : undefined;
+    case "deleteNote":
+    case "cancelReminder":
+      return isID(a) && isVersion(b)
+        ? {
+            method: "DELETE",
+            path: `${memory}/${op === "deleteNote" ? "notes" : "reminders"}/${a}?version=${b}`,
+          }
+        : undefined;
+    case "forgetObservation":
+      return isID(a) && isVersion(b) && typeof c === "boolean"
+        ? {
+            method: "DELETE",
+            path: `${memory}/observations/${a}?version=${b}${c ? "&sources=true" : ""}`,
+          }
+        : undefined;
+    case "editResponsibility": {
+      if (!isID(a) || !isVersion(b) || !isRecord(c)) return undefined;
+      const change: Record<string, string> = {};
+      for (const [key, value] of Object.entries(c)) {
+        if (!["goal", "nextAction", "status"].includes(key) || !memoryText(value)) return undefined;
+        change[key] = value;
+      }
+      if (!Object.keys(change).length) return undefined;
+      return {
+        method: "PATCH",
+        path: `${memory}/responsibilities/${a}`,
+        body: { version: b, ...change },
+      };
+    }
+    case "editReminder": {
+      if (!isID(a) || !isVersion(b) || !isRecord(c)) return undefined;
+      const change: Record<string, number | null> = {};
+      for (const [key, value] of Object.entries(c)) {
+        if (key === "dueAt" && typeof value === "number" && Number.isSafeInteger(value))
+          change.dueAt = value;
+        else if (key === "everyMinutes" && (value === null || isID(value)))
+          change.everyMinutes = value;
+        else return undefined;
+      }
+      if (!Object.keys(change).length) return undefined;
+      return { method: "PATCH", path: `${memory}/reminders/${a}`, body: { version: b, ...change } };
+    }
+    case "deleteArchived":
+      return isMessageID(a)
+        ? { method: "DELETE", path: `${memory}/archive/${segment(a)}` }
+        : undefined;
+    case "approveWatch":
+      return isID(a) ? { method: "POST", path: `${memory}/supervisions/${a}/approve` } : undefined;
+    case "endWatch":
+      return isID(a) ? { method: "DELETE", path: `${memory}/supervisions/${a}` } : undefined;
+    case "revokeGrant":
+      return isID(a) ? { method: "DELETE", path: `${memory}/grants/${a}` } : undefined;
+    case "createTrigger": {
+      if (!isRecord(a)) return undefined;
+      const { responsibility, repository, reasons, task } = a;
+      return isID(responsibility) &&
+        isText(repository, 200) &&
+        Array.isArray(reasons) &&
+        reasons.length <= 10 &&
+        reasons.every((reason) => isText(reason, 64)) &&
+        memoryText(task)
+        ? {
+            method: "POST",
+            path: `${memory}/triggers`,
+            body: { responsibility, repository, reasons, task },
+          }
+        : undefined;
+    }
+    case "previewTrigger":
+      return isID(a) ? { method: "GET", path: `${memory}/triggers/${a}/preview` } : undefined;
+    case "enableTrigger":
+      return isID(a) && isRevision(b)
+        ? { method: "POST", path: `${memory}/triggers/${a}/enable`, body: { revision: b } }
+        : undefined;
+    case "pauseTrigger":
+      return isID(a) ? { method: "POST", path: `${memory}/triggers/${a}/pause` } : undefined;
+    case "revokeTrigger":
+      return isID(a) ? { method: "DELETE", path: `${memory}/triggers/${a}` } : undefined;
+    case "instructions":
+      return { method: "GET", path: `${base}/instructions` };
+    case "saveInstructions":
+      return typeof a === "string" && Buffer.byteLength(a, "utf8") <= 64 * 1024 && isRevision(b)
+        ? { method: "PUT", path: `${base}/instructions`, body: { content: a, revision: b } }
+        : undefined;
+    case "revertInstructions":
+      return isRevision(a)
+        ? { method: "POST", path: `${base}/instructions/revert`, body: { revision: a } }
+        : undefined;
+    case "library":
+      return optionalID(a)
+        ? { method: "GET", path: `${base}/library${a === null ? "" : `?before=${a}`}` }
+        : undefined;
+    case "slack":
+      return { method: "GET", path: `${base}/slack` };
+    case "slackConnect":
+      return typeof a === "boolean"
+        ? { method: "POST", path: `${base}/slack/connect`, body: a ? { retry: true } : {} }
+        : undefined;
+    case "slackAttach":
+      return isSlackAppID(a)
+        ? { method: "POST", path: `${base}/slack/attach`, body: { appID: a } }
+        : undefined;
+    case "slackInstall":
+      return { method: "POST", path: `${base}/slack/install`, body: {} };
+    case "slackUpdate":
+      return a === null ||
+        (Array.isArray(a) && a.length <= 20 && a.every((change) => isText(change, 4000)))
+        ? {
+            method: "POST",
+            path: `${base}/slack/update`,
+            body: a === null ? {} : { approve: a },
+            timeout: 60_000,
+          }
+        : undefined;
+    case "slackIcon":
+      return { method: "POST", path: `${base}/slack/icon`, body: {} };
+    case "slackDMCheck":
+      return { method: "POST", path: `${base}/slack/dm-check`, body: {} };
+    case "fresh":
+      return typeof a === "boolean"
+        ? {
+            method: "POST",
+            path: `${base}/fresh`,
+            body: a ? { force: true } : {},
+            timeout: 120_000,
+          }
+        : undefined;
+  }
+  return undefined;
+};
+
+const operationNames = new Set<string>([
+  "feed",
+  "dismiss",
+  "dismissAll",
+  "memory",
+  "observations",
+  "observationSource",
+  "noteSource",
+  "search",
+  "recall",
+  "archived",
+  "archiveStatus",
+  "runs",
+  "requests",
+  "addNote",
+  "editNote",
+  "deleteNote",
+  "editResponsibility",
+  "editReminder",
+  "cancelReminder",
+  "addObservation",
+  "editObservation",
+  "forgetObservation",
+  "deleteArchived",
+  "approveWatch",
+  "endWatch",
+  "revokeGrant",
+  "createTrigger",
+  "previewTrigger",
+  "enableTrigger",
+  "pauseTrigger",
+  "revokeTrigger",
+  "instructions",
+  "saveInstructions",
+  "revertInstructions",
+  "library",
+  "health",
+  "slack",
+  "slackConnect",
+  "slackAttach",
+  "slackInstall",
+  "slackUpdate",
+  "slackIcon",
+  "slackDMCheck",
+  "slackLogin",
+  "fresh",
+] satisfies Operation[]);
+
+const isOperation = (value: unknown): value is Operation =>
+  typeof value === "string" && operationNames.has(value);
+
+// Overlapping reads of the same thing share one request.
+const readFlights = new Map<string, Promise<Reply<unknown>>>();
+
+/** Never retried: a mutation whose answer was lost is reported as unknown for the owner to check. */
+const operate = (op: unknown, ...args: unknown[]): Promise<Reply<unknown>> | Reply<unknown> => {
+  if (!isOperation(op)) return { ok: false, error: "That isn't something the app does." };
+  const built = build(op, args);
+  if (!built) return { ok: false, error: "That request isn't valid." };
+  if (built.method === "GET") {
+    const known = readFlights.get(built.path);
+    if (known) return known;
+    const flight = reply("GET", built.path, undefined, built.timeout).finally(() =>
+      readFlights.delete(built.path),
+    );
+    readFlights.set(built.path, flight);
+    return flight;
+  }
+  return reply(built.method, built.path, built.body, built.timeout);
+};
+
+// Secrets: typed in a secure field or picked up from the clipboard, sent once to the daemon and
+// never kept, logged, journaled or retried. The words of a failure never repeat one.
+
+const secretWords = "The daemon refused it, and the app kept nothing.";
+
+const sendSecret = async (
+  path: string,
+  body: Record<string, string>,
+  values: string[],
+): Promise<Reply<unknown>> => {
+  const result = await reply("POST", path, body, 30_000);
+  // Only main's references go; JavaScript can't promise the memory is erased.
+  for (const key of Object.keys(body)) body[key] = "";
+  if (result.ok) return result;
+  if (values.some((value) => value && result.error.includes(value)))
+    return { ok: false, error: secretWords, ...(result.status ? { status: result.status } : {}) };
+  return result;
+};
+
+const isSecret = (value: unknown, max = 1024): value is string =>
+  typeof value === "string" && value.trim().length > 0 && value.length <= max;
+
+const secret = (input: unknown): Promise<Reply<unknown>> | Reply<unknown> => {
+  if (!isRecord(input)) return { ok: false, error: "That request isn't valid." };
+  switch (input.kind) {
+    case "slackToken": {
+      const { dot, token, value } = input;
+      if (!isName(dot) || (token !== "bot" && token !== "app") || !isSecret(value)) break;
+      return sendSecret(
+        `/dots/${segment(dot)}/slack/tokens`,
+        { kind: token, token: value.trim() },
+        [value.trim()],
+      );
+    }
+    case "slackConfig": {
+      const { token, refreshToken } = input;
+      if (!isSecret(token) || !isSecret(refreshToken)) break;
+      return sendSecret(
+        "/slack/config",
+        { token: token.trim(), refreshToken: refreshToken.trim() },
+        [token.trim(), refreshToken.trim()],
+      );
+    }
+    case "slackLink": {
+      const { dot, bot, app: appToken, replaceAppID } = input;
+      if (
+        !isName(dot) ||
+        !isSecret(bot) ||
+        !isSecret(appToken) ||
+        (replaceAppID !== undefined && !isSlackAppID(replaceAppID))
+      )
+        break;
+      return sendSecret(
+        `/dots/${segment(dot)}/slack/link`,
+        { bot: bot.trim(), app: appToken.trim(), ...(replaceAppID ? { replaceAppID } : {}) },
+        [bot.trim(), appToken.trim()],
+      );
+    }
+    case "slackChallenge": {
+      const { attempt, challenge } = input;
+      if (!isText(attempt, 200) || !/^[\w-]{1,200}$/.test(attempt) || !isSecret(challenge, 128))
+        break;
+      return sendSecret(`/slack/login/${segment(attempt)}`, { challenge: challenge.trim() }, [
+        challenge.trim(),
+      ]);
+    }
+  }
+  return { ok: false, error: "That request isn't valid." };
+};
+
+// Clipboard pickup. Electron can't read the clipboard's change count, so a small helper does,
+// over its own pipes; in the smoke test a fake stands in, so tests never touch the real one.
+
+interface Clipboard {
+  revision(): Promise<number | undefined>;
+  /** The text while the clipboard still holds `revision`, null once it doesn't. */
+  text(revision: number): Promise<string | null | undefined>;
+  clear(revision: number): Promise<void>;
+}
+
+const fakeClipboard = { revision: 0, text: "" as string | undefined, reads: 0, clears: 0 };
+
+const smokeClipboard: Clipboard = {
+  revision: async () => fakeClipboard.revision,
+  text: async (revision) => {
+    fakeClipboard.reads++;
+    return revision === fakeClipboard.revision ? fakeClipboard.text : null;
+  },
+  clear: async (revision) => {
+    if (revision !== fakeClipboard.revision) return;
+    fakeClipboard.text = undefined;
+    fakeClipboard.revision++;
+    fakeClipboard.clears++;
+  },
+};
+
+const helperPath = () =>
+  join(app.getAppPath(), "clipboard-helper").replace(
+    `${sep}app.asar${sep}`,
+    `${sep}app.asar.unpacked${sep}`,
+  );
+
+let helper: ChildProcessByStdio<Writable, Readable, null> | undefined;
+let helperBuffer = Buffer.alloc(0);
+// Each command's reader, in order; a reader takes what it needs from the buffer, or waits.
+const helperQueue: ((buffer: Buffer) => number)[] = [];
+const helperWaiters: (() => void)[] = [];
+
+const stopHelper = () => {
+  helper?.kill();
+  helper = undefined;
+  helperBuffer = Buffer.alloc(0);
+  helperQueue.length = 0;
+  for (const wake of helperWaiters.splice(0)) wake();
+};
+
+const startHelper = () => {
+  if (helper) return helper;
+  try {
+    const child = spawn(helperPath(), [], { stdio: ["pipe", "pipe", "ignore"] });
+    child.on("error", stopHelper);
+    child.on("exit", () => {
+      if (helper === child) stopHelper();
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      helperBuffer = Buffer.concat([helperBuffer, chunk]);
+      while (helperQueue.length) {
+        const used = helperQueue[0]?.(helperBuffer) ?? 0;
+        if (used <= 0) break;
+        helperBuffer = helperBuffer.subarray(used);
+        helperQueue.shift();
+      }
+      if (helperBuffer.length > 16 * 1024) stopHelper();
+    });
+    helper = child;
+  } catch {
+    helper = undefined;
+  }
+  return helper;
+};
+
+/** One helper command, answered by `read`, or undefined if the helper failed or took too long. */
+const ask = <T>(command: string, read: (buffer: Buffer) => [number, T] | undefined) =>
+  new Promise<T | undefined>((done) => {
+    const child = startHelper();
+    if (!child) return done(undefined);
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (!finished) stopHelper();
+    }, 2_000);
+    const finish = (value: T | undefined) => {
+      finished = true;
+      clearTimeout(timer);
+      done(value);
+    };
+    helperWaiters.push(() => finish(undefined));
+    helperQueue.push((buffer) => {
+      const got = read(buffer);
+      if (!got) return 0;
+      finish(got[1]);
+      return got[0];
+    });
+    child.stdin.write(`${command}\n`);
+  });
+
+const readLine = (buffer: Buffer): [number, string] | undefined => {
+  const end = buffer.indexOf(10);
+  return end < 0 ? undefined : [end + 1, buffer.subarray(0, end).toString("utf8")];
+};
+
+const helperClipboard: Clipboard = {
+  revision: async () => {
+    const value = await ask("r", readLine);
+    return value !== undefined && /^-?\d{1,18}$/.test(value) ? Number(value) : undefined;
+  },
+  text: (revision) =>
+    ask<string | null | undefined>(`t ${revision}`, (buffer) => {
+      const head = readLine(buffer);
+      if (!head) return undefined;
+      const [used, value] = head;
+      if (value === "-") return [used, null];
+      if (value === "0" || value === "L") return [used, undefined];
+      const size = Number(value);
+      if (!Number.isSafeInteger(size) || size <= 0 || size > 4096) return [used, undefined];
+      if (buffer.length < used + size) return undefined;
+      return [used + size, buffer.subarray(used, used + size).toString("utf8")];
+    }),
+  clear: async (revision) => {
+    await ask(`c ${revision}`, readLine);
+  },
+};
+
+const clipboardFor = (): Clipboard => (smoke ? smokeClipboard : helperClipboard);
+
+interface Armed {
+  dot: string;
+  step: PickupStep;
+  appID: string | null;
+  seen: number;
+  deadline: number;
+  mismatched: boolean;
+}
+
+interface Held {
+  dot: string;
+  step: "access" | "linkBot";
+  token: string;
+  deadline: number;
+  // A picked-up app-level token waiting for the owner to confirm it replaces `replace`.
+  app?: string;
+  replace?: string;
+}
+
+let armed: Armed | undefined;
+let held: Held | undefined;
+let pickupNotice: { dot: string; text: string } | undefined;
+let pickupTimer: ReturnType<typeof setInterval> | undefined;
+let pickupBusy = false;
+let shownSlack: { dot: string; appID: string | null } | undefined;
+let pickupAvailable = true;
+
+const pickupState = (): PickupState => ({
+  dot: armed?.dot ?? held?.dot ?? pickupNotice?.dot ?? null,
+  step: armed?.step ?? null,
+  holding: held && !held.app ? held.step : null,
+  mismatched: armed?.mismatched ?? false,
+  notice: pickupNotice?.text ?? null,
+  replace: held?.replace ?? null,
+  available: pickupAvailable,
+});
+
+const announce = () => emit({ kind: "pickup", state: pickupState() });
+
+const dropHeld = () => {
+  if (held) {
+    held.token = "";
+    if (held.app) held.app = "";
+  }
+  held = undefined;
+};
+
+/** Ends the pickup and drops a held token, saying why to the dot's view. */
+const endPickup = (said?: string) => {
+  const dot = armed?.dot ?? held?.dot;
+  armed = undefined;
+  dropHeld();
+  if (pickupTimer) clearInterval(pickupTimer);
+  pickupTimer = undefined;
+  if (dot && said) pickupNotice = { dot, text: said };
+  announce();
+};
+
+const leftView = "Pickup stopped when you left the dot's Slack view. Nothing was kept.";
+
+/** Sends what a pickup took, once, and says what became of it. */
+const deliverPickup = async (dot: string, run: () => Promise<Reply<unknown>>, what: string) => {
+  pickupBusy = true;
+  const result = await run().finally(() => {
+    pickupBusy = false;
+  });
+  pickupNotice = {
+    dot,
+    text: result.ok
+      ? `${what} sent to the daemon once. Saved isn't connected: this view says Connected only once the daemon checked it.`
+      : result.lost
+        ? `Couldn't confirm the daemon got the ${what.toLowerCase()}. It isn't sent again: check this view, and save it again if needed.`
+        : `Not saved: ${result.error}`,
+  };
+  announce();
+};
+
+/** One look at the clipboard for the armed pickup: each new copy is read once, after arming. */
+const checkPickup = async () => {
+  const now = Date.now();
+  if (held) {
+    if (shownSlack?.dot !== held.dot) return endPickup(leftView);
+    if (now >= held.deadline)
+      return endPickup(
+        held.step === "linkBot"
+          ? "The app-level token wasn't picked up within 2 minutes, so the bot token was dropped. Nothing was saved."
+          : "The refresh token wasn't picked up within 2 minutes, so the access token was dropped. Nothing was saved.",
+      );
+  }
+  const pickup = armed;
+  if (!pickup || pickupBusy) return;
+  if (shownSlack?.dot !== pickup.dot) return endPickup(leftView);
+  if (pickup.appID && shownSlack.appID !== pickup.appID)
+    return endPickup("The dot's app changed, so the pickup stopped. Nothing was kept.");
+  if (now >= pickup.deadline)
+    return endPickup(
+      `No ${pickupNames[pickup.step]} was copied within 2 minutes, so the pickup stopped. Nothing was kept.`,
+    );
+  pickupBusy = true;
+  try {
+    const board = clipboardFor();
+    const revision = await board.revision();
+    if (armed !== pickup) return;
+    if (revision === undefined) {
+      pickupAvailable = false;
+      return endPickup(
+        "The app can't watch the clipboard here, so pickup is off. Use the secure fields.",
+      );
+    }
+    if (revision === pickup.seen) return;
+    pickup.seen = revision;
+    const copied = await board.text(revision);
+    if (armed !== pickup || copied === null) return;
+    if (copied === undefined || !tokenMatches(pickup.step, copied, pickup.appID ?? undefined)) {
+      pickup.mismatched = true;
+      announce();
+      return;
+    }
+    await board.clear(revision);
+    armed = undefined;
+    if (pickupTimer && !held && pickup.step !== "access" && pickup.step !== "linkBot") {
+      clearInterval(pickupTimer);
+      pickupTimer = undefined;
+    }
+    const dot = pickup.dot;
+    switch (pickup.step) {
+      case "access":
+      case "linkBot":
+        held = { dot, step: pickup.step, token: copied, deadline: now + pickupMilliseconds };
+        pickupNotice = {
+          dot,
+          text:
+            pickup.step === "access"
+              ? "Access token picked up and held in the app's memory only. Pick up the refresh token within 2 minutes; nothing is saved until both are."
+              : "Bot token picked up and held in the app's memory only. Pick up the app-level token within 2 minutes; nothing is saved until both are.",
+        };
+        announce();
+        return;
+      case "refresh": {
+        const first = held;
+        if (!first || first.dot !== dot || first.step !== "access") return endPickup();
+        const token = first.token;
+        endPickup();
+        pickupBusy = false;
+        return deliverPickup(
+          dot,
+          () => sendSecret("/slack/config", { token, refreshToken: copied }, [token, copied]),
+          "Configuration token pair",
+        );
+      }
+      case "linkApp": {
+        const first = held;
+        if (!first || first.dot !== dot || first.step !== "linkBot") return endPickup();
+        const view = await reply("GET", `/dots/${segment(dot)}/slack`);
+        const bound =
+          view.ok && isRecord(view.value) && isRecord(view.value.app) ? view.value.app : undefined;
+        const boundID =
+          bound &&
+          (bound.state === "created" || bound.state === "active") &&
+          isSlackAppID(bound.appID)
+            ? bound.appID
+            : undefined;
+        if (!view.ok) {
+          endPickup();
+          pickupNotice = {
+            dot,
+            text: "Couldn't read the dot's app, so nothing was saved. Pick up both tokens again.",
+          };
+          announce();
+          return;
+        }
+        if (boundID && linkAppID(copied) !== boundID) {
+          // Held until the owner confirms the replacement, within the bot token's own time.
+          first.app = copied;
+          first.replace = boundID;
+          announce();
+          return;
+        }
+        const bot = first.token;
+        endPickup();
+        pickupBusy = false;
+        return deliverPickup(
+          dot,
+          () => sendSecret(`/dots/${segment(dot)}/slack/link`, { bot, app: copied }, [bot, copied]),
+          "App token pair",
+        );
+      }
+      case "bot":
+      case "app":
+        endPickup();
+        pickupBusy = false;
+        return deliverPickup(
+          dot,
+          () =>
+            sendSecret(`/dots/${segment(dot)}/slack/tokens`, { kind: pickup.step, token: copied }, [
+              copied,
+            ]),
+          pickup.step === "bot" ? "Bot token" : "App-level token",
+        );
+    }
+  } finally {
+    pickupBusy = false;
+  }
+};
+
+const steps: readonly unknown[] = [
+  "access",
+  "refresh",
+  "bot",
+  "app",
+  "linkBot",
+  "linkApp",
+] satisfies PickupStep[];
+const isStep = (value: unknown): value is PickupStep => steps.includes(value);
+
+/** Arms the one pickup for this dot's step, replacing any other; only later copies count. */
+const armPickup = async (dot: unknown, step: unknown, appID: unknown): Promise<PickupState> => {
+  if (step === null) {
+    endPickup("Pickup stopped. Nothing was kept.");
+    return pickupState();
+  }
+  if (!isName(dot) || !isStep(step) || !(appID === null || isSlackAppID(appID)))
+    return pickupState();
+  const chosen = step;
+  if (shownSlack?.dot !== dot) return pickupState();
+  if ((chosen === "bot" || chosen === "app") && !appID) return pickupState();
+  const after = pickupAfter(chosen);
+  if (
+    after &&
+    !(held && held.dot === dot && held.step === after && !held.app && Date.now() < held.deadline)
+  ) {
+    endPickup();
+    pickupNotice = {
+      dot,
+      text: `Pick up the ${after === "access" ? "access" : "bot"} token first.`,
+    };
+    announce();
+    return pickupState();
+  }
+  if (!after) dropHeld();
+  const revision = await clipboardFor().revision();
+  if (revision === undefined) {
+    pickupAvailable = false;
+    endPickup("The app can't watch the clipboard here, so pickup is off. Use the secure fields.");
+    return pickupState();
+  }
+  pickupAvailable = true;
+  armed = {
+    dot,
+    step: chosen,
+    appID: chosen === "bot" || chosen === "app" ? appID : null,
+    seen: revision,
+    deadline: Date.now() + pickupMilliseconds,
+    mismatched: false,
+  };
+  pickupNotice = undefined;
+  if (!pickupTimer) pickupTimer = setInterval(() => void checkPickup(), 250);
+  announce();
+  return pickupState();
+};
+
+const confirmReplace = (dot: unknown, appID: unknown, replace: unknown): PickupState => {
+  const first = held;
+  if (!first?.app || first.dot !== dot || first.replace !== appID || typeof replace !== "boolean")
+    return pickupState();
+  const bot = first.token;
+  const linked = first.app;
+  const replaced = first.replace ?? "";
+  endPickup();
+  if (!replace) {
+    pickupNotice = {
+      dot: first.dot,
+      text: `Nothing was saved. ${first.dot} keeps the app ${replaced}.`,
+    };
+    announce();
+    return pickupState();
+  }
+  void deliverPickup(
+    first.dot,
+    () =>
+      sendSecret(
+        `/dots/${segment(first.dot)}/slack/link`,
+        { bot, app: linked, replaceAppID: replaced },
+        [bot, linked],
+      ),
+    "App token pair",
+  );
+  return pickupState();
+};
+
+const slackShown = (dot: unknown, appID: unknown) => {
+  shownSlack = isName(dot) && (appID === null || isSlackAppID(appID)) ? { dot, appID } : undefined;
+  if (pickupNotice && pickupNotice.dot !== shownSlack?.dot) pickupNotice = undefined;
+  if (armed || held) void checkPickup();
+};
+
+// The Library: a file downloads by its ID, checks against the size and digest its listing gave,
+// and is offered to save; it's never previewed or opened.
+
+const artifactLimit = 10 * 1024 * 1024;
+
+const exportArtifact = async (
+  dot: unknown,
+  artifact: unknown,
+): Promise<Reply<{ saved: boolean }>> => {
+  if (!isName(dot) || !isRecord(artifact))
+    return { ok: false, error: "That file can't be exported." };
+  const { id, name, size, sha256 } = artifact;
+  if (
+    !isID(id) ||
+    !isText(name, 255) ||
+    typeof size !== "number" ||
+    !Number.isSafeInteger(size) ||
+    size < 0 ||
+    size > artifactLimit ||
+    !isRevision(sha256)
+  )
+    return { ok: false, error: "That file can't be exported." };
+  const answer = await exchange(
+    current(),
+    "GET",
+    `/dots/${segment(dot)}/library/${id}/content`,
+    undefined,
+    60_000,
+    size + 1,
+  );
+  if ("failed" in answer) return unreached(answer);
+  if (answer.status !== 200) return failure(answer);
+  if (
+    answer.body.length !== size ||
+    createHash("sha256").update(answer.body).digest("hex") !== sha256
+  )
+    return {
+      ok: false,
+      error: "The file didn't match what the Library lists, so nothing was saved.",
+    };
+  const suggested = name.split(/[\\/]/).at(-1)?.replace(/^\.+/, "") || `deliverable-${id}`;
+  if (smoke) {
+    recorded.saves.push({ name: suggested, bytes: answer.body.length });
+    return { ok: true, value: { saved: true } };
+  }
+  const chosen = window
+    ? await dialog.showSaveDialog(window, { defaultPath: suggested })
+    : await dialog.showSaveDialog({ defaultPath: suggested });
+  if (chosen.canceled || !chosen.filePath) return { ok: true, value: { saved: false } };
+  try {
+    writeFileSync(chosen.filePath, answer.body, { mode: 0o600 });
+  } catch {
+    return { ok: false, error: "Couldn't write the file there, so nothing was saved." };
+  }
+  return { ok: true, value: { saved: true } };
+};
+
 // The window, the menu bar icon and the shortcut.
 
 let window: BrowserWindow | undefined;
@@ -882,6 +1782,15 @@ const createWindow = () => {
   contents.on("will-navigate", (event) => event.preventDefault());
   contents.on("will-redirect", (event) => event.preventDefault());
   contents.on("will-attach-webview", (event) => event.preventDefault());
+  // A reload or a crashed page loses the view a pickup belongs to.
+  contents.on("did-start-loading", () => {
+    shownSlack = undefined;
+    if (armed || held) endPickup();
+  });
+  contents.on("render-process-gone", () => {
+    shownSlack = undefined;
+    endPickup();
+  });
   window.on("close", (event) => {
     if (quitting) return;
     event.preventDefault();
@@ -1023,13 +1932,20 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
   setTray: (state) => {
     if (typeof state !== "object" || state === null) return;
     if (!isRecord(state)) return;
-    const { busy, unread } = state;
+    const { busy, unread, unsaved } = state;
     trayState = {
       busy: busy === true,
       unread: Number.isSafeInteger(unread) ? Math.max(0, Number(unread)) : 0,
+      unsaved: Number.isSafeInteger(unsaved) ? Math.max(0, Number(unsaved)) : 0,
     };
     updateTray();
   },
+  call: operate,
+  secret,
+  pickup: armPickup,
+  slackShown,
+  confirmReplace,
+  exportArtifact,
 };
 
 const smokeAnswer = (value: unknown) => process.stdout.write(`SMOKE ${JSON.stringify(value)}\n`);
@@ -1057,10 +1973,22 @@ const smokeDriver = () => {
       id = command.id;
       // What showing the window tells the page, without showing it.
       if (command.emit === "shown") emit({ kind: "shown" });
+      // A copy to the fake clipboard pickup watches: a new revision, as a real copy makes.
+      if (typeof command.clipboard === "string") {
+        fakeClipboard.text = command.clipboard;
+        fakeClipboard.revision++;
+      }
       const value =
         typeof command.eval === "string"
           ? await contents.executeJavaScript(command.eval, true)
-          : { recorded, attempts: readAttempts(), open: unresolved(), violations, errors };
+          : {
+              recorded,
+              attempts: readAttempts(),
+              open: unresolved(),
+              violations,
+              errors,
+              clipboard: { ...fakeClipboard },
+            };
       smokeAnswer({ id, ok: true, value });
       if (command.quit === true) app.quit();
     } catch (cause) {
@@ -1116,8 +2044,28 @@ void app.whenReady().then(() => {
   );
 });
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
+  // Unsaved instructions are only in the renderer: quitting asks once before it drops them.
+  if (!quitting && (trayState.unsaved ?? 0) > 0) {
+    if (smoke) recorded.quitPrompts++;
+    else {
+      const choice = dialog.showMessageBoxSync({
+        type: "warning",
+        message: "Quit and discard unsaved instructions?",
+        detail: "Your edits to a dot's instructions aren't saved. Quitting discards them.",
+        buttons: ["Cancel", "Discard and Quit"],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      if (choice !== 1) {
+        event.preventDefault();
+        return;
+      }
+    }
+  }
   quitting = true;
+  endPickup();
+  stopHelper();
   for (const directory of shares) removeShare(directory);
 });
 app.on("will-quit", () => globalShortcut.unregisterAll());

@@ -31,6 +31,12 @@ const bridge: Bridge = {
   stopWorker: call("stopWorker"),
   openRequest: call("openRequest"),
   setTray: call("setTray"),
+  call: call("call") as Bridge["call"],
+  secret: call("secret"),
+  pickup: call("pickup"),
+  slackShown: call("slackShown"),
+  confirmReplace: call("confirmReplace"),
+  exportArtifact: call("exportArtifact"),
   onEvent: (listener: (event: AppEvent) => void) => {
     const handle = (_event: unknown, payload: AppEvent) => listener(payload);
     ipcRenderer.on(eventChannel, handle);
