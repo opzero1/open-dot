@@ -80,6 +80,7 @@ class FakeDaemon {
   pageDelay = 0;
   olderDelay = 0;
   failOlder = false;
+  failReceipts = false;
   emptyPages = 0;
   stallNext = false;
   stalled = 0;
@@ -239,6 +240,7 @@ class FakeDaemon {
     const receipt = /^\/dots\/jojo\/pending\/([^/]+)$/.exec(path);
     if (receipt?.[1] && method === "GET" && this.capable) {
       this.log.receipts++;
+      if (this.failReceipts) return Response.json({ error: "Not now." }, { status: 503 });
       const status = this.receipts.get(receipt[1]) ?? "unknown";
       return Response.json({ id: receipt[1], sessionID, status });
     }
@@ -1008,6 +1010,64 @@ test("a send the daemon admitted stands when its record can't be removed, and no
   } finally {
     if (existsSync(data)) chmodSync(data, 0o700);
   }
+}, 170_000);
+
+test("a send saved behind an unreadable answer stays to reconcile by its ID, and nothing resends unguarded", async () => {
+  await scenario(
+    "malformed",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hi" }];
+    },
+    async ({ fake, js, until, state }) => {
+      await until(`!!t.msg("m1")`, "the first page");
+      // The daemon commits each send, then answers 202 with a body that isn't JSON.
+      const commit = (post: Post, body: string) => {
+        fake.receipts.set(post.messageID, "sent");
+        fake.pending.push({ id: post.messageID, status: "sent", delivery: "queue" });
+        return new Response(body, { status: 202, headers: { "content-type": "application/json" } });
+      };
+      fake.onPost = (post) =>
+        post.text === "Empty"
+          ? commit(post, "")
+          : post.text === "Garbled"
+            ? commit(post, '{"id":')
+            : undefined;
+      // An empty answer: the receipt asked for at once settles it.
+      await js(`t.type("Empty"), t.enter(), true`);
+      await until(`t.box().value === ""`, "the empty answer to settle");
+      expect((await state()).attempts).toEqual([]);
+
+      // A garbled answer while receipts are down: the record and the draft stay, and Return warns.
+      fake.failReceipts = true;
+      await js(`t.type("Garbled"), t.enter(), true`);
+      await until(
+        `!!document.querySelector("[data-attempt-unknown]")`,
+        "the garbled send to be unknown",
+      );
+      const id = fake.log.posts[1]?.messageID;
+      if (!id) throw new Error("No second post.");
+      expect((await state()).open.map((attempt) => attempt.messageID)).toEqual([id]);
+      expect(await js(`t.box().value`)).toBe("Garbled");
+      await js(`t.enter(), true`);
+      await until(
+        `!!document.querySelector("[data-composer-error]")?.textContent.includes("Send anyway")`,
+        "the unknown-send warning",
+      );
+      await delay(1500);
+      expect(fake.log.posts).toHaveLength(2);
+
+      // Receipts come back: the same ID settles it, and the next message goes once.
+      fake.failReceipts = false;
+      await until(`!document.querySelector("[data-attempt-unknown]")`, "the send to reconcile", 30);
+      await until(`t.box().value === ""`, "the reconciled draft to clear");
+      expect((await state()).attempts).toEqual([]);
+      await js(`t.enter(), true`);
+      await js(`t.type("Next"), t.enter(), true`);
+      await until(`t.box().value === ""`, "the next send");
+      expect(fake.log.posts.map((post) => post.text)).toEqual(["Empty", "Garbled", "Next"]);
+      expect(new Set(fake.log.posts.map((post) => post.messageID)).size).toBe(3);
+    },
+  );
 }, 170_000);
 
 test("a change whose answer was lost stays blocked until a read shows it, and Try again asks for the same change", async () => {

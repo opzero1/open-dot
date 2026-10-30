@@ -288,7 +288,13 @@ const json = async (
   try {
     return { ok: true, value: JSON.parse(answer.body.toString("utf8")) as unknown };
   } catch {
-    return { ok: false, error: "The daemon's answer wasn't JSON.", status: answer.status };
+    // The daemon took the request and said so, but not what it did: the outcome is unknown.
+    return {
+      ok: false,
+      error: "The daemon's answer wasn't understood.",
+      status: answer.status,
+      lost: true,
+    };
   }
 };
 

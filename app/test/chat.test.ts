@@ -194,6 +194,8 @@ test("only an answer saying what happened settles a send; anything else is unkno
   for (const status of [0, 400, 404, 409, 413, 415, 422])
     expect(sendOutcome({ ok: false, error: "", status })).toBe("refused");
   expect(sendOutcome({ ok: false, error: "", lost: true })).toBe("unknown");
+  // A success the app couldn't read: the daemon may have saved it.
+  expect(sendOutcome({ ok: false, error: "", status: 202, lost: true })).toBe("unknown");
   expect(sendOutcome({ ok: false, error: "", status: 401 })).toBe("unknown");
   expect(sendOutcome({ ok: false, error: "", status: 503 })).toBe("unknown");
   expect(sendOutcome({ ok: false, error: "" })).toBe("unknown");
