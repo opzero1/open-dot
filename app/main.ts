@@ -97,6 +97,10 @@ const recorded = {
   quitPrompts: 0,
   // The OpenCode commands main asked the owner about, which the driver's `confirm` answers.
   confirms: [] as string[],
+  // Every request the page made to anything but the app's own files, blobs and data, and how
+  // many it made to its own, which shows the count is live.
+  remote: [] as string[],
+  local: 0,
 };
 let smokeConfirm = false;
 
@@ -1920,6 +1924,13 @@ const createWindow = () => {
         else recorded.show++;
       };
     }
+    // And if the page asks for anything remote: it must only ever load what main hands it.
+    window.webContents.session.webRequest.onBeforeRequest((details, callback) => {
+      if (!/^(?:blob|data|devtools):/.test(details.url) && !details.url.startsWith(`${origin}/`))
+        recorded.remote.push(details.url);
+      else recorded.local++;
+      callback({});
+    });
   }
   const contents = window.webContents;
   contents.setWindowOpenHandler(({ url }) => {

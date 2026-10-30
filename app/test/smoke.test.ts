@@ -29,6 +29,11 @@ beforeAll(() => {
 
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
+// A real, playable 16×16 VP8 WebM of two frames, made with ffmpeg's lavfi color source.
+const webm = Buffer.from(
+  "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAIkEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEyTbuMU6uEHFO7a1OsggIO7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjMuMS4xMDJXQYxMYXZmNjMuMS4xMDJEiYhAeQAAAAAAABZUrmvXrgEAAAAAAABO14EBc8WI2k8EuBUmJq+cgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QL68IA4JCwgRC6gRCagQJVsIRVuYEBVe6BAOwBAAAAAAAAAgAAElTDZ/pzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYzLjEuMTAyc3PVY8CLY8WI2k8EuBUmJq9nyKBFo4dFTkNPREVSRIeTTGF2YzYzLjEuMTAyIGxpYnZweGfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDAuNDAwMDAwMDAwAB9DtnXY54EAo7yBAACAsAIAnQEqEAAQAABHCIWFiIWEiAICAnWqA/gCDP0oAP7/TRL//FhX8WFfxYV/8WFf/PzO7cX85gCjlYEAyACxAQABEBAAGAAYWC/0AAgAABxTu2uRu4+zgQC3iveBAfGCAbHwgQM=",
+  "base64",
+);
 const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
   "base64",
@@ -774,6 +779,8 @@ true`;
 interface Recorded {
   show: number;
   focus: number;
+  remote: string[];
+  local: number;
   emojiPanel: number;
   openExternal: string[];
   clipboard: { text?: string; images?: number }[];
@@ -930,6 +937,9 @@ const scenario = async (
     const { recorded, violations } = await app.state();
     expect(recorded.show).toBe(0);
     expect(recorded.focus).toBe(0);
+    // The page never asks the network for anything: remote media come only as blobs from main.
+    expect(recorded.remote).toEqual([]);
+    expect(recorded.local).toBeGreaterThan(0);
     expect(violations).toEqual([]);
   } finally {
     await app.close();
@@ -998,11 +1008,12 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         {
           id: "msg_reply",
           kind: "dot",
-          text: "first line\nsecond line\n\n> [!WARNING]\n> Careful\n\n![chart](https://media.example/chart.png)\n\nhttps://media.example/clip.mp4",
+          text: "first line\nsecond line\n\n> [!WARNING]\n> Careful\n\n![chart](https://media.example/chart.png)\n\nhttps://media.example/clip.webm\n\nhttps://media.example/broken.mp4",
           extra: {
             media: [
               { id: "aaaaaaaaaaaaaaaa", url: "https://media.example/chart.png", kind: "image" },
-              { id: "bbbbbbbbbbbbbbbb", url: "https://media.example/clip.mp4", kind: "video" },
+              { id: "bbbbbbbbbbbbbbbb", url: "https://media.example/clip.webm", kind: "video" },
+              { id: "cccccccccccccccc", url: "https://media.example/broken.mp4", kind: "video" },
             ],
           },
         },
@@ -1024,8 +1035,10 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         },
       ];
       fake.media.set("aaaaaaaaaaaaaaaa", png);
+      fake.media.set("bbbbbbbbbbbbbbbb", webm);
+      // Passes the type check by its header, but no browser can play it.
       fake.media.set(
-        "bbbbbbbbbbbbbbbb",
+        "cccccccccccccccc",
         new Uint8Array([
           0,
           0,
@@ -1114,8 +1127,23 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
       expect(fake.log.toolReads).toEqual(["msg_work/c2"]);
       // The reply's listed image and video load as blobs through main; the image opens the viewer.
       await until(
-        `!!document.querySelector("[data-message='msg_reply'] .remote-image img[src^='blob:']") && !!document.querySelector("[data-message='msg_reply'] video[src^='blob:']")`,
+        `!!document.querySelector("[data-message='msg_reply'] .remote-image img[src^='blob:']") && !!document.querySelector("[data-message='msg_reply'] video[data-media='bbbbbbbbbbbbbbbb']")`,
         "the reply's media",
+      );
+      // The real video decodes; the one only its header passed falls back to its link.
+      await until(
+        `document.querySelector("video[data-media='bbbbbbbbbbbbbbbb']").readyState >= 1`,
+        "the video's metadata",
+      );
+      expect(
+        await js(`(() => {
+          const video = document.querySelector("video[data-media='bbbbbbbbbbbbbbbb']");
+          return [video.videoWidth, video.videoHeight];
+        })()`),
+      ).toEqual([16, 16]);
+      await until(
+        `!!document.querySelector("[data-media='cccccccccccccccc'][data-failed] a[href='https://media.example/broken.mp4']")`,
+        "the broken video's link",
       );
       expect(
         await js(`(() => {
@@ -1140,6 +1168,7 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
       expect(fake.log.mediaReads.toSorted()).toEqual([
         "msg_reply/aaaaaaaaaaaaaaaa",
         "msg_reply/bbbbbbbbbbbbbbbb",
+        "msg_reply/cccccccccccccccc",
       ]);
       expect(fake.log.activityReads).toBeGreaterThan(0);
     },
