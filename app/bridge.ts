@@ -573,6 +573,26 @@ export interface Artifact {
   status: string;
 }
 
+/** A dot's model steps on one local day, as OpenCode reported them. */
+export interface UsageDay {
+  day: number;
+  steps: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  hitPercent?: number | null;
+}
+
+/** A dot's last week of model steps, and whether its latest steps keep rewriting the cache. */
+export interface DotUsage {
+  days: UsageDay[];
+  counting: boolean;
+  streak: number;
+  alarm: boolean;
+}
+
 export interface LibraryPage {
   artifacts: Artifact[];
   next: number | null;
@@ -685,6 +705,7 @@ export interface Operations {
   saveInstructions: [[dot: string, content: string, revision: string], Instructions];
   revertInstructions: [[dot: string, revision: string], Instructions];
   library: [[dot: string, before: number | null], LibraryPage];
+  usage: [[dot: string], DotUsage];
   health: [[], HealthReport];
   slack: [[dot: string], SlackSetup];
   slackConnect: [[dot: string, retry: boolean], SlackSetup];

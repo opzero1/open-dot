@@ -182,6 +182,23 @@ export const shapes: Record<Operation, Shape> = {
     ],
     "next?": "n",
   },
+  usage: {
+    days: [
+      {
+        day: "n",
+        steps: "n",
+        input: "n",
+        output: "n",
+        reasoning: "n",
+        cacheRead: "n",
+        cacheWrite: "n",
+        "hitPercent?": "n",
+      },
+    ],
+    counting: "b",
+    streak: "n",
+    alarm: "b",
+  },
   health: { checkedAt: "n", checks: [{ id: "s", status: "s", summary: "s" }] },
   slack: slackSetup,
   slackConnect: slackSetup,

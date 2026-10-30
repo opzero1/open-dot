@@ -620,6 +620,24 @@ class FakeDaemon {
         checkedAt: now,
         checks: [{ id: "daemon", status: "healthy", summary: "Running." }],
       });
+    if (path === "/dots/jojo/usage")
+      return json({
+        days: [
+          {
+            day: new Date(now).setHours(0, 0, 0, 0),
+            steps: 4,
+            input: 40,
+            output: 900,
+            reasoning: 0,
+            cacheRead: 146_400,
+            cacheWrite: 440_000,
+            hitPercent: 25,
+          },
+        ],
+        counting: true,
+        streak: 3,
+        alarm: true,
+      });
     if (path === "/dots/jojo/memory") return json(memory);
     if (path === "/dots/jojo/memory/archive" && method === "GET")
       return json({
@@ -3037,6 +3055,10 @@ test("Library exports through the save dialog only, Health reads, and Start Fres
       expect(recorded.openExternal).toEqual([]);
       await openPane(app, "Health");
       await until(`!!document.querySelector('[data-health="daemon"]')`, "the health check");
+      await until(
+        `document.querySelector('[data-section="cache"]')?.innerText.includes("25% from cache") && !!document.querySelector("[data-cache-alarm]")`,
+        "the dot's prompt cache use and alarm",
+      );
       await openPane(app, "Start Fresh…");
       await press("[role=alertdialog]", "Start Fresh");
       await until(

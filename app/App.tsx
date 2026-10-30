@@ -1253,7 +1253,7 @@ const App = () => {
         ) : dot && pane === "library" ? (
           <Library key={dot.name} dot={dot.name} />
         ) : dot && pane === "health" ? (
-          <Health />
+          <Health key={dot.name} dot={dot.name} />
         ) : dot && pane === "slack" ? (
           <Slack key={dot.name} dot={dot.name} ask={setAsk} />
         ) : dot && conversation ? (

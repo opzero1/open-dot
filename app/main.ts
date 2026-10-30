@@ -1066,6 +1066,8 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
       return optionalID(a)
         ? { method: "GET", path: `${base}/library${a === null ? "" : `?before=${a}`}` }
         : undefined;
+    case "usage":
+      return { method: "GET", path: `${base}/usage` };
     case "slack":
       return { method: "GET", path: `${base}/slack` };
     case "slackConnect":
@@ -1156,6 +1158,7 @@ const operationNames = new Set<string>([
   "saveInstructions",
   "revertInstructions",
   "library",
+  "usage",
   "health",
   "slack",
   "slackConnect",

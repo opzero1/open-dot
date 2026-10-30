@@ -3,7 +3,14 @@
 // previewing or opening it. Health repairs nothing; its OpenCode server controls run only when the
 // owner clicks them, and main asks first before Restart and Stop.
 import { useCallback, useEffect, useState } from "react";
-import type { Artifact, HealthCheck, HealthReport, ServiceAction, ServiceView } from "./bridge";
+import type {
+  Artifact,
+  DotUsage,
+  HealthCheck,
+  HealthReport,
+  ServiceAction,
+  ServiceView,
+} from "./bridge";
 import { ago } from "./surfaces";
 import { bridge, bytes } from "./ui";
 
@@ -267,19 +274,82 @@ const OpenCodeServer = () => {
   );
 };
 
-export const Health = () => {
+const tokens = (n: number) => n.toLocaleString();
+
+/** The dot's model steps per day this week, with each day's cache hit ratio, and its alarm. */
+const PromptCache = ({
+  usage,
+  error,
+}: {
+  usage: DotUsage | undefined;
+  error: string | undefined;
+}) => (
+  <section className="pane-section" aria-label="Prompt cache" data-section="cache">
+    <h3>Prompt cache</h3>
+    {error ? (
+      <div className="item-error" role="alert">
+        {error}
+      </div>
+    ) : null}
+    {usage?.alarm ? (
+      <div className="item-error" role="alert" data-cache-alarm>
+        This dot's latest {usage.streak} steps after a turn's first each wrote more to the cache
+        than they read, so its conversation is cached again on every step. An OpenCode upgrade may
+        have changed how cache hints are ordered.
+      </div>
+    ) : null}
+    {usage && !usage.days.length ? (
+      <p className="note">
+        {usage.counting
+          ? "No model step recorded this week."
+          : "Steps count from when the daemon first read this conversation to its end."}
+      </p>
+    ) : null}
+    {usage?.days.length ? (
+      <ul className="items">
+        {usage.days.map((day) => (
+          <li className="item" key={day.day} data-usage-day={day.day}>
+            <div className="item-line">
+              <span className="item-title">{new Date(day.day).toLocaleDateString()}</span>
+              <span>
+                {day.hitPercent === null || day.hitPercent === undefined
+                  ? "No prompt tokens"
+                  : `${day.hitPercent}% from cache`}
+              </span>
+            </div>
+            <div className="note">
+              {`${day.steps} steps: ${tokens(day.cacheRead)} read from cache, ${tokens(day.cacheWrite)} written, ${tokens(day.input)} uncached; ${tokens(day.output)} output, ${tokens(day.reasoning)} reasoning`}
+            </div>
+          </li>
+        ))}
+      </ul>
+    ) : null}
+  </section>
+);
+
+export const Health = ({ dot }: { dot: string }) => {
   const [report, setReport] = useState<HealthReport>();
+  const [usage, setUsage] = useState<DotUsage>();
+  const [usageError, setUsageError] = useState<string>();
   const [error, setError] = useState<string>();
   const [loading, setLoading] = useState(false);
 
   const check = useCallback(async () => {
     setLoading(true);
-    const [result] = await Promise.all([bridge.call("health"), bridge.opencode("status")]);
+    const [result, steps] = await Promise.all([
+      bridge.call("health"),
+      bridge.call("usage", dot),
+      bridge.opencode("status"),
+    ]);
     setLoading(false);
+    if (steps.ok) {
+      setUsageError(undefined);
+      setUsage(steps.value);
+    } else setUsageError(steps.error);
     if (!result.ok) return setError(result.error);
     setError(undefined);
     setReport(result.value);
-  }, []);
+  }, [dot]);
 
   useEffect(() => void check(), [check]);
 
@@ -295,6 +365,7 @@ export const Health = () => {
       </header>
       <div className="pane-body">
         <OpenCodeServer />
+        <PromptCache usage={usage} error={usageError} />
         <p className="note">The same report as open-dot doctor. Nothing here repairs anything.</p>
         {error ? (
           <div className="item-error" role="alert">
