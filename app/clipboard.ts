@@ -1,6 +1,8 @@
 // The clipboard helper's client (clipboard.m): one command per line on its stdin, answered in order
 // on its stdout. Only an outstanding command keeps a callback; each is dropped once answered, timed
-// out or stopped, so nothing the helper read is kept by this client after it's handed over.
+// out or stopped, so nothing the helper read is kept by this client after it's handed over. Its
+// bytes don't stay either: the receive buffer is its own unpooled copy, and every byte it or an
+// incoming chunk held is zeroed once taken, so no shared backing store keeps a token reachable.
 import type { Readable, Writable } from "node:stream";
 
 export interface Clipboard {
@@ -16,6 +18,14 @@ export interface HelperProcess {
   kill(): unknown;
   on(event: "error" | "exit", listener: () => void): unknown;
 }
+
+/** A zeroed copy of `parts`, in its own memory rather than a pooled slab other buffers share. */
+const own = (...parts: Buffer[]) => {
+  const copy = Buffer.alloc(parts.reduce((size, part) => size + part.length, 0));
+  let at = 0;
+  for (const part of parts) at += part.copy(copy, at);
+  return copy;
+};
 
 const readLine = (buffer: Buffer): [number, string] | undefined => {
   const end = buffer.indexOf(10);
@@ -37,6 +47,7 @@ export const helperClipboard = (start: () => HelperProcess, timeout = 2_000) => 
   const stop = () => {
     helper?.kill();
     helper = undefined;
+    buffer.fill(0);
     buffer = Buffer.alloc(0);
     queue.length = 0;
     const ending = [...waiters];
@@ -55,13 +66,25 @@ export const helperClipboard = (start: () => HelperProcess, timeout = 2_000) => 
         if (helper === child) stop();
       });
       child.stdout.on("data", (chunk: Buffer) => {
-        if (helper !== child) return;
-        buffer = Buffer.concat([buffer, chunk]);
+        if (helper !== child) {
+          chunk.fill(0);
+          return;
+        }
+        const received = own(buffer, chunk);
+        chunk.fill(0);
+        buffer.fill(0);
+        buffer = received;
+        let used = 0;
         while (queue.length) {
-          const used = queue[0]?.(buffer) ?? 0;
-          if (used <= 0) break;
-          buffer = buffer.subarray(used);
+          const took = queue[0]?.(received.subarray(used)) ?? 0;
+          if (took <= 0) break;
+          used += took;
           queue.shift();
+        }
+        if (used) {
+          // What's left moves to fresh memory; the taken bytes are zeroed, never kept.
+          buffer = used < received.length ? own(received.subarray(used)) : Buffer.alloc(0);
+          received.fill(0);
         }
         if (buffer.length > 16 * 1024) stop();
       });
@@ -121,5 +144,11 @@ export const helperClipboard = (start: () => HelperProcess, timeout = 2_000) => 
     },
   };
 
-  return { clipboard, stop, pending: () => ({ waiters: waiters.size, readers: queue.length }) };
+  return {
+    clipboard,
+    stop,
+    pending: () => ({ waiters: waiters.size, readers: queue.length }),
+    /** For tests: a copy of all the memory behind what's kept of the helper's output. */
+    held: () => new Uint8Array(buffer.buffer.slice(0)),
+  };
 };
