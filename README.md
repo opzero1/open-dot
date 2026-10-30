@@ -217,7 +217,9 @@ bun run app:package   # build app/dist/mac-arm64/open-dot.app, signed ad hoc
 
 It finds the daemon from `api.json`, so it follows `OPEN_DOT_HOME`. Closing the window hides it; Control-Option-Space or the menu bar icon shows it again. The menu bar icon shows when a dot is busy and how many messages you haven't read. If another app has Control-Option-Space, the icon's menu says so. Quit from that menu.
 
-A message you send gets its ID before it leaves the app, and the app saves only that ID until the daemon answers. If the answer is lost, the app asks the daemon about that ID and shows what it says. It never sends the message again on its own.
+A message you send gets its ID before it leaves the app, and the app saves only that ID until the daemon answers. It sends only to a daemon that said, since the app last found it, that it takes the app's IDs; one that saves a message under another ID gets no more sends until it's updated. If the answer is lost, the message stays in the box with a warning, and the app asks the daemon about that ID. Once the daemon says it has the message, what was sent leaves the box, keeping anything you typed since; if open-dot cancelled it, it stays in the box. It never sends the message again on its own.
+
+Scroll up for older messages; the one you're reading stays put. Past 600 loaded messages the newest ones make way and **Back to latest** returns to them; after the daemon restarts, older messages load again from the latest page. Delete hides a message after you confirm, with Undo for ten seconds; **Show deleted** lists hidden messages with **Restore**. Copy and Share load every image again and do nothing if any fails; Copy takes the text, or all images of an image-only message.
 
 To start the packaged app at login, hidden, save `~/Library/LaunchAgents/com.opzero1.open-dot.app.plist`:
 
