@@ -370,7 +370,10 @@ const archiveDelete = (name: string, messageID: string) =>
       : fail(`${name} has no archived message ${messageID}.`);
   });
 
-/** The owner adds their own observed row; one stating a forgotten fact lets it be observed again. */
+/**
+ * The owner adds their own observed row; one with a forgotten fact's exact text, as tombstones
+ * compare it, lets that fact be observed again.
+ */
 const observationAdd = (name: string, given: string) =>
   Effect.suspend(() => {
     const dot = findDot(db, name);
@@ -383,7 +386,7 @@ const observationAdd = (name: string, given: string) =>
       return fail("Run this in a terminal: adding a row needs you to confirm it. Nothing changed.");
     if (
       !confirmed(
-        `Add to ${name}'s observed memory: "${text}"? A forgotten fact in much the same words may then be observed again.`,
+        `Add to ${name}'s observed memory: "${text}"? A forgotten fact with exactly this text, ignoring case, accents, spacing and punctuation, may then be observed again. A forgotten fact put any other way stays forgotten.`,
       )
     )
       return Effect.sync(() => console.log("Nothing changed."));
