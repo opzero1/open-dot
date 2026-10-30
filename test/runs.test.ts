@@ -254,6 +254,39 @@ test("a failed or interrupted turn is failed, and missing history or a deleted s
   expect(hasOpenRuns(db)).toBe(false);
 });
 
+test("a run never keeps a credential from a failed turn's error or a reply, even one its excerpt cuts", async () => {
+  track();
+  track({ goal: "Rotate keys" });
+  claimDue(db, 35 * minute);
+  await pass();
+  deliver();
+  const [failed, replied] = runs().map((run) => run.messageID);
+  const token = `ghp_${"A1b2".repeat(9)}`;
+  fake.state.messageTurns.set(failed ?? "", {
+    end: "idle_f",
+    outcome: "failed",
+    error: `Push refused for password: hunter2 with ${token}`,
+    text: undefined,
+    inputs: [failed ?? ""],
+    complete: true,
+  });
+  // The token starts just before the 600-character excerpt ends.
+  const reply = `${"a".repeat(590)} ${token} done`;
+  fake.state.messageTurns.set(replied ?? "", {
+    end: "idle_r",
+    outcome: "succeeded",
+    text: reply,
+    inputs: [replied ?? ""],
+    complete: true,
+    reply: { id: "msg_reply", text: reply },
+  });
+  await pass();
+  const saved = JSON.stringify(db.$client.query("SELECT * FROM responsibility_runs").all());
+  expect(saved).toContain("[redacted]");
+  for (const secret of ["hunter2", "A1b2", "ghp_"]) expect(saved).not.toContain(secret);
+  expect(runs().map((run) => run.outcome)).toEqual(["failed", "succeeded"]);
+});
+
 test("concurrent runs that share a turn get no result, and each run gets only its own", async () => {
   const a = track();
   const b = track({ goal: "Ship the release", nextAction: "Tag it" });

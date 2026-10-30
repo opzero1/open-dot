@@ -60,13 +60,16 @@ const endOf = (run: ResponsibilityRun, turn: Turn) => {
     turn: "ended" as const,
     waiting: false,
     outcome: turn.outcome,
-    error: turn.error ?? null,
+    error: turn.error === undefined ? null : redact(turn.error),
     turnEnd: turn.end,
     endedAt: turn.endedAt ?? null,
     attribution,
     resultID: reply?.id ?? null,
     resultText: reply
-      ? redact(reply.text.slice(0, resultLimit).replace(/[\uD800-\uDBFF]$/, ""))
+      ? // Redacted whole, so a credential crossing the cut can't leave its start behind.
+        redact(reply.text)
+          .slice(0, resultLimit)
+          .replace(/[\uD800-\uDBFF]$/, "")
       : null,
   };
 };
