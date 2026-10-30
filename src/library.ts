@@ -19,7 +19,7 @@ import { and, count, desc, eq, lt, sum } from "drizzle-orm";
 import type { Db } from "./db";
 import { validName } from "./dots";
 import { home, outputDirectory } from "./home";
-import { redact } from "./memory";
+import { looksSecret } from "./memory";
 import { type Artifact, artifacts, workers } from "./schema";
 
 /** The most bytes one deliverable may have. */
@@ -512,7 +512,7 @@ export function addDeliverable(
   const segments = outputPath(rawPath, outputDirectory(dot, worker.id));
   if (typeof segments === "string") return { error: segments };
   // Its name and path are kept and shown as the Library's metadata, so none may hold a credential.
-  if (redact(segments.join("/")) !== segments.join("/"))
+  if (looksSecret(segments.join("/")))
     return {
       error: "The file's path looks like it holds a credential. Rename the file, then add it.",
     };

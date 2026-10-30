@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import { and, asc, eq, gt, isNull } from "drizzle-orm";
 import type { Db } from "./db";
+import { looksSecret } from "./memory";
 import { type Grant, grants } from "./schema";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -323,6 +324,9 @@ export const parseGrant = (
     (!/^[\w.:/@*-]{1,100}$/.test(target) || target.replaceAll("*", "").length < 3)
   )
     return "--target takes a pattern of letters, digits and . : / @ - with at least 3 that aren't *.";
+  // A grant's scope is listed in the dot's memory every turn, so none may hold a credential.
+  if ([repo, branch, target].some((value) => value !== null && looksSecret(value)))
+    return "A scope that looks like it holds a credential isn't saved.";
   const until = values.get("--until");
   const span = values.get("--for");
   if ((until === undefined) === (span === undefined))

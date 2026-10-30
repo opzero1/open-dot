@@ -17,6 +17,7 @@ import {
 import { join } from "node:path";
 import { validName } from "./dots";
 import { home } from "./home";
+import { redact } from "./memory";
 
 /** The most UTF-8 bytes of instructions the notch reads or saves. */
 export const instructionsLimit = 64 * 1024;
@@ -44,6 +45,9 @@ const historyName = /^(\d{12})\.md$/;
 const revisionOf = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/** Text as it may be kept: with likely credentials replaced by `[redacted]`. */
+const redacted = (bytes: Buffer) => Buffer.from(redact(decoder.decode(bytes)), "utf8");
 
 /** Whether a value can be saved: well-formed text without NUL, at most the limit in UTF-8. */
 export const isInstructionsText = (value: unknown): value is string =>
@@ -265,7 +269,9 @@ export function saveInstructions(
   const { place, text, history } = now;
   const before = text?.bytes ?? empty;
   if (revisionOf(before) !== revision) return { conflict: view(before, hasHistory(history)) };
-  const bytes = Buffer.from(content, "utf8");
+  const bytes = Buffer.from(redact(content), "utf8");
+  if (bytes.length > instructionsLimit)
+    return { status: 413, error: "Instructions must be at most 64 KiB of UTF-8 text." };
   if (bytes.equals(before)) return { saved: view(before, hasHistory(history)) };
   if (!history) return unsafeHistory(place);
   let kept: string | undefined;
@@ -276,7 +282,7 @@ export function saveInstructions(
         if (!isRealDirectory(place.history)) return unsafeHistory(place);
       }
       const entry = `${String(nextNumber(place)).padStart(12, "0")}.md`;
-      writeAtomically(place.history, entry, before, 0o600);
+      writeAtomically(place.history, entry, redacted(before), 0o600);
       kept = join(place.history, entry);
     }
     writeAtomically(place.directory, "AGENTS.md", bytes, text?.mode ?? 0o644);
@@ -318,7 +324,8 @@ export function revertInstructions(name: string, revision: string): Instructions
   const previous = readText(newest.path, "The earlier version");
   if (!previous) return { status: 404, error: "There's no earlier version to revert to." };
   if ("status" in previous) return previous;
-  writeAtomically(place.directory, "AGENTS.md", previous.bytes, text?.mode ?? 0o644);
+  const restored = redacted(previous.bytes);
+  writeAtomically(place.directory, "AGENTS.md", restored, text?.mode ?? 0o644);
   try {
     rmSync(newest.path, { force: true });
     syncDirectory(place.history);
@@ -334,5 +341,5 @@ export function revertInstructions(name: string, revision: string): Instructions
   } catch {
     // Keep the count from before the revert.
   }
-  return { saved: view(previous.bytes, left) };
+  return { saved: view(restored, left) };
 }

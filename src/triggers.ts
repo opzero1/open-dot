@@ -15,7 +15,7 @@ import {
 } from "drizzle-orm";
 import type { Db } from "./db";
 import { githubReasons } from "./feed";
-import { isID, memoryText } from "./memory";
+import { isID, looksSecret, memoryText } from "./memory";
 import {
   dots,
   feed,
@@ -71,6 +71,8 @@ export function parseTrigger(body: unknown): TriggerInput | Invalid {
   const repo = typeof repository === "string" ? repository.trim().toLowerCase() : "";
   if (!repositoryPattern.test(repo))
     return { invalid: "repository must be owner/name, as GitHub shows it." };
+  if (looksSecret(repo) || (typeof repository === "string" && looksSecret(repository.trim())))
+    return { invalid: "repository looks like it holds a credential, so it isn't saved." };
   if (
     !Array.isArray(reasons) ||
     reasons.length === 0 ||

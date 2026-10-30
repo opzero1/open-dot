@@ -619,6 +619,17 @@ test("an exact pinned read reconciles lost older mutation responses without repl
   expect(fake.state.prompted).toEqual([]);
 });
 
+test("a reaction's excerpt never keeps a credential, even one its 240 characters cut", async () => {
+  const token = `xoxb-${"9".repeat(30)}`;
+  fake.state.history.set("ses_jojo", [
+    entry("msg_answer", "assistant", `${"a".repeat(230)} ${token}`),
+  ]);
+  expect((await putReaction("👍")).status).toBe(200);
+  const excerpt = db.select().from(reactions).get()?.excerpt ?? "";
+  expect(excerpt).toBe(`${"a".repeat(230)} [redacted`);
+  expect(excerpt).not.toContain("xoxb");
+});
+
 test("owner reactions add, replace and remove idempotently without queuing a turn", async () => {
   fake.state.history.set("ses_jojo", [entry("msg_answer", "assistant", "A".repeat(400))]);
   const first = await putReaction("👍");

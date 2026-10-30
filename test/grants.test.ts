@@ -209,6 +209,10 @@ test("grants are parsed strictly, expire, and are revoked once", () => {
     ["merge", ["--branch", "x", "--for", "31d"]],
     ["merge", ["--branch", "x", "--until", "2020-01-01T00:00"]],
     ["merge", ["--branch", "x", "--for", "1h", "--yes", "1"]],
+    // A scope that looks like a credential would be listed in the dot's memory every turn.
+    ["merge", ["--branch", `ghp_${"a".repeat(20)}`, "--for", "1h"]],
+    ["deploy", ["--target", `sk-${"b".repeat(20)}`, "--for", "1h"]],
+    ["merge", ["--repo", `acme/xoxb-${"1".repeat(12)}`, "--pr", "1", "--for", "1h"]],
   ] as const)
     expect(parseGrant("jojo", operation, flags, now)).toBeString();
 

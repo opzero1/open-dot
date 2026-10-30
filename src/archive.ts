@@ -1,7 +1,7 @@
 import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { Effect } from "effect";
 import type { Db } from "./db";
-import { fold, indexTerms, noteSource, redact, snippet, stopwords } from "./memory";
+import { fold, indexTerms, looksSecret, noteSource, redact, snippet, stopwords } from "./memory";
 import { type HistoryItem, OpenCode, OpenCodeError } from "./opencode";
 import { messageKind, messageSources } from "./reactions";
 import {
@@ -89,6 +89,8 @@ export function parseArchiveSettings(body: unknown): Switches | Invalid {
   const model = fields.observerModel;
   if (model !== undefined) {
     if (model !== null && (typeof model !== "string" || !modelPattern.test(model))) return usage;
+    if (model !== null && looksSecret(model))
+      return { invalid: "observerModel looks like it holds a credential, so it isn't saved." };
     change.observerModel = model;
   }
   const daily = fields.observerDailyTokens;

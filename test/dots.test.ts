@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, Result } from "effect";
@@ -62,4 +62,21 @@ test("a ready dot whose session disappeared fails instead of creating a replacem
 
   expect(Result.isFailure(result)).toBe(true);
   expect(fake.state.created).toEqual([]);
+});
+
+test("a purpose's credential is never kept in the database or AGENTS.md", () => {
+  const dot = Effect.runSync(
+    createDot(
+      db,
+      "kakyoin",
+      `Watch deploys. The token: ${"t".repeat(20)} and ghp_${"A1".repeat(12)}`,
+    ),
+  );
+  const agents = readFileSync(join(dot.directory, "AGENTS.md"), "utf8");
+  const saved = JSON.stringify(db.$client.query("SELECT * FROM dots").all());
+  for (const kept of [agents, saved]) {
+    expect(kept).toContain("Watch deploys. The token: [redacted] and [redacted]");
+    expect(kept).not.toContain("t".repeat(20));
+    expect(kept).not.toContain("ghp_");
+  }
 });

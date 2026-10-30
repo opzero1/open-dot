@@ -508,3 +508,18 @@ test("a done or dropped responsibility and a changed binding never run", async (
   await call(`/dots/jojo/memory/triggers/${trigger.id}/pause`, { method: "POST" });
   expect((await enable(trigger)).status).toBe(409);
 });
+
+test("a repository that looks like a credential is refused and nothing is saved", async () => {
+  for (const repository of [`acme/ghp_${"a".repeat(20)}`, `acme/xoxb-${"1".repeat(12)}`]) {
+    const response = await call("/dots/jojo/memory/triggers", {
+      method: "POST",
+      body: { responsibility: 1, repository, reasons: ["Review requested"], task },
+    });
+    expect(response.status).toBe(400);
+  }
+  // A task's credential is redacted, as every memory text is.
+  const trigger = await draft({ task: `Review it. password: ${"p".repeat(12)}` });
+  expect(trigger.task).toBe("Review it. password: [redacted]");
+  const saved = JSON.stringify(db.$client.query("SELECT * FROM feed_triggers").all());
+  for (const secret of ["ghp_", "xoxb-", "p".repeat(12)]) expect(saved).not.toContain(secret);
+});

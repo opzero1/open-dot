@@ -320,6 +320,12 @@ test("the owner's API shows and changes the archive switches", async () => {
   expect((await request("PUT", '{"autoRecall":1}')).status).toBe(400);
   const recalling = await request("PUT", '{"autoRecall":true}');
   expect(await recalling.json()).toMatchObject({ archive: true, autoRecall: true });
+  // A model name that looks like a credential is refused, not redacted into another name.
+  const planted = `openai/sk-${"a1".repeat(12)}`;
+  expect((await request("PUT", JSON.stringify({ observerModel: planted }))).status).toBe(400);
+  expect(JSON.stringify(db.$client.query("SELECT * FROM memory_settings").all())).not.toContain(
+    "sk-",
+  );
   expect(fake.state.pages).toEqual([]);
 });
 

@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray, max, notInArray } from "drizzle-orm";
 import type { Db } from "./db";
+import { redact } from "./memory";
 import {
   type Dot,
   outbox,
@@ -94,7 +95,7 @@ export const saveReaction = (
     );
     const previous = tx.select().from(reactions).where(key).get();
     if (previous?.emoji === emoji) return previous;
-    const value = { emoji, excerpt: text.slice(0, 240), updatedAt: Date.now() };
+    const value = { emoji, excerpt: redact(text).slice(0, 240), updatedAt: Date.now() };
     // Only the owner's own choices become recent, never a dot's, and they outlive the reaction.
     if (actor === "owner" && emoji !== null && !isClassic(emoji)) {
       const last = tx

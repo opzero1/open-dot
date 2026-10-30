@@ -5,6 +5,7 @@ import { asc, eq } from "drizzle-orm";
 import { Data, Effect } from "effect";
 import type { Db } from "./db";
 import { dotDirectory } from "./home";
+import { redact } from "./memory";
 import { OpenCode } from "./opencode";
 import { requestPolicy } from "./requests";
 import { type Dot, dots } from "./schema";
@@ -29,7 +30,9 @@ You are ${name}, a durable personal agent. ${purpose}
 `;
 
 /** Saves the dot and its session ID before any OpenCode call, so a crash can be reconciled by that ID. */
-export function createDot(db: Db, name: string, purpose: string) {
+export function createDot(db: Db, name: string, given: string) {
+  // The purpose is kept in AGENTS.md and the database, and shown to every other dot.
+  const purpose = redact(given);
   if (!validName.test(name)) {
     return Effect.fail(
       new DotError({

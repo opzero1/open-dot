@@ -52,6 +52,12 @@ export const redact = (text: string) =>
     .reduce((rest, pattern) => rest.replace(pattern, "[redacted]"), text)
     .replace(labelled, "$1$2[redacted]");
 
+/**
+ * Whether redaction would change a value. An identifier, such as a model, repository or path, is
+ * refused rather than redacted, since a changed identifier would name something else.
+ */
+export const looksSecret = (value: string) => redact(value) !== value;
+
 /** Common English words, which neither recall nor a forgotten fact's words count. */
 export const stopwords = new Set(
   "the and for are but not you your yours with that this these those what when where which who why how have has had was were will would could should can did does doing done from into onto about above after again against all also any because been before being below between both each few more most other some such than then there their them they too very just only own same here off out over under until upon our ours its it's i'm i've i'll you're don't didn't isn't aren't wasn't can't won't let lets get got make made like want need know think said say says tell told please thanks thank okay yes yeah".split(

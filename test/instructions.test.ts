@@ -306,3 +306,22 @@ test("open-dot instructions prints the dot's AGENTS.md path", () => {
   expect(unknown.exitCode).toBe(1);
   expect(unknown.stderr.toString()).toContain('No dot named "nobody"');
 });
+
+test("no credential reaches AGENTS.md or its history through a save, a kept version or a revert", async () => {
+  const token = `xoxb-${"1234567890".repeat(3)}`;
+  const files = () =>
+    [onDisk(), ...kept().map((name) => readFileSync(join(historyDir(), name), "utf8"))].join("\n");
+  // The owner's own save.
+  const saved = await json(await save(`# jojo\nUse ${token} and password: hunter2\n`, "# jojo\n"));
+  expect(saved.body.content).toBe("# jojo\nUse [redacted] and password: [redacted]\n");
+  // A secret the owner typed straight into the file is redacted as the next save keeps it.
+  writeFileSync(instructionsPath("jojo"), `# by hand\ntoken=${"q".repeat(20)}\n`);
+  expect((await save("# clean\n", `# by hand\ntoken=${"q".repeat(20)}\n`)).status).toBe(200);
+  // A version kept before redaction existed is redacted as it's put back.
+  writeFileSync(join(historyDir(), "000000000099.md"), `# old\nsk-${"z".repeat(30)}\n`);
+  const reverted = await json(await revert("# clean\n"));
+  expect(reverted).toMatchObject({ status: 200, body: { content: "# old\n[redacted]\n" } });
+  expect(files()).toContain("[redacted]");
+  for (const secret of ["xoxb-", "hunter2", "q".repeat(20), "z".repeat(30)])
+    expect(files()).not.toContain(secret);
+});
