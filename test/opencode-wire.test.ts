@@ -85,8 +85,8 @@ test("installed public client reads a running turn's text so far over fake HTTP 
   expect(result.checks).toHaveLength(10);
 }, 20_000);
 
-test("installed public client pages messages with opaque cursors over fake HTTP only", async () => {
+test("installed public client pages messages and reads tool calls, bounded, over fake HTTP only", async () => {
   const result = await fixture("test/fixtures/messages-wire.ts", "messages-wire");
   expect(result).toMatchObject({ code: 0, stderr: "" });
-  expect(result.checks).toHaveLength(3);
+  expect(result.checks).toHaveLength(7);
 }, 20_000);
