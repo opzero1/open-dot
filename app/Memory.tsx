@@ -63,6 +63,12 @@ interface Kept {
   rejected: Map<string, { mine: string; current: string }>;
   /** Unsent new rows. Only Cancel, or the daemon confirming the text as it was sent, clears one. */
   creating: { note: string; observation: string; trigger?: TriggerDraft | undefined };
+  /** Rows whose change is out now. A pane opened again meanwhile refuses another send of them. */
+  sending: Set<string>;
+  /** What the daemon last said about a row's change, so an answer after a reopen still shows. */
+  errors: Map<string, string>;
+  /** Each open pane of the dot, to draw again when any of this changes, and read after a change. */
+  panes: Set<(changed: boolean) => void>;
 }
 
 // Unsent edits and new rows per dot, kept while the window lives so switching panes, dots or
@@ -78,6 +84,9 @@ const keptFor = (dot: string) => {
       reminders: new Drafts(),
       rejected: new Map(),
       creating: { note: "", observation: "" },
+      sending: new Set(),
+      errors: new Map(),
+      panes: new Set(),
     };
     kept.set(dot, known);
   }
@@ -121,11 +130,14 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   const [memory, setMemory] = useState<MemoryData>();
   const [archive, setArchive] = useState<ArchiveStatus>();
   const [error, setError] = useState<string>();
-  const [busy, setBusy] = useState(new Set<string>());
-  const [rowErrors, setRowErrors] = useState(new Map<string, string>());
   const drafts = keptFor(dot);
+  const busy = drafts.sending;
+  const rowErrors = drafts.errors;
   const [, setTick] = useState(0);
-  const render = () => setTick((tick) => tick + 1);
+  // Draws every open pane of the dot, so a change settling after a reopen shows in the new one.
+  const render = () => {
+    for (const draw of drafts.panes) draw(false);
+  };
   const rejected = drafts.rejected;
   const setRejected = (row: string, value: { mine: string; current: string } | undefined) => {
     if (value) rejected.set(row, value);
@@ -148,19 +160,28 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   }, [dot]);
 
   useEffect(() => {
+    const draw = (changed: boolean) => {
+      setTick((tick) => tick + 1);
+      if (changed) void read();
+    };
+    drafts.panes.add(draw);
+    return () => {
+      drafts.panes.delete(draw);
+    };
+  }, [drafts, read]);
+
+  useEffect(() => {
     setMemory(undefined);
     void read();
     const timer = setInterval(() => void read(), 20_000);
     return () => clearInterval(timer);
   }, [read, key]);
 
-  const setRowError = (row: string, text: string | undefined) =>
-    setRowErrors((current) => {
-      const next = new Map(current);
-      if (text) next.set(row, text);
-      else next.delete(row);
-      return next;
-    });
+  const setRowError = (row: string, text: string | undefined) => {
+    if (text) rowErrors.set(row, text);
+    else rowErrors.delete(row);
+    render();
+  };
 
   /**
    * Sends one change once. Reads out meanwhile are dropped, and one read follows. A 409 shows
@@ -172,26 +193,25 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
     work: () => Promise<Reply<unknown>>,
     rejectedText?: { mine: string; current: (value: unknown) => string | undefined },
   ) => {
+    // Checked and taken at once, before any await, and kept with the dot's drafts rather than this
+    // pane, so neither a second press nor a pane opened again meanwhile sends the row twice.
     if (busy.has(row)) return { result: undefined, conflict: false };
+    busy.add(row);
+    render();
     const at = keyRef.current;
     fence.current.advance(at);
     recalls.current.changed();
     noteSearches.current.changed();
-    setBusy((current) => new Set(current).add(row));
     let result: Reply<unknown>;
     try {
       result = await work();
     } catch {
       result = { ok: false, error: "No answer. Nothing was retried.", lost: true };
     }
+    busy.delete(row);
     fence.current.advance(at);
     recalls.current.changed();
     noteSearches.current.changed();
-    setBusy((current) => {
-      const next = new Set(current);
-      next.delete(row);
-      return next;
-    });
     let conflict = false;
     if (result.ok) setRowError(row, undefined);
     else {
@@ -212,7 +232,8 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
       void recallRun(recalls.current.rerun());
       void noteSearchRun(noteSearches.current.rerun());
     }
-    void read();
+    // Whichever pane of the dot is open now reads what the change left.
+    for (const draw of drafts.panes) draw(true);
     return { result, conflict };
   };
 
@@ -1493,7 +1514,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               value={newObservation}
               onChange={(event) => create({ observation: event.target.value })}
             />
-            <button type="submit" disabled={!newObservation.trim()}>
+            <button type="submit" disabled={!newObservation.trim() || busy.has("observation:new")}>
               Add
             </button>
           </form>

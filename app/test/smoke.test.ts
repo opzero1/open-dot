@@ -2268,6 +2268,96 @@ test("Memory: a new note, observation and feed trigger survive Escape, the Feed 
   );
 }, 170_000);
 
+test("Memory: a new note, observation or feed trigger held out goes once, though Memory is left and opened again, and the newer draft stays", async () => {
+  await scenario(
+    "memory-held",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      const posts = () =>
+        mutations(fake, "/dots/jojo/memory")
+          .filter((call) => call.method === "POST")
+          .map((call) => [call.path, call.body]);
+      const drafts = `(() => ({
+        note: document.querySelector('[aria-label="New note"]')?.value,
+        observation: document.querySelector('[aria-label="New observation"]')?.value,
+        instruction: document.querySelector('[aria-label="Instruction"]')?.value,
+      }))()`;
+      const buttons = `[["notes", "Add"], ["observed", "Add"], ["triggers", "Save draft"]].map(([section, label]) => t.button(label, document.querySelector('[data-section="' + section + '"]')))`;
+      await openPane(app, "Memory");
+      await until(`!!document.querySelector('[aria-label="New note"]')`, "the memory");
+      await js(`t.fill('[aria-label="New note"]', "Buy tea")`);
+      await js(`t.fill('[aria-label="New observation"]', "Prefers mornings")`);
+      await press('[data-section="triggers"]', "New feed trigger…");
+      await js(`(() => {
+        const select = document.querySelector('[aria-label="Responsibility"]');
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(select, "2");
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      })()`);
+      await js(`t.fill('[aria-label="Repository"]', "acme/app")`);
+      await js(
+        `[...document.querySelectorAll('[data-section="triggers"] fieldset label')].find((l) => l.textContent.includes("Mentioned")).querySelector("input").click(), true`,
+      );
+      await js(`t.fill('[aria-label="Instruction"]', "Look at it")`);
+      // The daemon holds each create's answer.
+      const hold = Promise.withResolvers<void>();
+      fake.data.memoryHold = hold.promise;
+      await press('[data-section="notes"]', "Add");
+      await press('[data-section="observed"]', "Add");
+      await press('[data-section="triggers"]', "Save draft");
+      for (let tick = 0; tick < 50 && posts().length < 3; tick++) await delay(100);
+      const sent = [
+        ["/dots/jojo/memory/notes", { text: "Buy tea" }],
+        ["/dots/jojo/memory/observations", { text: "Prefers mornings" }],
+        [
+          "/dots/jojo/memory/triggers",
+          { responsibility: 2, repository: "acme/app", reasons: ["Mentioned"], task: "Look at it" },
+        ],
+      ];
+      expect(posts()).toEqual(sent);
+      // Leave Memory and open it again while they're out, and type on.
+      await js(`t.cmd("1"), true`);
+      await until(`!document.querySelector('[data-pane="memory"]')`, "the chat");
+      await js(`t.cmd("2"), true`);
+      await until(`!!document.querySelector('[aria-label="Instruction"]')`, "the reopened memory");
+      await js(`t.fill('[aria-label="New note"]', "Buy tea and milk")`);
+      await js(`t.fill('[aria-label="New observation"]', "Prefers early mornings")`);
+      await js(`t.fill('[aria-label="Instruction"]', "Look at it closely")`);
+      // Each is still sending: its button stays off, and submitting its form or pressing again
+      // sends nothing.
+      expect(await js(`${buttons}.map((button) => button.disabled)`)).toEqual([true, true, true]);
+      await js(`(() => {
+        for (const label of ["New note", "New observation"]) {
+          const form = document.querySelector('[aria-label="' + label + '"]').form;
+          form.requestSubmit();
+          form.requestSubmit();
+        }
+        for (const button of ${buttons}) button.click();
+        return true;
+      })()`);
+      await delay(500);
+      expect(posts()).toEqual(sent);
+      // Once answered, the newer drafts stay unsent and the buttons come back.
+      hold.resolve();
+      fake.data.memoryHold = undefined;
+      await until(
+        `${buttons}.every((button) => !button.disabled)`,
+        "the answered creates in the reopened pane",
+      );
+      expect(await js(drafts)).toEqual({
+        note: "Buy tea and milk",
+        observation: "Prefers early mornings",
+        instruction: "Look at it closely",
+      });
+      await delay(500);
+      expect(posts()).toEqual(sent);
+    },
+  );
+}, 170_000);
+
 test("Memory: a refused edit shows beside the value now, edits send only changed fields, and confirmations gate every change", async () => {
   await scenario(
     "memory",
