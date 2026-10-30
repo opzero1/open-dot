@@ -3,7 +3,7 @@ import { defineConfig } from "vite-plus";
 export default defineConfig({
   lint: {
     options: { typeAware: true, typeCheck: true },
-    ignorePatterns: ["drizzle/**"],
+    ignorePatterns: ["drizzle/**", "app/build/**", "app/dist/**"],
     plugins: ["typescript", "import", "unicorn", "oxc"],
     categories: { correctness: "error", suspicious: "error" },
     rules: {
@@ -16,9 +16,14 @@ export default defineConfig({
       "eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
     },
     // Test fakes stand in for only the parts of OpenCode's APIs the code under test uses.
-    overrides: [{ files: ["test/**"], rules: { "typescript/no-unsafe-type-assertion": "off" } }],
+    overrides: [
+      {
+        files: ["test/**", "app/test/**"],
+        rules: { "typescript/no-unsafe-type-assertion": "off" },
+      },
+    ],
   },
   fmt: {
-    ignorePatterns: ["drizzle/**"],
+    ignorePatterns: ["drizzle/**", "app/build/**", "app/dist/**"],
   },
 });

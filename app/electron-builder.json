@@ -1,0 +1,18 @@
+{
+  "appId": "com.opzero1.open-dot.app",
+  "productName": "open-dot",
+  "electronVersion": "45.1.0",
+  "npmRebuild": false,
+  "directories": {
+    "app": "app/build",
+    "output": "app/dist"
+  },
+  "files": ["**/*", "!node_modules/**"],
+  "asar": true,
+  "mac": {
+    "target": "dir",
+    "identity": "-",
+    "category": "public.app-category.productivity",
+    "hardenedRuntime": false
+  }
+}
