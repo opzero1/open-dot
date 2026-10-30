@@ -1,6 +1,7 @@
 // Builds the app into app/build: the renderer with Vite+, main and the sandboxed preload with Bun.
-import { rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 const root = import.meta.dirname;
 const out = join(root, "build");
@@ -40,6 +41,38 @@ const helper = Bun.spawnSync(
   { stdout: "inherit", stderr: "inherit" },
 );
 if (helper.exitCode !== 0) throw new Error("The clipboard helper build failed.");
+
+// The app's icon for packaging, from the owner's 1024-pixel PNG: macOS's sips scales each size
+// into an iconset and iconutil makes the .icns. Packaging leaves it out of the app's archive.
+const iconset = join(mkdtempSync(join(tmpdir(), "open-dot-icon-")), "icon.iconset");
+mkdirSync(iconset);
+try {
+  for (const size of [16, 32, 128, 256, 512])
+    for (const scale of [1, 2]) {
+      const name = `icon_${size}x${size}${scale === 2 ? "@2x" : ""}.png`;
+      const pixels = String(size * scale);
+      const sips = Bun.spawnSync(
+        [
+          "sips",
+          "-z",
+          pixels,
+          pixels,
+          join(root, "resources", "app-icon.png"),
+          "--out",
+          join(iconset, name),
+        ],
+        { stdout: "ignore", stderr: "inherit" },
+      );
+      if (sips.exitCode !== 0) throw new Error(`Scaling the app icon to ${name} failed.`);
+    }
+  const icns = Bun.spawnSync(["iconutil", "-c", "icns", iconset, "-o", join(out, "icon.icns")], {
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  if (icns.exitCode !== 0) throw new Error("Making the app icon failed.");
+} finally {
+  rmSync(dirname(iconset), { recursive: true, force: true });
+}
 
 const manifest: unknown = await Bun.file(join(root, "..", "package.json")).json();
 const version =

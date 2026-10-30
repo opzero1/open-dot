@@ -7,10 +7,11 @@
     "app": "app/build",
     "output": "app/dist"
   },
-  "files": ["**/*", "!node_modules/**"],
+  "files": ["**/*", "!node_modules/**", "!icon.icns"],
   "asar": true,
   "mac": {
     "target": "dir",
+    "icon": "app/build/icon.icns",
     "identity": "-",
     "category": "public.app-category.productivity",
     "hardenedRuntime": false
