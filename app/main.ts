@@ -67,6 +67,7 @@ import {
   sendOutcome,
   settled,
 } from "./chat";
+import { decoded } from "./decode";
 import {
   isSlackAppID,
   linkAppID,
@@ -893,11 +894,11 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
       return isQuery(a) && isOffset(b)
         ? { method: "GET", path: `${memory}/recall?q=${segment(a.trim())}&offset=${b}` }
         : undefined;
-    case "archived":
     case "searchNotes":
       return isQuery(a)
         ? { method: "GET", path: `${memory}/search?q=${segment(a.trim())}&limit=20` }
         : undefined;
+    case "archived":
       return isMessageID(a) && isOffset(b)
         ? { method: "GET", path: `${memory}/archive/${segment(a)}?offset=${b}` }
         : undefined;
@@ -1071,8 +1072,8 @@ const operationNames = new Set<string>([
   "observationSource",
   "noteSource",
   "recall",
-  "archived",
   "searchNotes",
+  "archived",
   "archiveStatus",
   "runs",
   "requests",
@@ -1124,13 +1125,15 @@ const operate = (op: unknown, ...args: unknown[]): Promise<Reply<unknown>> | Rep
   if (built.method === "GET") {
     const known = readFlights.get(built.path);
     if (known) return known;
-    const flight = reply("GET", built.path, undefined, built.timeout).finally(() =>
-      readFlights.delete(built.path),
-    );
+    const flight = reply("GET", built.path, undefined, built.timeout)
+      .then((result) => decoded(op, "GET", result))
+      .finally(() => readFlights.delete(built.path));
     readFlights.set(built.path, flight);
     return flight;
   }
-  return reply(built.method, built.path, built.body, built.timeout);
+  return reply(built.method, built.path, built.body, built.timeout).then((result) =>
+    decoded(op, built.method, result),
+  );
 };
 
 // Secrets: typed in a secure field or picked up from the clipboard, sent once to the daemon and
