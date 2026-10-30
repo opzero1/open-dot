@@ -10,15 +10,15 @@ import {
 } from "@pierre/diffs";
 import type { Element, ElementContent } from "hast";
 import type { Blockquote, Paragraph, Root, RootContent } from "mdast";
-import { memo, type ReactNode, useEffect, useId, useState } from "react";
+import { createContext, memo, type ReactNode, useContext, useEffect, useId, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import type { Bridge } from "./bridge";
-import { isDiff, safeExternalURL } from "./chat";
+import type { Bridge, Bytes, Result } from "./bridge";
+import { isDiff, mediaKey, type MediaView, safeExternalURL } from "./chat";
 
 const bridge = (): Bridge | undefined => globalThis.openDot;
 
@@ -402,26 +402,154 @@ export const DiffBlock = ({ code }: { code: string }) => {
   );
 };
 
-const components: Components = {
-  a: ({ href, children }) => {
-    const url = safeExternalURL(href);
-    if (!url) return <span className="link-inert">{children}</span>;
+/** A reply's remote media: the ones the daemon listed, how to load one, and the image viewer. */
+export interface MediaContext {
+  list: readonly MediaView[];
+  load: (id: string) => Promise<Result<Bytes>>;
+  onOpenImage: (url: string) => void;
+}
+
+const Media = createContext<MediaContext | undefined>(undefined);
+
+const listed = (media: MediaContext | undefined, raw: unknown) => {
+  const key = mediaKey(raw);
+  return key === undefined ? undefined : media?.list.find((entry) => entry.url === key);
+};
+
+/** Bytes of remote media the window holds as blob URLs at once; past it, media stay links. */
+const mediaBudget = 96 * 1024 * 1024;
+let mediaHeld = 0;
+
+const Link = ({ href, children }: { href: unknown; children: ReactNode }) => {
+  const url = safeExternalURL(href);
+  if (!url) return <span className="link-inert">{children}</span>;
+  return (
+    <a
+      href={url}
+      title={url}
+      rel="noreferrer noopener"
+      onClick={(event) => {
+        event.preventDefault();
+        void bridge()?.openLink(url);
+      }}
+    >
+      {children}
+    </a>
+  );
+};
+
+/**
+ * One listed image or video, loaded through the daemon into a blob URL that's revoked when it
+ * goes. Until it loads, or if it can't, the link shows instead.
+ */
+const RemoteMedia = ({
+  media,
+  entry,
+  alt,
+  fallback,
+}: {
+  media: MediaContext;
+  entry: MediaView;
+  alt: string;
+  fallback: ReactNode;
+}) => {
+  const [url, setURL] = useState<string>();
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    let held = 0;
+    let made: string | undefined;
+    setURL(undefined);
+    setFailed(false);
+    void media.load(entry.id).then((result) => {
+      if (!live) return;
+      const size = result.ok ? result.value.data.byteLength : 0;
+      if (
+        !result.ok ||
+        !result.value.mime.startsWith(`${entry.kind}/`) ||
+        mediaHeld + size > mediaBudget
+      ) {
+        setFailed(true);
+        return;
+      }
+      held = size;
+      mediaHeld += held;
+      made = URL.createObjectURL(
+        new Blob([new Uint8Array(result.value.data)], { type: result.value.mime }),
+      );
+      setURL(made);
+    });
+    return () => {
+      live = false;
+      mediaHeld -= held;
+      if (made) URL.revokeObjectURL(made);
+    };
+  }, [media, entry.id, entry.kind]);
+  if (!url)
     return (
-      <a
-        href={url}
-        title={url}
-        rel="noreferrer noopener"
-        onClick={(event) => {
-          event.preventDefault();
-          void bridge()?.openLink(url);
-        }}
+      <span
+        className="remote-media-pending"
+        data-media={entry.id}
+        data-failed={failed || undefined}
       >
-        {children}
-      </a>
+        {fallback}
+      </span>
+    );
+  const label = alt || (entry.kind === "image" ? "Image" : "Video");
+  return entry.kind === "image" ? (
+    <button
+      type="button"
+      className="remote-image"
+      data-media={entry.id}
+      aria-label={`Open image: ${label}`}
+      title={entry.url}
+      onClick={() => media.onOpenImage(url)}
+    >
+      <img src={url} alt={alt} />
+    </button>
+  ) : (
+    <video
+      className="remote-video"
+      data-media={entry.id}
+      src={url}
+      aria-label={label}
+      title={entry.url}
+      controls
+      muted
+      playsInline
+      preload="metadata"
+    />
+  );
+};
+
+const components: Components = {
+  a: function Anchor({ href, children, node }) {
+    const media = useContext(Media);
+    // Only a bare link, its text the URL itself, previews the image or video it names.
+    const entry = node && textOf(node) === href ? listed(media, href) : undefined;
+    const link = <Link href={href}>{children}</Link>;
+    return media && entry ? (
+      <RemoteMedia media={media} entry={entry} alt="" fallback={link} />
+    ) : (
+      link
     );
   },
-  // Remote images never load: the text gets a label instead.
-  img: ({ alt }) => <span className="image-inert">[image{alt ? `: ${alt}` : ""}]</span>,
+  // Remote images load only through the daemon, and only the ones it listed for this reply.
+  img: function Image({ src, alt }) {
+    const media = useContext(Media);
+    const entry = listed(media, src);
+    const label = `[image${alt ? `: ${alt}` : ""}]`;
+    return media && entry ? (
+      <RemoteMedia
+        media={media}
+        entry={entry}
+        alt={alt ?? ""}
+        fallback={<Link href={entry.url}>{label}</Link>}
+      />
+    ) : (
+      <span className="image-inert">{label}</span>
+    );
+  },
   pre: ({ node }) => {
     const code = node?.children.find(
       (child): child is Element => child.type === "element" && child.tagName === "code",
@@ -443,23 +571,27 @@ const components: Components = {
 };
 
 /** One message's text. Raw HTML in it is dropped, never rendered. */
-export const Markdown = memo(({ text }: { text: string }) => (
-  <div className="markdown">
-    <ReactMarkdown
-      skipHtml
-      remarkPlugins={[
-        remarkGfm,
-        [remarkMath, { singleDollarTextMath: true }],
-        remarkAlerts,
-        remarkBreaks,
-      ]}
-      rehypePlugins={[
-        [rehypeSanitize, schema],
-        [rehypeKatex, katexOptions],
-      ]}
-      components={components}
-    >
-      {text}
-    </ReactMarkdown>
-  </div>
-));
+export const Markdown = memo(
+  ({ text, media }: { text: string; media?: MediaContext | undefined }) => (
+    <Media.Provider value={media}>
+      <div className="markdown">
+        <ReactMarkdown
+          skipHtml
+          remarkPlugins={[
+            remarkGfm,
+            [remarkMath, { singleDollarTextMath: true }],
+            remarkAlerts,
+            remarkBreaks,
+          ]}
+          rehypePlugins={[
+            [rehypeSanitize, schema],
+            [rehypeKatex, katexOptions],
+          ]}
+          components={components}
+        >
+          {text}
+        </ReactMarkdown>
+      </div>
+    </Media.Provider>
+  ),
+);

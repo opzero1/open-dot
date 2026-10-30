@@ -42,6 +42,26 @@ test("remote images never load and become labels", () => {
   expect(html).toContain("[image: tracker]");
 });
 
+test("only media the daemon listed for the reply load, and only through it", () => {
+  const url = "https://example.com/chart.png";
+  const media = {
+    list: [{ id: "0123456789abcdef", url, kind: "image" as const }],
+    load: () => Promise.resolve({ ok: false as const, error: "no" }),
+    onOpenImage: () => {},
+  };
+  const html = renderToStaticMarkup(
+    createElement(Markdown, {
+      text: `![chart](${url}#top) ![other](https://example.com/other.png) [${url}](${url}) [named](${url})`,
+      media,
+    }),
+  );
+  // Until it loads, a listed image is a link to its page; the unlisted one stays a label.
+  expect(html).not.toContain("<img");
+  expect(html).toContain('data-media="0123456789abcdef"');
+  expect(html.match(/data-media=/g)).toHaveLength(2);
+  expect(html).toContain("[image: other]");
+});
+
 test("GitHub-flavored markdown renders headings, lists, task lists, tables and quotes", () => {
   const html = render(
     "## Title\n\n- [x] done\n- [ ] next\n\n1. one\n\n> quoted\n\n| a | b |\n| - | - |\n| 1 | ~~2~~ |",

@@ -1309,3 +1309,32 @@ button:disabled {
 .activity-time {
   font-variant-numeric: tabular-nums;
 }
+
+/* A reply's remote images and videos, loaded through the daemon. */
+.remote-image {
+  display: block;
+  margin: 4px 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: zoom-in;
+  max-width: 100%;
+}
+
+.remote-image img,
+.remote-video {
+  display: block;
+  max-width: min(100%, 420px);
+  max-height: 320px;
+  border-radius: 8px;
+}
+
+.remote-video {
+  margin: 4px 0;
+  background: #000;
+}
+
+.remote-image:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

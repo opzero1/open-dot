@@ -148,6 +148,54 @@ export const imageInfo = (
   return undefined;
 };
 
+/** A remote image or video a dot's reply links to, fetched only through the daemon. */
+export interface MediaView {
+  id: string;
+  url: string;
+  kind: "image" | "video";
+}
+
+export const mediaLimit = 32 * 1024 * 1024;
+
+const mp4Brands = new Set(["isom", "iso2", "iso4", "iso5", "iso6", "mp41", "mp42", "avc1", "dash"]);
+
+/** The type remote media bytes really are: the raster images and MP4 or WebM, never SVG or HTML. */
+export const mediaType = (bytes: Uint8Array) => {
+  const image = imageInfo(bytes);
+  if (image && image.mime !== "image/tiff") return image.mime;
+  if (ascii(bytes, 4, 4) === "ftyp") {
+    const brand = ascii(bytes, 8, 4);
+    if (brand === "avif" || brand === "avis") return "image/avif";
+    if (mp4Brands.has(brand)) return "video/mp4";
+  }
+  if (startsWith(bytes, [0x1a, 0x45, 0xdf, 0xa3]) && ascii(bytes, 0, 64).includes("webm"))
+    return "video/webm";
+  return undefined;
+};
+
+/** The URL as the daemon lists it: parsed, without its fragment. */
+export const mediaKey = (raw: unknown) => {
+  if (typeof raw !== "string" || !URL.canParse(raw)) return undefined;
+  const url = new URL(raw);
+  url.hash = "";
+  return url.href;
+};
+
+const isMedia = (entry: unknown): entry is MediaView =>
+  typeof entry === "object" &&
+  entry !== null &&
+  "id" in entry &&
+  "url" in entry &&
+  "kind" in entry &&
+  typeof entry.id === "string" &&
+  /^[\da-f]{16}$/.test(entry.id) &&
+  safeExternalURL(entry.url) !== undefined &&
+  (entry.kind === "image" || entry.kind === "video");
+
+/** The media a message lists, keeping only well-formed entries. */
+export const messageMedia = (message: { media?: unknown }): MediaView[] =>
+  Array.isArray(message.media) ? message.media.filter(isMedia).slice(0, 8) : [];
+
 /** Why an image can't be attached, or nothing when it can, checked before any decoding. */
 export const imageProblem = (bytes: Uint8Array, attached: number): string | undefined => {
   if (attached >= imageLimits.count) return "Attach at most five images.";

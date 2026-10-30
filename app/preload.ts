@@ -19,6 +19,7 @@ const bridge: Bridge = {
   hide: call("hide"),
   pending: call("pending"),
   image: call("image"),
+  media: call("media"),
   avatar: call("avatar"),
   ingest: call("ingest"),
   openLink: call("openLink"),

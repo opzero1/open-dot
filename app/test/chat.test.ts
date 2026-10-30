@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { MessageView, PageView } from "../bridge";
 import {
+  mediaKey,
+  mediaType,
+  messageMedia,
   afterSend,
   applyIntents,
   canReact,
@@ -577,4 +580,40 @@ describe("work log", () => {
       hidden: 5,
     });
   });
+});
+
+/** An ISO media file's first box, with the given brand. */
+const box = (brand: string) =>
+  new Uint8Array([0, 0, 0, 24, ...new TextEncoder().encode(`ftyp${brand}`), ...new Uint8Array(12)]);
+
+test("remote media are recognized by their bytes and listed only when well formed", () => {
+  const header = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 2,
+    0, 0, 0, 3,
+  ]);
+  expect(mediaType(header)).toBe("image/png");
+  expect(mediaType(box("isom"))).toBe("video/mp4");
+  expect(mediaType(box("avif"))).toBe("image/avif");
+  expect(mediaType(box("qt  "))).toBeUndefined();
+  expect(
+    mediaType(new TextEncoder().encode("<svg xmlns='http://www.w3.org/2000/svg'/>")),
+  ).toBeUndefined();
+  expect(mediaKey("https://example.com/a.png#x")).toBe("https://example.com/a.png");
+  const good = {
+    id: "0123456789abcdef",
+    url: "https://example.com/a.png",
+    kind: "image" as const,
+  };
+  expect(
+    messageMedia({
+      media: [
+        good,
+        { ...good, id: "BAD" },
+        { ...good, url: "javascript:alert(1)" },
+        { ...good, kind: "audio" },
+        null,
+      ],
+    }),
+  ).toEqual([good]);
+  expect(messageMedia({})).toEqual([]);
 });

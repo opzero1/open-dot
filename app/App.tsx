@@ -55,6 +55,7 @@ import {
   mergeLatest,
   mergeOlder,
   mergeWork,
+  messageMedia,
   olderRead,
   pendingActions,
   pendingLabel,
@@ -2281,6 +2282,17 @@ const MessageRow = ({
     if (!blocked && !message.hidden) onMenu({ message, x, y });
   };
   const reactions = message.reactions.filter((reaction) => reaction.emoji);
+  // Only a dot's own replies show remote media, and only what the daemon listed for them.
+  const media = useMemo(() => {
+    const list = message.kind === "dot" ? messageMedia(message) : [];
+    return list.length > 0
+      ? {
+          list,
+          load: (id: string) => bridge.media(dot, message.id, message.sessionID, id),
+          onOpenImage,
+        }
+      : undefined;
+  }, [dot, message.id, message.sessionID, message.kind, message.media, onOpenImage]);
   return (
     <div
       className={`message ${message.kind} ${message.hidden ? "hidden" : ""}`}
@@ -2308,7 +2320,7 @@ const MessageRow = ({
             <div className="plain">{message.text}</div>
           ) : null
         ) : message.text ? (
-          <Markdown text={message.text} />
+          <Markdown text={message.text} media={media} />
         ) : null}
         {message.tools.length ? (
           <div className="tools">

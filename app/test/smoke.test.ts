@@ -239,6 +239,8 @@ class FakeDaemon {
   work: object[] = [];
   activity: object | null = null;
   details = new Map<string, object>();
+  // Each listed media's bytes, by its ID.
+  media = new Map<string, Uint8Array>();
   // jojo's avatar: its listed revision, and how many reads of it fail before one answers.
   avatar: { revision: string; failures: number } | null = null;
   avatarReads = 0;
@@ -285,6 +287,7 @@ class FakeDaemon {
     dotReads: 0,
     activityReads: 0,
     toolReads: [] as string[],
+    mediaReads: [] as string[],
     // Requests each server instance got, by its number.
     requests: [] as number[],
   };
@@ -487,6 +490,16 @@ class FakeDaemon {
       return this.activity
         ? Response.json({ ...this.activity, sessionID: url.searchParams.get("sessionID") })
         : Response.json({ error: "Not found" }, { status: 404 });
+    }
+    const remote = /^\/dots\/jojo\/messages\/([^/]+)\/media\/([^/]+)$/.exec(path);
+    if (remote && method === "GET") {
+      this.log.mediaReads.push(`${remote[1]}/${remote[2]}`);
+      const bytes = this.media.get(remote[2] ?? "");
+      return bytes
+        ? new Response(new Uint8Array(bytes), {
+            headers: { "content-type": "application/octet-stream" },
+          })
+        : Response.json({ error: "No." }, { status: 404 });
     }
     const tool = /^\/dots\/jojo\/messages\/([^/]+)\/tools\/([^/]+)$/.exec(path);
     if (tool && method === "GET") {
@@ -985,7 +998,13 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         {
           id: "msg_reply",
           kind: "dot",
-          text: "first line\nsecond line\n\n> [!WARNING]\n> Careful",
+          text: "first line\nsecond line\n\n> [!WARNING]\n> Careful\n\n![chart](https://media.example/chart.png)\n\nhttps://media.example/clip.mp4",
+          extra: {
+            media: [
+              { id: "aaaaaaaaaaaaaaaa", url: "https://media.example/chart.png", kind: "image" },
+              { id: "bbbbbbbbbbbbbbbb", url: "https://media.example/clip.mp4", kind: "video" },
+            ],
+          },
         },
       ];
       fake.work = [
@@ -1005,6 +1024,18 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
           more: null,
         },
       ];
+      fake.media.set("aaaaaaaaaaaaaaaa", png);
+      fake.media.set(
+        "bbbbbbbbbbbbbbbb",
+        new Uint8Array([
+          0,
+          0,
+          0,
+          24,
+          ...new TextEncoder().encode("ftypisom"),
+          ...new Uint8Array(12),
+        ]),
+      );
       fake.activity = {
         state: "tool",
         tool: "bash",
@@ -1082,6 +1113,35 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         })()`),
       ).toEqual({ output: 20, more: ["Show more (10 more lines)"] });
       expect(fake.log.toolReads).toEqual(["msg_work/c2"]);
+      // The reply's listed image and video load as blobs through main; the image opens the viewer.
+      await until(
+        `!!document.querySelector("[data-message='msg_reply'] .remote-image img[src^='blob:']") && !!document.querySelector("[data-message='msg_reply'] video[src^='blob:']")`,
+        "the reply's media",
+      );
+      expect(
+        await js(`(() => {
+          const video = document.querySelector("[data-message='msg_reply'] video");
+          return {
+            controls: video.controls,
+            muted: video.muted,
+            autoplay: video.autoplay || video.hasAttribute("autoplay"),
+            preload: video.getAttribute("preload"),
+            label: document.querySelector(".remote-image").getAttribute("aria-label"),
+          };
+        })()`),
+      ).toEqual({
+        controls: true,
+        muted: true,
+        autoplay: false,
+        preload: "metadata",
+        label: "Open image: chart",
+      });
+      await js(`document.querySelector(".remote-image").click(), true`);
+      await until(`!!document.querySelector(".viewer img[src^='blob:']")`, "the image viewer");
+      expect(fake.log.mediaReads.toSorted()).toEqual([
+        "msg_reply/aaaaaaaaaaaaaaaa",
+        "msg_reply/bbbbbbbbbbbbbbbb",
+      ]);
       expect(fake.log.activityReads).toBeGreaterThan(0);
     },
   );

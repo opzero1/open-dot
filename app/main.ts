@@ -61,6 +61,8 @@ import {
   type Endpoint,
   imageInfo,
   imageLimits,
+  mediaLimit,
+  mediaType,
   imageProblem,
   isImageType,
   loopbackEndpoint,
@@ -118,6 +120,8 @@ const csp = [
   "style-src-attr 'unsafe-inline'",
   "font-src 'self'",
   "img-src 'self' blob:",
+  // A reply's remote images and videos, only as blobs of bytes the daemon fetched and checked.
+  "media-src blob:",
   "worker-src 'self'",
   "connect-src 'self'",
   "base-uri 'none'",
@@ -323,6 +327,17 @@ const json = async (
       lost: true,
     };
   }
+};
+
+/** A remote image or video the daemon fetched: only MP4, WebM and raster images, by their bytes. */
+const mediaBytes = async (path: string): Promise<Result<Bytes>> => {
+  const answer = await exchange(current(), "GET", path, undefined, 30_000, mediaLimit + 1024);
+  if ("failed" in answer) return unreached(answer);
+  if (answer.status !== 200) return failure(answer);
+  const mime = mediaType(answer.body);
+  return mime
+    ? { ok: true, value: { mime, data: new Uint8Array(answer.body) } }
+    : { ok: false, error: "That isn't media the app shows." };
 };
 
 const bytes = async (path: string): Promise<Result<Bytes>> => {
@@ -2024,6 +2039,18 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
       `/dots/${segment(dot)}/messages/${segment(id)}/attachments/${Number(index)}?sessionID=${segment(sessionID)}`,
     );
   },
+  media: (dot, id, sessionID, mediaID) =>
+    isName(dot) &&
+    isName(id) &&
+    isName(sessionID) &&
+    typeof mediaID === "string" &&
+    /^[\da-f]{16}$/.test(mediaID)
+      ? coalesce(`media\0${dot}\0${sessionID}\0${id}\0${mediaID}`, () =>
+          mediaBytes(
+            `/dots/${segment(dot)}/messages/${segment(id)}/media/${mediaID}?sessionID=${segment(sessionID)}`,
+          ),
+        )
+      : { ok: false, error: "Bad media." },
   avatar: (dot) =>
     isName(dot) ? bytes(`/dots/${segment(dot)}/avatar`) : { ok: false, error: "Bad dot." },
   ingest,

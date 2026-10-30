@@ -72,6 +72,8 @@ export interface MessageView {
   quote?: QuoteView;
   peer?: string | null;
   feed?: { title: string; url: string | null; source: string };
+  /** A dot reply's remote media, checked by the renderer before use. */
+  media?: unknown;
 }
 
 export type PendingStatus = "sending" | "confirming" | "sent";
@@ -744,6 +746,8 @@ export interface Bridge {
   hide(dot: string, id: string, sessionID: string, hidden: boolean): Promise<Result<true>>;
   pending(dot: string, id: string, change: "steer" | "cancel"): Promise<Result<true>>;
   image(dot: string, id: string, sessionID: string, index: number): Promise<Result<Bytes>>;
+  /** A remote image or video a dot reply lists, fetched by the daemon. */
+  media(dot: string, id: string, sessionID: string, mediaID: string): Promise<Result<Bytes>>;
   avatar(dot: string): Promise<Result<Bytes>>;
   ingest(input: ImageInput): Promise<Result<DraftImage>>;
   openLink(url: string): Promise<boolean>;
@@ -795,6 +799,7 @@ export const channels = [
   "hide",
   "pending",
   "image",
+  "media",
   "avatar",
   "ingest",
   "openLink",
