@@ -68,6 +68,9 @@ const loaded = globalThis.openDot;
 if (!loaded) throw new Error("The app's preload didn't load.");
 const bridge: Bridge = loaded;
 
+// Older pages a list too short to scroll loads on its own before it waits for Load older.
+const autoFillLimit = 10;
+
 // Daemon images become blob URLs, a bounded number at a time; evicted ones are revoked.
 const blobs = new Map<string, string>();
 const blobLimit = 150;
@@ -1281,16 +1284,43 @@ const MessageList = ({
     virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
   }, [rows.length, virtualizer]);
 
+  // Loads the next older page, one at a time, rendering again once each settles to check the fill.
+  const [, setLoads] = useState(0);
+  const older = () => {
+    if (!conversation.next || olderError || loading.current) return;
+    loading.current = true;
+    void onOlder().finally(() => {
+      loading.current = false;
+      setLoads((count) => count + 1);
+    });
+  };
+
+  // A page that doesn't fill the list can't be scrolled to load more, such as an empty one past a
+  // run of tool calls, or one whose messages are all deleted: older pages load on their own, up
+  // to a bound, and Load older stays offered.
+  const fills = useRef(0);
+  const [short, setShort] = useState(false);
+  // After every render: measuring rows changes the height without changing any input.
+  useEffect(() => {
+    const element = scroller.current;
+    if (!element) return;
+    const unfilled = element.scrollHeight - element.clientHeight < 300;
+    setShort(unfilled);
+    if (!unfilled) fills.current = 0;
+    if (!unfilled || fills.current >= autoFillLimit || !conversation.next || olderError) return;
+    if (loading.current) return;
+    fills.current++;
+    older();
+  });
+
   const onScroll = () => {
     const element = scroller.current;
     if (!element) return;
     atBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
     setLatest(!atBottom.current || conversation.detached);
     if (element.scrollTop < 300 && conversation.next && !olderError && !loading.current) {
-      loading.current = true;
-      void onOlder().finally(() => {
-        loading.current = false;
-      });
+      fills.current = 0;
+      older();
     }
   };
 
@@ -1314,6 +1344,19 @@ const MessageList = ({
           ) : null}
           <button type="button" onClick={onLatest}>
             Back to latest
+          </button>
+        </div>
+      ) : short && conversation.next ? (
+        <div className="older-more">
+          <button
+            type="button"
+            data-load-older
+            onClick={() => {
+              fills.current = 0;
+              older();
+            }}
+          >
+            Load older messages
           </button>
         </div>
       ) : null}

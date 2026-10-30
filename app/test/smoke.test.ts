@@ -72,6 +72,7 @@ class FakeDaemon {
   pageDelay = 0;
   olderDelay = 0;
   failOlder = false;
+  emptyPages = 0;
   stallNext = false;
   stalled = 0;
   stalledDone = 0;
@@ -88,6 +89,7 @@ class FakeDaemon {
     puts: [] as { id: string; part: string; body: Record<string, unknown> }[],
     stops: [] as number[],
     staleCursors: 0,
+    olderReads: 0,
     receipts: 0,
     // Requests each server instance got, by its number.
     requests: [] as number[],
@@ -163,15 +165,28 @@ class FakeDaemon {
       const before = url.searchParams.get("before");
       const limit = Number(url.searchParams.get("limit") ?? 50);
       let end = this.messages.length;
+      // Pages before the latest that a run of tool calls left without a visible message.
+      let empty = this.emptyPages;
       if (before !== null) {
-        const cursor = /^c\.(\d+)\.(\d+)$/.exec(before);
+        const cursor = /^c\.(\d+)\.(\d+)(?:\.(\d+))?$/.exec(before);
         if (!cursor || Number(cursor[1]) !== index || this.failOlder) {
           if (cursor && Number(cursor[1]) !== index) this.log.staleCursors++;
           return Response.json({ error: "Invalid conversation cursor. Refresh." }, { status: 400 });
         }
         end = Number(cursor[2]);
+        empty = Number(cursor[3] ?? 0);
+        this.log.olderReads++;
         await delay(this.olderDelay);
       }
+      if (empty > 0)
+        return Response.json({
+          messages: [],
+          sessionID,
+          next: `c.${index}.${end}.${empty - 1}`,
+          pending: [...this.pending],
+          recentEmojis: [],
+          clientMessageIDs: true,
+        });
       const start = Math.max(0, end - limit);
       const page = {
         messages: this.messages.slice(start, end).map((item, at) => this.view(item, start + at)),
@@ -736,6 +751,33 @@ test("long history: anchored prepend, selection across messages, a detached wind
       fake.failOlder = false;
       await js(`t.click("Back to latest", document.querySelector("[data-older-error]"))`);
       await until(`t.count() === 50 && !document.querySelector("[data-older-error]")`, "recovery");
+    },
+  );
+}, 170_000);
+
+test("history past empty pages loads without scrolling: on its own up to a bound, then by Load older", async () => {
+  await scenario(
+    "empty-pages",
+    (fake) => {
+      // The latest page and the eleven before it hold only tool calls; the message is older.
+      fake.emptyPages = 12;
+      fake.messages = [{ id: "m0", kind: "dot", text: "Before the tool calls" }];
+    },
+    async ({ fake, js, until }) => {
+      // Ten older pages load on their own, then Load older is offered; nothing scrolled.
+      await until(`!!document.querySelector("[data-load-older]")`, "Load older", 30);
+      await delay(1500);
+      expect(fake.log.olderReads).toBe(10);
+      expect(await js(`!!t.msg("m0")`)).toBe(false);
+      await js(`document.querySelector("[data-load-older]").click(), true`);
+      await until(`!!t.msg("m0")`, "the older message");
+      expect(fake.log.olderReads).toBe(12);
+      // Polls of the unchanged empty latest page keep it, and nothing more is read.
+      await delay(2500);
+      expect(
+        await js(`({ shown: !!t.msg("m0"), more: !!document.querySelector("[data-load-older]") })`),
+      ).toEqual({ shown: true, more: false });
+      expect(fake.log.olderReads).toBe(12);
     },
   );
 }, 170_000);

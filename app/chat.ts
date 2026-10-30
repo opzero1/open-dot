@@ -390,6 +390,8 @@ export interface Conversation {
   pending: PendingView[];
   // The cursor for older messages, or null at the start or once a daemon restart voided it.
   next: string | null;
+  // The latest page's own cursor: an empty latest page with the same one means nothing new came.
+  latestNext: string | null;
   // True once older pages pushed the newest messages out: polls refresh what's loaded in place,
   // and Back to latest returns.
   detached: boolean;
@@ -402,6 +404,7 @@ const fresh = (page: PageView): Conversation => ({
   latest: page.messages,
   pending: page.pending,
   next: page.next,
+  latestNext: page.next,
   detached: false,
 });
 
@@ -433,10 +436,15 @@ export const mergeLatest = (
       latest: page.messages,
       pending: page.pending,
       next: page.generation === current.generation ? current.next : null,
+      latestNext: page.next,
     };
   }
   if (page.generation !== current.generation) return fresh(page);
   const first = page.messages[0];
+  // A latest page with nothing to show, whose cursor hasn't moved, keeps the older pages loaded
+  // beneath it: nothing arrived in between.
+  if (!first && page.next !== null && page.next === current.latestNext)
+    return { ...current, latest: [], pending: page.pending };
   const cut = first ? current.messages.findIndex((message) => message.id === first.id) : -1;
   // A page that doesn't overlap what's shown starts over, so no gap is hidden.
   if (cut < 0) return fresh(page);
@@ -452,6 +460,7 @@ export const mergeLatest = (
     latest: page.messages,
     pending: page.pending,
     next: start > 0 ? page.next : current.next,
+    latestNext: page.next,
   };
 };
 

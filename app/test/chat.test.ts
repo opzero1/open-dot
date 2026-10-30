@@ -332,6 +332,19 @@ test("latest pages keep loaded history, a new session starts over, and a detache
   expect(wide.detached).toBe(false);
 });
 
+test("an empty latest page with a continuation keeps older pages until its cursor moves", () => {
+  const empty = page([], { next: "head" });
+  const older = mergeOlder(mergeLatest(undefined, empty), page(["a"], { next: "older" }));
+  expect(ids(older)).toEqual(["a"]);
+  const polled = mergeLatest(older, empty);
+  expect(ids(polled)).toEqual(["a"]);
+  expect(polled.next).toBe("older");
+  // New mechanics moved the head: what's loaded may hide a gap, so it starts over.
+  const moved = mergeLatest(polled, page([], { next: "moved" }));
+  expect(ids(moved)).toEqual([]);
+  expect(moved.next).toBe("moved");
+});
+
 test("a restarted daemon voids old cursors, and older pages from another daemon are ignored", () => {
   const start = mergeOlder(mergeLatest(undefined, page(["b", "c"])), page(["a"]));
   // Same session, new daemon: the old cursor can't be read, so the view starts from its latest page.
