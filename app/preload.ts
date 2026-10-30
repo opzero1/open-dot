@@ -10,6 +10,7 @@ const call =
 const bridge: Bridge = {
   dots: call("dots"),
   messages: call("messages"),
+  message: call("message"),
   send: call("send"),
   attempts: call("attempts"),
   reconcile: call("reconcile"),
@@ -22,6 +23,7 @@ const bridge: Bridge = {
   ingest: call("ingest"),
   openLink: call("openLink"),
   copyText: call("copyText"),
+  shareText: call("shareText"),
   copyMessage: call("copyMessage"),
   shareMessage: call("shareMessage"),
   emojiPanel: call("emojiPanel"),

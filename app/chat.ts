@@ -291,30 +291,31 @@ export const canReact = (message: MessageView) =>
 export const reactionOf = (message: MessageView, actor: "owner" | "dot") =>
   message.reactions.find((reaction) => reaction.actor === actor)?.emoji ?? null;
 
-/** A change the owner made that a read hasn't shown yet: a reaction or whether it's hidden. */
+/**
+ * A change the owner made to one message, a reaction or whether it's hidden, shown over what reads
+ * return until a read settles it. `settledAt` is when its call returned; until then, and whenever
+ * its outcome is unknown, it blocks any other change to that message.
+ */
 export interface Intent {
   sessionID: string;
   emoji?: string | null;
   hidden?: boolean;
+  settledAt?: number;
 }
 
-/**
- * Shows each intended change over a page until a read for the same session shows it, so a read
- * that started before the change can't flicker it back. Returns the messages and the intents
- * still waiting.
- */
+const showsIntent = (message: MessageView, intent: Intent) =>
+  (intent.emoji === undefined || reactionOf(message, "owner") === intent.emoji) &&
+  (intent.hidden === undefined || message.hidden === intent.hidden);
+
+/** Shows each intended change over the messages as reads returned them. */
 export const applyIntents = (
   messages: MessageView[],
   intents: ReadonlyMap<string, Intent>,
-): { messages: MessageView[]; waiting: Map<string, Intent> } => {
-  const waiting = new Map<string, Intent>();
-  const shown = messages.map((message) => {
+): MessageView[] =>
+  messages.map((message) => {
     const intent = intents.get(message.id);
-    if (!intent || intent.sessionID !== message.sessionID) return message;
-    const emojiShown = intent.emoji === undefined || reactionOf(message, "owner") === intent.emoji;
-    const hiddenShown = intent.hidden === undefined || message.hidden === intent.hidden;
-    if (emojiShown && hiddenShown) return message;
-    waiting.set(message.id, intent);
+    if (!intent || intent.sessionID !== message.sessionID || showsIntent(message, intent))
+      return message;
     return {
       ...message,
       hidden: intent.hidden ?? message.hidden,
@@ -323,66 +324,213 @@ export const applyIntents = (
           ? message.reactions
           : [
               ...message.reactions.filter((reaction) => reaction.actor !== "owner"),
-              { actor: "owner" as const, emoji: intent.emoji, updatedAt: Date.now() },
+              { actor: "owner" as const, emoji: intent.emoji, updatedAt: intent.settledAt ?? 0 },
             ],
     };
   });
-  // Intents for messages outside this page wait for a page that has them.
-  for (const [id, intent] of intents)
-    if (!messages.some((message) => message.id === id)) waiting.set(id, intent);
-  return { messages: shown, waiting };
-};
+
+/**
+ * The intents a read settles: its call has returned, and the read either started after that or
+ * already shows the change. A read that started earlier can't flicker the change back, and a read
+ * that started later is the daemon's word, even when the change didn't take.
+ */
+export const settledBy = (
+  messages: readonly MessageView[],
+  intents: ReadonlyMap<string, Intent>,
+  startedAt: number,
+): string[] =>
+  messages.flatMap((message) => {
+    const intent = intents.get(message.id);
+    return intent?.settledAt !== undefined &&
+      intent.sessionID === message.sessionID &&
+      (startedAt >= intent.settledAt || showsIntent(message, intent))
+      ? [message.id]
+      : [];
+  });
 
 export const historyLimit = 600;
 
 export interface Conversation {
   sessionID: string;
+  // Which discovered daemon the cursor came from; another one can't read it.
+  generation: number;
+  // What's loaded, oldest first: the latest page and any older pages above it.
   messages: MessageView[];
+  // The latest page alone, for unread counts and Delivered, even while reading older messages.
+  latest: MessageView[];
   pending: PendingView[];
-  // The cursor for older messages, or null at the start of the conversation.
+  // The cursor for older messages, or null at the start or once a daemon restart voided it.
   next: string | null;
-  // True once older pages pushed the latest messages out: polls then wait for Back to latest.
+  // True once older pages pushed the newest messages out: polls refresh what's loaded in place,
+  // and Back to latest returns.
   detached: boolean;
 }
 
+const fresh = (page: PageView): Conversation => ({
+  sessionID: page.sessionID,
+  generation: page.generation,
+  messages: page.messages,
+  latest: page.messages,
+  pending: page.pending,
+  next: page.next,
+  detached: false,
+});
+
+/** Index of the first or last message in `keep`, such as those a selection spans. */
+const kept = (messages: readonly MessageView[], keep: ReadonlySet<string>, last: boolean) =>
+  last
+    ? messages.findLastIndex((message) => keep.has(message.id))
+    : messages.findIndex((message) => keep.has(message.id));
+
 /**
- * Merges the latest page into what's shown. A new session replaces everything; otherwise older
- * messages already loaded stay above the page, up to the history limit.
+ * Merges the latest page into what's shown. A new session, or a restarted daemon whose cursors the
+ * old ones can't continue, starts over unless the owner is reading older messages; a page from a
+ * daemon older than what's shown is ignored. Past the history limit the oldest messages go, except
+ * any in `keep`.
  */
-export const mergeLatest = (current: Conversation | undefined, page: PageView): Conversation => {
-  if (!current || current.sessionID !== page.sessionID || current.detached)
+export const mergeLatest = (
+  current: Conversation | undefined,
+  page: PageView,
+  keep: ReadonlySet<string> = new Set(),
+): Conversation => {
+  if (!current || current.sessionID !== page.sessionID) return fresh(page);
+  if (page.generation < current.generation) return current;
+  if (current.detached) {
+    const read = new Map(page.messages.map((message) => [message.id, message]));
     return {
-      sessionID: page.sessionID,
-      messages: page.messages,
+      ...current,
+      generation: page.generation,
+      messages: current.messages.map((message) => read.get(message.id) ?? message),
+      latest: page.messages,
       pending: page.pending,
-      next: page.next,
-      detached: false,
+      next: page.generation === current.generation ? current.next : null,
     };
+  }
+  if (page.generation !== current.generation) return fresh(page);
   const first = page.messages[0];
   const cut = first ? current.messages.findIndex((message) => message.id === first.id) : -1;
   // A page that doesn't overlap what's shown starts over, so no gap is hidden.
-  if (cut < 0)
-    return { ...current, messages: page.messages, pending: page.pending, next: page.next };
+  if (cut < 0) return fresh(page);
   const messages = [...current.messages.slice(0, cut), ...page.messages];
+  const keepFrom = kept(messages, keep, false);
+  const start = Math.max(
+    0,
+    Math.min(messages.length - historyLimit, keepFrom < 0 ? Infinity : keepFrom),
+  );
   return {
     ...current,
-    messages: messages.slice(-historyLimit),
+    messages: messages.slice(start),
+    latest: page.messages,
     pending: page.pending,
-    next: messages.length > historyLimit ? page.next : current.next,
+    next: start > 0 ? page.next : current.next,
   };
 };
 
-/** Prepends an older page; past the limit the newest messages go and polls wait for Latest. */
-export const mergeOlder = (current: Conversation, page: PageView): Conversation => {
-  if (page.sessionID !== current.sessionID) return current;
+/**
+ * Prepends an older page from the same session and daemon. Past the limit the newest messages go,
+ * except any in `keep`, and polls then wait for Back to latest.
+ */
+export const mergeOlder = (
+  current: Conversation,
+  page: PageView,
+  keep: ReadonlySet<string> = new Set(),
+): Conversation => {
+  if (page.sessionID !== current.sessionID || page.generation !== current.generation)
+    return current;
   const known = new Set(current.messages.map((message) => message.id));
   const messages = [
     ...page.messages.filter((message) => !known.has(message.id)),
     ...current.messages,
   ];
-  const detached = current.detached || messages.length > historyLimit;
-  return { ...current, messages: messages.slice(0, historyLimit), next: page.next, detached };
+  const end = Math.max(historyLimit, kept(messages, keep, true) + 1);
+  return {
+    ...current,
+    messages: messages.slice(0, end),
+    next: page.next,
+    detached: current.detached || end < messages.length,
+  };
 };
+
+/** Puts a message as a pinned read returned it wherever it's loaded, in the same session. */
+export const replaceMessage = (current: Conversation, message: MessageView): Conversation => {
+  if (message.sessionID !== current.sessionID) return current;
+  const swap = (list: MessageView[]) =>
+    list.some((item) => item.id === message.id)
+      ? list.map((item) => (item.id === message.id ? message : item))
+      : list;
+  return { ...current, messages: swap(current.messages), latest: swap(current.latest) };
+};
+
+// Sends the app made, with what they captured, kept only while a row still shows them.
+
+export interface Sent {
+  dot: string;
+  sessionID: string;
+  captured: Captured;
+  at: number;
+  // `unknown` while its outcome is unknown, `pending` once the daemon has it.
+  state: "unknown" | "pending";
+  // Whether a read listed it as pending, so its leaving means it was delivered or cancelled.
+  listed: boolean;
+}
+
+export const sentLimit = 20;
+
+/**
+ * Drops sends a page shows are done: delivered into the history, gone from pending after being
+ * listed, from an old session, or never listed within a minute. Unknown sends wait for their
+ * receipt. At most `sentLimit` are kept, newest first.
+ */
+export const keepSent = (
+  sent: ReadonlyMap<string, Sent>,
+  dot: string,
+  page: Pick<PageView, "sessionID" | "messages" | "pending">,
+  now: number,
+): Map<string, Sent> => {
+  const pending = new Set(page.pending.map((item) => item.id));
+  const delivered = new Set(page.messages.map((item) => item.id));
+  const next = new Map<string, Sent>();
+  for (const [id, item] of sent) {
+    if (item.dot !== dot || item.state === "unknown") next.set(id, item);
+    else if (item.sessionID !== page.sessionID || delivered.has(id)) continue;
+    else if (pending.has(id)) next.set(id, item.listed ? item : { ...item, listed: true });
+    else if (!item.listed && now - item.at < 60_000) next.set(id, item);
+  }
+  return new Map([...next].toSorted(([, a], [, b]) => b.at - a.at).slice(0, sentLimit));
+};
+
+/** Send now and Cancel, as the notch offers them: nothing while open-dot confirms a send. */
+export const pendingActions = (pending: PendingView) => ({
+  sendNow:
+    pending.status === "sending" || (pending.status === "sent" && pending.delivery === "queue"),
+  cancel: pending.status === "sending" || pending.status === "sent",
+});
+
+/** A worker opens once its session exists, and stops (or tries again) until it's done. */
+export const workerActions = (state: string) => ({
+  open: state !== "creating",
+  stop: state !== "done",
+});
+
+/** Attachments the app shows as images; anything else is listed by name. */
+export const isImageType = (mime: string) =>
+  ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(
+    mime.split(";")[0]?.trim().toLowerCase() ?? "",
+  );
+
+export const fallbackTapbacks = ["🧐", "✋", "👀", "🧠", "🔥"] as const;
+
+/** The menu's second row, always five: recent choices, then fallbacks not already shown. */
+export const recentTapbacks = (recent: readonly string[]) => {
+  const used = recent.slice(0, 5);
+  return [...used, ...fallbackTapbacks.filter((emoji) => !used.includes(emoji))].slice(0, 5);
+};
+
+/** The owner's current reaction when neither row shows it, listed on its own so it can go. */
+export const unlistedTapback = (selected: string | null, row: readonly string[]) =>
+  selected && !(tapbacks as readonly string[]).includes(selected) && !row.includes(selected)
+    ? selected
+    : undefined;
 
 export const pendingLabel = { sending: "Sending…", confirming: "Confirming…", sent: "Sent" };
 

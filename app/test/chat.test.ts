@@ -10,17 +10,27 @@ import {
   emptyDraft,
   historyLimit,
   imageInfo,
+  isImageType,
+  keepSent,
   imageProblem,
   loopbackEndpoint,
   mergeLatest,
   mergeOlder,
+  pendingActions,
+  recentTapbacks,
   redoDraft,
+  replaceMessage,
   returnAction,
   safeExternalURL,
+  type Sent,
   sendOutcome,
+  sentLimit,
   settled,
+  settledBy,
   undoDraft,
+  unlistedTapback,
   unreadSince,
+  workerActions,
 } from "../chat";
 
 test("links open only as http, https or mailto, without credentials or hidden characters", () => {
@@ -213,24 +223,27 @@ test("the owner reacts only to the dot's visible messages", () => {
     expect(canReact(message("a", { kind }))).toBe(false);
 });
 
-test("a stale read can't undo a change until a read for the same session shows it", () => {
-  const intents = new Map([["a", { sessionID: "ses_a", emoji: "👍", hidden: true }]]);
-  const stale = applyIntents([message("a")], intents);
-  expect(stale.messages[0]).toMatchObject({
+test("a change stays shown over stale reads until a read that started after its call settles it", () => {
+  const pendingIntent = { sessionID: "ses_a", emoji: "👍", hidden: true };
+  const shown = applyIntents([message("a")], new Map([["a", pendingIntent]]));
+  expect(shown[0]).toMatchObject({ hidden: true, reactions: [{ actor: "owner", emoji: "👍" }] });
+  // While its call is out, nothing settles it, even a read that already shows it.
+  const showing = message("a", {
     hidden: true,
-    reactions: [{ actor: "owner", emoji: "👍" }],
+    reactions: [{ actor: "owner", emoji: "👍", updatedAt: 1 }],
   });
-  expect(stale.waiting.size).toBe(1);
-  const fresh = applyIntents(
-    [message("a", { hidden: true, reactions: [{ actor: "owner", emoji: "👍", updatedAt: 1 }] })],
-    intents,
-  );
-  expect(fresh.waiting.size).toBe(0);
-  // An intent from another session never paints this one.
-  const other = applyIntents([message("a", { sessionID: "ses_b" })], intents);
-  expect(other.messages[0]?.hidden).toBe(false);
-  // A message outside this page keeps its intent for a later page.
-  expect(applyIntents([], intents).waiting.size).toBe(1);
+  expect(settledBy([showing], new Map([["a", pendingIntent]]), 100)).toEqual([]);
+  const returned = new Map([["a", { ...pendingIntent, settledAt: 50 }]]);
+  // A read that started before the call returned and shows the old state can't settle it...
+  expect(settledBy([message("a")], returned, 40)).toEqual([]);
+  // ...but one that shows the change, or that started after the call returned, does: the second is
+  // the daemon's word even when the change didn't take.
+  expect(settledBy([showing], returned, 40)).toEqual(["a"]);
+  expect(settledBy([message("a")], returned, 50)).toEqual(["a"]);
+  // An intent from another session never paints or settles this one.
+  const other = message("a", { sessionID: "ses_b" });
+  expect(applyIntents([other], returned)[0]?.hidden).toBe(false);
+  expect(settledBy([other], returned, 99)).toEqual([]);
 });
 
 const page = (ids: string[], fields: Partial<PageView> = {}): PageView => ({
@@ -239,26 +252,131 @@ const page = (ids: string[], fields: Partial<PageView> = {}): PageView => ({
   next: "cursor",
   pending: [],
   recentEmojis: [],
+  generation: 1,
   ...fields,
 });
 
-test("latest pages keep loaded history, a new session starts over, and older pages past the limit detach", () => {
+const ids = (conversation: { messages: MessageView[] }) =>
+  conversation.messages.map((item) => item.id);
+
+test("latest pages keep loaded history, a new session starts over, and a detached view survives polls", () => {
   const start = mergeLatest(undefined, page(["b", "c"]));
   const older = mergeOlder(start, page(["a"], { next: null }));
-  expect(older.messages.map((item) => item.id)).toEqual(["a", "b", "c"]);
+  expect(ids(older)).toEqual(["a", "b", "c"]);
   const polled = mergeLatest(older, page(["c", "d"]));
-  expect(polled.messages.map((item) => item.id)).toEqual(["a", "b", "c", "d"]);
+  expect(ids(polled)).toEqual(["a", "b", "c", "d"]);
   expect(polled.next).toBeNull();
-  const moved = mergeLatest(polled, page(["x"], { sessionID: "ses_b" }));
-  expect(moved.messages.map((item) => item.id)).toEqual(["x"]);
+  expect(ids(mergeLatest(polled, page(["x"], { sessionID: "ses_b" })))).toEqual(["x"]);
   const many = Array.from({ length: historyLimit }, (_, index) => `m${index}`);
   const full = mergeLatest(undefined, page(many));
-  const detached = mergeOlder(full, page(["older"]));
+  const detached = mergeOlder(full, page(["older"], { next: "older-cursor" }));
   expect(detached.detached).toBe(true);
   expect(detached.messages).toHaveLength(historyLimit);
   expect(detached.messages[0]?.id).toBe("older");
-  // Back to latest: a detached view takes the next latest page whole.
-  expect(mergeLatest(detached, page(["new"])).messages.map((item) => item.id)).toEqual(["new"]);
+  // Polls keep the reading window, refresh what it shows, and track the latest page apart.
+  const hidden = page(["m0", "new"]);
+  hidden.messages[0] = message("m0", { hidden: true });
+  const kept = mergeLatest(detached, hidden);
+  expect(ids(kept)).toEqual(ids(detached));
+  expect(kept.messages[1]).toMatchObject({ id: "m0", hidden: true });
+  expect(kept.latest.map((item) => item.id)).toEqual(["m0", "new"]);
+  expect(kept.next).toBe("older-cursor");
+  // Pushing past the limit keeps selected messages instead of cutting them.
+  const selected = new Set([`m${historyLimit - 1}`]);
+  const wide = mergeOlder(full, page(["older"]), selected);
+  expect(wide.messages).toHaveLength(historyLimit + 1);
+  expect(wide.detached).toBe(false);
+});
+
+test("a restarted daemon voids old cursors, and older pages from another daemon are ignored", () => {
+  const start = mergeOlder(mergeLatest(undefined, page(["b", "c"])), page(["a"]));
+  // Same session, new daemon: the old cursor can't be read, so the view starts from its latest page.
+  const restarted = mergeLatest(start, page(["c", "d"], { generation: 2, next: "new-cursor" }));
+  expect(ids(restarted)).toEqual(["c", "d"]);
+  expect(restarted).toMatchObject({ generation: 2, next: "new-cursor" });
+  // A late page from the old daemon changes nothing.
+  expect(mergeLatest(restarted, page(["z"], { generation: 1 }))).toBe(restarted);
+  expect(mergeOlder(restarted, page(["y"], { generation: 1 }))).toBe(restarted);
+  // While reading older messages, the window stays but the dead cursor goes.
+  const detached = { ...start, detached: true };
+  const kept = mergeLatest(detached, page(["c", "d"], { generation: 2 }));
+  expect(ids(kept)).toEqual(["a", "b", "c"]);
+  expect(kept.next).toBeNull();
+});
+
+test("a pinned read replaces an older loaded message, in its own session only", () => {
+  const start = mergeOlder(mergeLatest(undefined, page(["b"])), page(["a"]));
+  const updated = replaceMessage(start, message("a", { hidden: true }));
+  expect(updated.messages[0]?.hidden).toBe(true);
+  expect(replaceMessage(start, message("a", { sessionID: "ses_b", hidden: true }))).toBe(start);
+});
+
+const captured = { text: "hi", images: [] };
+const sentItem = (fields: Partial<Sent> = {}): Sent => ({
+  dot: "jojo",
+  sessionID: "ses_a",
+  captured,
+  at: 1000,
+  state: "pending",
+  listed: false,
+  ...fields,
+});
+
+const listed = (pending: string[], messages: string[] = [], sessionID = "ses_a") => ({
+  sessionID,
+  messages: messages.map((id) => message(id)),
+  pending: pending.map((id) => ({ id, status: "sent" as const, delivery: "queue" })),
+});
+
+test("a send's capture goes once it's delivered, cancelled, from an old session or never listed", () => {
+  let sent = new Map([
+    ["p", sentItem()],
+    ["u", sentItem({ state: "unknown" })],
+    ["other", sentItem({ dot: "polnareff" })],
+  ]);
+  sent = keepSent(sent, "jojo", listed(["p"]), 2000);
+  expect(sent.get("p")?.listed).toBe(true);
+  // Gone from pending after being listed: delivered or cancelled.
+  expect([...keepSent(sent, "jojo", listed([]), 2000).keys()].toSorted()).toEqual(["other", "u"]);
+  // Not listed yet: a read may have started before the send; it waits a minute.
+  const fresh = new Map([["n", sentItem()]]);
+  expect(keepSent(fresh, "jojo", listed([]), 30_000).has("n")).toBe(true);
+  expect(keepSent(fresh, "jojo", listed([]), 70_000).has("n")).toBe(false);
+  expect(keepSent(fresh, "jojo", listed([], ["n"]), 2000).has("n")).toBe(false);
+  expect(keepSent(fresh, "jojo", listed(["n"], [], "ses_b"), 2000).has("n")).toBe(false);
+  const many = new Map(
+    Array.from({ length: sentLimit + 5 }, (_, index) => [`s${index}`, sentItem({ at: index })]),
+  );
+  const bounded = keepSent(many, "polnareff", listed([]), 0);
+  expect(bounded.size).toBe(sentLimit);
+  expect(bounded.has(`s${sentLimit + 4}`)).toBe(true);
+});
+
+const actions = (status: "sending" | "confirming" | "sent", delivery: string | null) =>
+  pendingActions({ id: "p", status, delivery });
+
+test("pending, worker and attachment actions match the notch", () => {
+  expect(actions("sending", "auto")).toEqual({ sendNow: true, cancel: true });
+  expect(actions("sent", "queue")).toEqual({ sendNow: true, cancel: true });
+  expect(actions("sent", "steer")).toEqual({ sendNow: false, cancel: true });
+  expect(actions("confirming", "queue")).toEqual({ sendNow: false, cancel: false });
+  expect(workerActions("creating")).toEqual({ open: false, stop: true });
+  expect(workerActions("running")).toEqual({ open: true, stop: true });
+  expect(workerActions("stopping")).toEqual({ open: true, stop: true });
+  expect(workerActions("done")).toEqual({ open: true, stop: false });
+  expect(isImageType("image/PNG; charset=binary")).toBe(true);
+  expect(isImageType("image/svg+xml")).toBe(false);
+  expect(isImageType("application/pdf")).toBe(false);
+});
+
+test("the second Tapback row fills to five, and a reaction neither row shows is listed", () => {
+  expect(recentTapbacks([])).toEqual(["🧐", "✋", "👀", "🧠", "🔥"]);
+  expect(recentTapbacks(["🎉", "👀"])).toEqual(["🎉", "👀", "🧐", "✋", "🧠"]);
+  const row = recentTapbacks(["🎉"]);
+  expect(unlistedTapback("🦄", row)).toBe("🦄");
+  expect(unlistedTapback("🎉", row)).toBeUndefined();
+  expect(unlistedTapback("❤️", row)).toBeUndefined();
+  expect(unlistedTapback(null, row)).toBeUndefined();
 });
 
 test("Delivered marks only a trailing owner message with nothing pending, and unread waits for a baseline", () => {

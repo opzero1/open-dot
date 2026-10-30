@@ -90,6 +90,8 @@ export interface PageView {
   recentEmojis: string[];
   clientMessageIDs?: boolean;
   refreshError?: string;
+  /** Added by main: which discovered daemon answered. A new one can't read the old one's cursors. */
+  generation: number;
 }
 
 /** Where a send the app made stands, by the daemon's receipt; `unknown` means no row there. */
@@ -119,6 +121,15 @@ export type Result<T> =
       // The request may have reached the daemon: the outcome is unknown, not a failure.
       lost?: boolean;
     };
+
+/**
+ * What became of a send: `saved` (the daemon has it, under `id`), `unknown` (it may have arrived;
+ * the app tracks `id` and never sends it again) or `refused` (nothing was saved).
+ */
+export type SendResult =
+  | { outcome: "saved"; id: string; warning?: string }
+  | { outcome: "unknown"; id: string; error: string }
+  | { outcome: "refused"; error: string };
 
 export interface ImageInput {
   name: string;
@@ -162,8 +173,10 @@ export interface WorkerOpen {
 /** Everything the renderer can ask of main. Each call is validated again in main. */
 export interface Bridge {
   dots(): Promise<Result<DotView[]>>;
-  messages(dot: string, before?: string): Promise<Result<PageView>>;
-  send(input: SendInput): Promise<Result<{ id: string }>>;
+  messages(dot: string, before?: string, generation?: number): Promise<Result<PageView>>;
+  /** One message as the daemon has it now, in the session the app saw it in. */
+  message(dot: string, id: string, sessionID: string): Promise<Result<MessageView>>;
+  send(input: SendInput): Promise<SendResult>;
   attempts(): Promise<Attempt[]>;
   reconcile(attempt: Attempt): Promise<Result<ReceiptStatus>>;
   forget(messageID: string): Promise<void>;
@@ -175,6 +188,7 @@ export interface Bridge {
   ingest(input: ImageInput): Promise<Result<DraftImage>>;
   openLink(url: string): Promise<boolean>;
   copyText(text: string): Promise<boolean>;
+  shareText(text: string): Promise<boolean>;
   copyMessage(dot: string, id: string, sessionID: string): Promise<Result<true>>;
   shareMessage(dot: string, id: string, sessionID: string): Promise<Result<true>>;
   emojiPanel(): Promise<void>;
@@ -191,6 +205,7 @@ export type AppEvent = { kind: "shown" } | { kind: "shortcut"; registered: boole
 export const channels = [
   "dots",
   "messages",
+  "message",
   "send",
   "attempts",
   "reconcile",
@@ -203,6 +218,7 @@ export const channels = [
   "ingest",
   "openLink",
   "copyText",
+  "shareText",
   "copyMessage",
   "shareMessage",
   "emojiPanel",

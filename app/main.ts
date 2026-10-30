@@ -44,6 +44,7 @@ import {
   eventChannel,
   type ReceiptStatus,
   type Result,
+  type SendResult,
   type TrayState,
 } from "./bridge";
 import {
@@ -52,6 +53,7 @@ import {
   imageInfo,
   imageLimits,
   imageProblem,
+  isImageType,
   loopbackEndpoint,
   safeExternalURL,
   sendOutcome,
@@ -62,7 +64,14 @@ import {
 // instead of used; it never shows or focuses a window.
 const smoke = process.env.OPEN_DOT_APP_SMOKE === "1";
 const startHidden = smoke || process.argv.includes("--hidden");
-const recorded = { show: 0, focus: 0, openExternal: [] as string[], share: 0, shortcut: 0 };
+const recorded = {
+  show: 0,
+  focus: 0,
+  emojiPanel: 0,
+  openExternal: [] as string[],
+  clipboard: [] as { text?: string; images?: number }[],
+  shares: [] as { texts: number; files: number; directory: string }[],
+};
 
 if (process.env.OPEN_DOT_APP_DATA) app.setPath("userData", resolve(process.env.OPEN_DOT_APP_DATA));
 if (smoke) app.setActivationPolicy("accessory");
@@ -140,15 +149,29 @@ const home = process.env.OPEN_DOT_HOME
   ? resolve(process.env.OPEN_DOT_HOME.replace(/^~(?=$|\/)/, homedir()))
   : join(homedir(), ".opendot");
 let endpoint: Endpoint | undefined;
-// Whether the running daemon takes the app's own message IDs, from its latest message page.
-let clientIDs = false;
+// The last daemon discovered, by address and token, and how many have been: a new one voids the
+// old one's cursors and whatever it said it could do.
+let endpointKey: string | undefined;
+let generation = 0;
+// The daemon, by key, whose message page said it takes the app's own message IDs, and one that
+// answered a send with another ID, which the app no longer sends to.
+let capable: string | undefined;
+let distrusted: string | undefined;
 
-const loadEndpoint = () => {
+const keyOf = (target: Endpoint) => `${target.url}\n${target.token}`;
+
+const current = () => {
+  if (endpoint) return endpoint;
   try {
     const raw = readFileSync(join(home, "api.json"), "utf8");
     endpoint = raw.length < 4096 ? loopbackEndpoint(JSON.parse(raw)) : undefined;
   } catch {
     endpoint = undefined;
+  }
+  if (endpoint && keyOf(endpoint) !== endpointKey) {
+    endpointKey = keyOf(endpoint);
+    generation++;
+    capable = undefined;
   }
   return endpoint;
 };
@@ -164,19 +187,23 @@ interface Answer {
  * before the request went out is status 0; one after it may have arrived is `lost`.
  */
 const exchange = (
+  target: Endpoint | undefined,
   method: string,
   path: string,
   body?: unknown,
   timeout = 10_000,
   limit = 16 * 1024 * 1024,
 ): Promise<Answer | { failed: string; lost: boolean }> => {
-  const target = endpoint ?? loadEndpoint();
   if (!target) return Promise.resolve({ failed: "open-dot's daemon isn't running.", lost: false });
   const data = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
+  // Only this daemon's failure sends the app back to api.json, not one it already replaced.
+  const rediscover = () => {
+    if (endpoint === target) endpoint = undefined;
+  };
   return new Promise((done) => {
     let sent = false;
     const forget = (failed: string) => {
-      endpoint = undefined;
+      rediscover();
       done({ failed, lost: sent });
     };
     const request = httpRequest(
@@ -203,7 +230,7 @@ const exchange = (
         response.on("end", () => {
           const status = response.statusCode ?? 0;
           // A new token means the daemon restarted; a redirect is no daemon's answer.
-          if (status === 401 || (status >= 300 && status < 400)) endpoint = undefined;
+          if (status === 401 || (status >= 300 && status < 400)) rediscover();
           done({
             status,
             type: response.headers["content-type"] ?? "",
@@ -253,8 +280,9 @@ const json = async (
   path: string,
   body?: unknown,
   timeout?: number,
+  target = current(),
 ): Promise<Result<unknown>> => {
-  const answer = await exchange(method, path, body, timeout);
+  const answer = await exchange(target, method, path, body, timeout);
   if ("failed" in answer) return unreached(answer);
   if (answer.status < 200 || answer.status >= 300) return failure(answer);
   try {
@@ -265,7 +293,14 @@ const json = async (
 };
 
 const bytes = async (path: string): Promise<Result<Bytes>> => {
-  const answer = await exchange("GET", path, undefined, 20_000, imageLimits.bytes + 1024);
+  const answer = await exchange(
+    current(),
+    "GET",
+    path,
+    undefined,
+    20_000,
+    imageLimits.bytes + 1024,
+  );
   if ("failed" in answer) return unreached(answer);
   if (answer.status !== 200) return failure(answer);
   // Only the four raster types, by their bytes, whatever the daemon labelled them.
@@ -344,8 +379,21 @@ const validImage = (image: unknown): image is DraftImage => {
   );
 };
 
-const send = async (input: unknown): Promise<Result<{ id: string }>> => {
-  if (!isRecord(input)) return { ok: false, error: "Bad send.", status: 0 };
+const refused = (error: string): SendResult => ({ outcome: "refused", error });
+
+/** Whether this daemon's latest page says it takes the app's own message IDs. */
+const takesClientIDs = (target: Endpoint, page: Result<unknown>) => {
+  if (!page.ok || keyOf(target) !== endpointKey) return;
+  const key = keyOf(target);
+  if (isRecord(page.value) && page.value.clientMessageIDs === true && distrusted !== key)
+    capable = key;
+  else if (capable === key) capable = undefined;
+};
+
+const messageIDPattern = /^msg_[\w-]{1,100}$/;
+
+const send = async (input: unknown): Promise<SendResult> => {
+  if (!isRecord(input)) return refused("Bad send.");
   const { dot, sessionID, text, replyTo, images } = input;
   if (
     !isName(dot) ||
@@ -356,18 +404,25 @@ const send = async (input: unknown): Promise<Result<{ id: string }>> => {
     images.length > imageLimits.count ||
     !images.every(validImage)
   )
-    return { ok: false, error: "That message can't be sent.", status: 0 };
-  if (!clientIDs)
-    return {
-      ok: false,
-      error: "This daemon can't confirm the app's sends. Update and restart open-dot's daemon.",
-      status: 0,
-    };
+    return refused("That message can't be sent.");
+  const target = current();
+  if (!target) return refused("open-dot's daemon isn't running.");
+  const key = keyOf(target);
+  // Only to a daemon this one discovery verified: a restarted, older one would ignore the app's ID.
+  if (capable !== key && distrusted !== key)
+    takesClientIDs(
+      target,
+      await json("GET", `/dots/${segment(dot)}/messages?limit=1`, undefined, 10_000, target),
+    );
+  if (capable !== key)
+    return refused(
+      "This daemon can't confirm the app's sends. Update and restart open-dot's daemon.",
+    );
   const messageID = SessionMessage.ID.create();
   try {
     writeAttempts([...readAttempts(), { dot, sessionID, messageID, createdAt: Date.now() }]);
   } catch {
-    return { ok: false, error: "Couldn't save the send record, so nothing was sent.", status: 0 };
+    return refused("Couldn't save the send record, so nothing was sent.");
   }
   const result = await json(
     "POST",
@@ -388,10 +443,38 @@ const send = async (input: unknown): Promise<Result<{ id: string }>> => {
         : {}),
     },
     60_000,
+    target,
   );
   // Only an answer that says what happened settles the record; anything else stays to reconcile.
-  if (sendOutcome(result) !== "unknown") forgetAttempt(messageID);
-  return result.ok ? { ok: true, value: { id: messageID } } : result;
+  if (!result.ok) {
+    if (sendOutcome(result) === "unknown")
+      return { outcome: "unknown", id: messageID, error: result.error };
+    forgetAttempt(messageID);
+    return refused(result.error);
+  }
+  const saved = isRecord(result.value) ? result.value.id : undefined;
+  if (saved === messageID) {
+    forgetAttempt(messageID);
+    return { outcome: "saved", id: messageID };
+  }
+  if (typeof saved === "string" && messageIDPattern.test(saved)) {
+    // It saved the message under an ID of its own, so the app's ID tracks nothing: the message is
+    // there, and the app sends nothing more to this daemon.
+    forgetAttempt(messageID);
+    distrusted = key;
+    capable = undefined;
+    return {
+      outcome: "saved",
+      id: saved,
+      warning:
+        "open-dot's daemon saved this message without the app's ID, so the app stopped sending. Update and restart open-dot's daemon.",
+    };
+  }
+  return {
+    outcome: "unknown",
+    id: messageID,
+    error: "open-dot's answer didn't say which message it saved.",
+  };
 };
 
 const receipts: readonly unknown[] = [
@@ -424,7 +507,8 @@ interface Authoritative {
   id: string;
   sessionID: string;
   text: string;
-  attachments: number[];
+  // The images among its attachments, by index.
+  images: number[];
 }
 
 /** The message as the daemon has it now, in the session the owner saw it in. */
@@ -448,8 +532,13 @@ const readMessage = async (
       id,
       sessionID,
       text: typeof value.text === "string" ? value.text : "",
-      attachments: attachments.flatMap((item) =>
-        isRecord(item) && isIndex(item.index) ? [item.index] : [],
+      images: attachments.flatMap((item) =>
+        isRecord(item) &&
+        isIndex(item.index) &&
+        typeof item.mime === "string" &&
+        isImageType(item.mime)
+          ? [item.index]
+          : [],
       ),
     },
   };
@@ -458,29 +547,59 @@ const readMessage = async (
 const isIndex = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-const messageImages = async (dot: string, message: Authoritative) => {
+const exportLimit = 10;
+
+/** Every image of the message, or a failure if any one can't be read: never a partial set. */
+const messageImages = async (
+  dot: string,
+  message: Authoritative,
+  verb: string,
+): Promise<Result<Bytes[]>> => {
+  if (message.images.length > exportLimit)
+    return {
+      ok: false,
+      error: `This message has more than ${exportLimit} images, so nothing was ${verb}.`,
+    };
   const images: Bytes[] = [];
-  for (const index of message.attachments.slice(0, imageLimits.count)) {
+  for (const index of message.images) {
     const read = await bytes(
       `/dots/${segment(dot)}/messages/${segment(message.id)}/attachments/${index}?sessionID=${segment(message.sessionID)}`,
     );
-    if (read.ok) images.push(read.value);
+    if (!read.ok) return { ok: false, error: `Couldn't load every image, so nothing was ${verb}.` };
+    images.push(read.value);
   }
-  return images;
+  return { ok: true, value: images };
 };
 
+const writeClipboardText = async (text: string) => {
+  if (smoke) recorded.clipboard.push({ text });
+  else await clipboard.writeText(text);
+};
+
+/** Copies the message's text, or for an image-only message every image, all at once. */
 const copyMessage = async (dot: string, id: string, sessionID: string): Promise<Result<true>> => {
   const message = await readMessage(dot, id, sessionID);
   if (!message.ok) return message;
   if (message.value.text) {
-    await clipboard.writeText(message.value.text);
+    await writeClipboardText(message.value.text);
     return { ok: true, value: true };
   }
-  const [first] = await messageImages(dot, message.value);
-  const image = first && nativeImage.createFromBuffer(Buffer.from(first.data));
-  if (!image || image.isEmpty()) return { ok: false, error: "There's nothing to copy." };
-  const png = new Blob([new Uint8Array(image.toPNG())], { type: "image/png" });
-  await clipboard.write([new ClipboardItem({ "image/png": png })]);
+  if (!message.value.images.length) return { ok: false, error: "There's nothing to copy." };
+  const images = await messageImages(dot, message.value, "copied");
+  if (!images.ok) return images;
+  const pngs = images.value.map((image) => nativeImage.createFromBuffer(Buffer.from(image.data)));
+  if (pngs.some((image) => image.isEmpty()))
+    return { ok: false, error: "Couldn't read every image, so nothing was copied." };
+  if (smoke) recorded.clipboard.push({ images: pngs.length });
+  else
+    await clipboard.write(
+      pngs.map(
+        (image) =>
+          new ClipboardItem({
+            "image/png": new Blob([new Uint8Array(image.toPNG())], { type: "image/png" }),
+          }),
+      ),
+    );
   return { ok: true, value: true };
 };
 
@@ -491,22 +610,44 @@ const removeShare = (directory: string) => {
   shares.delete(directory);
 };
 
+const present = (texts: string[], filePaths: string[], directory?: string) => {
+  if (smoke)
+    recorded.shares.push({
+      texts: texts.length,
+      files: filePaths.length,
+      directory: directory ?? "",
+    });
+  else if (window) new ShareMenu({ texts, filePaths }).popup({ window });
+};
+
+/** Shares the text and every image, or nothing if any image fails to load. */
 const shareMessage = async (dot: string, id: string, sessionID: string): Promise<Result<true>> => {
   const message = await readMessage(dot, id, sessionID);
   if (!message.ok) return message;
-  const images = await messageImages(dot, message.value);
+  const texts = message.value.text ? [message.value.text] : [];
+  if (!texts.length && !message.value.images.length)
+    return { ok: false, error: "There's nothing to share." };
+  const images = await messageImages(dot, message.value, "shared");
+  if (!images.ok) return images;
+  if (!images.value.length) {
+    present(texts, []);
+    return { ok: true, value: true };
+  }
   const directory = mkdtempSync(join(tmpdir(), "open-dot-share-"));
   shares.add(directory);
   setTimeout(() => removeShare(directory), 10 * 60_000).unref();
-  const filePaths = images.map((image, index) => {
-    const path = join(directory, `image-${index + 1}.${image.mime.split("/")[1]}`);
-    writeFileSync(path, image.data, { mode: 0o600 });
-    return path;
-  });
-  const texts = message.value.text ? [message.value.text] : [];
-  if (!texts.length && !filePaths.length) return { ok: false, error: "There's nothing to share." };
-  if (smoke) recorded.share++;
-  else if (window) new ShareMenu({ texts, filePaths }).popup({ window });
+  let filePaths: string[];
+  try {
+    filePaths = images.value.map((image, index) => {
+      const path = join(directory, `image-${index + 1}.${image.mime.split("/")[1]}`);
+      writeFileSync(path, image.data, { mode: 0o600 });
+      return path;
+    });
+  } catch {
+    removeShare(directory);
+    return { ok: false, error: "Couldn't prepare the images, so nothing was shared." };
+  }
+  present(texts, filePaths, directory);
   return { ok: true, value: true };
 };
 
@@ -681,14 +822,46 @@ const trusted = (event: IpcMainInvokeEvent) =>
 
 const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
   dots: () => coalesce("dots", () => json("GET", "/dots")),
-  messages: (dot, before) => {
+  messages: (dot, before, from) => {
     if (!isName(dot) || (before !== undefined && !isText(before, 8192)))
       return { ok: false, error: "Bad read." };
+    const target = current();
+    const read = generation;
+    // A cursor belongs to the daemon that signed it; after a restart only the latest page reads.
+    if (before !== undefined && from !== read)
+      return {
+        ok: false,
+        error: "open-dot restarted, so older messages load again from Back to latest.",
+      };
     const query = typeof before === "string" ? `?before=${segment(before)}` : "";
-    return coalesce(`messages:${dot}:${query}`, async () => {
-      const page = await json("GET", `/dots/${segment(dot)}/messages${query}`);
-      if (page.ok) clientIDs = isRecord(page.value) && page.value.clientMessageIDs === true;
-      return page;
+    return coalesce(`messages:${read}:${dot}:${query}`, async () => {
+      const page = await json(
+        "GET",
+        `/dots/${segment(dot)}/messages${query}`,
+        undefined,
+        undefined,
+        target,
+      );
+      if (!page.ok) return page;
+      if (target) takesClientIDs(target, page);
+      if (!isRecord(page.value))
+        return { ok: false, error: "The daemon's answer wasn't understood." };
+      return { ok: true, value: { ...page.value, generation: read } };
+    });
+  },
+  message: (dot, id, sessionID) => {
+    if (!isName(dot) || !isName(id) || !isName(sessionID)) return { ok: false, error: "Bad read." };
+    return coalesce(`message:${dot}:${sessionID}:${id}`, async () => {
+      const read = await json(
+        "GET",
+        `/dots/${segment(dot)}/messages/${segment(id)}?sessionID=${segment(sessionID)}`,
+      );
+      if (
+        read.ok &&
+        (!isRecord(read.value) || read.value.id !== id || read.value.sessionID !== sessionID)
+      )
+        return { ok: false, error: "The daemon's message wasn't understood." };
+      return read;
     });
   },
   send,
@@ -737,7 +910,12 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
   openLink,
   copyText: async (text) => {
     if (!isText(text, 1_000_000)) return false;
-    await clipboard.writeText(text);
+    await writeClipboardText(text);
+    return true;
+  },
+  shareText: (text) => {
+    if (!isText(text, 1_000_000) || !text) return false;
+    present([text], []);
     return true;
   },
   copyMessage: (dot, id, sessionID) =>
@@ -749,7 +927,8 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
       ? shareMessage(dot, id, sessionID)
       : { ok: false, error: "Bad message." },
   emojiPanel: () => {
-    if (!smoke) app.showEmojiPanel();
+    if (smoke) recorded.emojiPanel++;
+    else app.showEmojiPanel();
   },
   openWorker: (id) =>
     isID(id) ? json("POST", `/workers/${id}/open`) : { ok: false, error: "Bad worker." },
@@ -771,7 +950,13 @@ const handlers: Record<Channel, (...args: unknown[]) => unknown> = {
   },
 };
 
-const smokeRun = async () => {
+const smokeAnswer = (value: unknown) => process.stdout.write(`SMOKE ${JSON.stringify(value)}\n`);
+
+/**
+ * The hidden smoke test's driver, only with OPEN_DOT_APP_SMOKE=1: each stdin line is a JSON
+ * command, `{id, eval}` to run in the page or `{id}` for what main recorded, answered on stdout.
+ */
+const smokeDriver = () => {
   if (!window) return;
   const contents = window.webContents;
   const violations: string[] = [];
@@ -781,68 +966,33 @@ const smokeRun = async () => {
     else if (event.level === "error" && errors.length < 20)
       errors.push(event.message.slice(0, 500));
   });
-  const evaluate = (code: string): Promise<unknown> => contents.executeJavaScript(code, true);
-  const until = async (code: string, label: string, seconds = 20) => {
-    for (let tick = 0; tick < seconds * 10; tick++) {
-      if ((await evaluate(code).catch(() => false)) === true) return;
-      await new Promise((done) => setTimeout(done, 100));
+  const run = async (line: string) => {
+    let id: unknown;
+    try {
+      const command: unknown = JSON.parse(line);
+      if (!isRecord(command)) return;
+      id = command.id;
+      const value =
+        typeof command.eval === "string"
+          ? await contents.executeJavaScript(command.eval, true)
+          : { recorded, attempts: readAttempts(), violations, errors };
+      smokeAnswer({ id, ok: true, value });
+      if (command.quit === true) app.quit();
+    } catch (cause) {
+      smokeAnswer({ id, ok: false, error: cause instanceof Error ? cause.message : String(cause) });
     }
-    throw new Error(`Timed out waiting for ${label}.`);
   };
-  const type = (text: string) =>
-    evaluate(`(() => {
-      const box = document.querySelector("textarea");
-      const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
-      set.call(box, ${JSON.stringify(text)});
-      box.dispatchEvent(new Event("input", { bubbles: true }));
-      box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
-    })()`);
-  const report: Record<string, unknown> = {};
-  try {
-    await until(`document.querySelectorAll("[data-message]").length >= 4`, "messages");
-    await until(
-      `!!document.querySelector(".katex") && !!document.querySelector(".diff")`,
-      "rendering",
-    );
-    report.render = await evaluate(`(() => {
-      const list = document.querySelector("[data-messages]");
-      return {
-        table: !!list.querySelector("table"),
-        task: !!list.querySelector("input[type=checkbox][disabled]"),
-        math: !!list.querySelector(".katex"),
-        code: !!list.querySelector(".code-block button"),
-        diff: !!list.querySelector(".diff .diff-add") && !!list.querySelector(".diff .diff-del"),
-        script: !!list.querySelector("script, iframe, object, embed, style"),
-        remoteImage: !!list.querySelector("img:not([src^='blob:'])"),
-        javascriptLink: [...list.querySelectorAll("a")].some((a) => !/^(https?|mailto):/.test(a.getAttribute("href") ?? "")),
-        workerRow: !!document.querySelector("[data-worker] [data-needs]"),
-        busy: !!document.querySelector("[data-dot][data-busy]"),
-      };
-    })()`);
-    await evaluate(`document.querySelector("[data-messages] a[href^='https:']").click()`);
-    await type("Hello");
-    await until(`document.querySelector("textarea").value === ""`, "the first send to clear");
-    await type("Second");
-    await until(
-      `!!document.querySelector("[data-attempt-unknown]")`,
-      "the lost send to be unknown",
-    );
-    report.keptDraft = await evaluate(`document.querySelector("textarea").value`);
-    await until(
-      `!document.querySelector("[data-attempt-unknown]")`,
-      "the lost send to reconcile",
-      30,
-    );
-    report.attempts = readAttempts();
-  } catch (cause) {
-    report.error = cause instanceof Error ? cause.message : String(cause);
-    report.page = await evaluate(`document.body.innerText.slice(0, 600)`).catch(String);
-  }
-  report.violations = violations;
-  report.errors = errors;
-  report.recorded = recorded;
-  process.stdout.write(`SMOKE ${JSON.stringify(report)}\n`);
-  app.exit(0);
+  let buffer = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk: string) => {
+    buffer += chunk;
+    for (let at = buffer.indexOf("\n"); at >= 0; at = buffer.indexOf("\n")) {
+      void run(buffer.slice(0, at));
+      buffer = buffer.slice(at + 1);
+    }
+  });
+  process.stdin.on("end", () => app.quit());
+  smokeAnswer({ ready: true });
 };
 
 void app.whenReady().then(() => {
@@ -869,8 +1019,7 @@ void app.whenReady().then(() => {
   createWindow();
   app.on("activate", showWindow);
   if (smoke) {
-    recorded.shortcut = 0;
-    window?.webContents.once("did-finish-load", () => void smokeRun());
+    window?.webContents.once("did-finish-load", smokeDriver);
     return;
   }
   tray = new Tray(trayIcon(false));

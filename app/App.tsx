@@ -6,6 +6,7 @@ import {
   type ClipboardEvent,
   type DragEvent,
   type KeyboardEvent,
+  type RefObject,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -22,6 +23,7 @@ import type {
   MessageView,
   PageView,
   PendingView,
+  ReceiptStatus,
   Result,
 } from "./bridge";
 import {
@@ -38,16 +40,25 @@ import {
   emptyDraft,
   imageLimits,
   type Intent,
+  isImageType,
+  keepSent,
   mergeLatest,
   mergeOlder,
+  pendingActions,
   pendingLabel,
   reactionOf,
+  recentTapbacks,
   redoDraft,
+  replaceMessage,
   returnAction,
-  sendOutcome,
+  type Sent,
+  sentLimit,
+  settledBy,
   tapbacks,
   undoDraft,
+  unlistedTapback,
   unreadSince,
+  workerActions,
 } from "./chat";
 import { Markdown } from "./Markdown";
 
@@ -70,26 +81,43 @@ const remember = (key: string, bytes: { mime: string; data: Uint8Array }) => {
   return url;
 };
 
+/** A daemon image as a blob URL, whether its read failed, and a way to try again. */
 const useBlob = (key: string, load: () => Promise<Result<{ mime: string; data: Uint8Array }>>) => {
   const [url, setURL] = useState(() => blobs.get(key));
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     let live = true;
     const known = blobs.get(key);
+    setFailed(false);
     if (known) setURL(known);
     else
       void load().then((result) => {
-        if (live && result.ok) setURL(remember(key, result.value));
+        if (!live) return;
+        if (result.ok) setURL(remember(key, result.value));
+        else setFailed(true);
       });
     return () => {
       live = false;
     };
     // The key names exactly what load reads.
-  }, [key]);
-  return url;
+  }, [key, attempt]);
+  return { url, failed, retry: () => setAttempt((count) => count + 1) };
+};
+
+/** State whose latest value async work reads from the ref, updated in both at once. */
+const useLive = <T,>(initial: T) => {
+  const [value, setValue] = useState(initial);
+  const ref = useRef(value);
+  const update = useCallback((change: (current: T) => T) => {
+    ref.current = change(ref.current);
+    setValue(ref.current);
+  }, []);
+  return [value, ref, update] as const;
 };
 
 const Avatar = ({ dot }: { dot: DotView }) => {
-  const url = useBlob(`avatar:${dot.name}:${dot.avatar?.revision ?? "none"}`, () =>
+  const { url } = useBlob(`avatar:${dot.name}:${dot.avatar?.revision ?? "none"}`, () =>
     dot.avatar ? bridge.avatar(dot.name) : Promise.resolve({ ok: false, error: "none" }),
   );
   return url ? (
@@ -99,41 +127,77 @@ const Avatar = ({ dot }: { dot: DotView }) => {
   );
 };
 
+const fileName = (attachment: { name: string | null; mime: string }) =>
+  attachment.name?.split("/").at(-1) || attachment.mime;
+
 const Thumb = ({
   dot,
   message,
   index,
+  name,
   onOpen,
 }: {
   dot: string;
   message: MessageView;
   index: number;
+  name: string;
   onOpen: (url: string) => void;
 }) => {
-  const url = useBlob(`image:${dot}:${message.sessionID}:${message.id}:${index}`, () =>
-    bridge.image(dot, message.id, message.sessionID, index),
+  const { url, failed, retry } = useBlob(
+    `image:${dot}:${message.sessionID}:${message.id}:${index}`,
+    () => bridge.image(dot, message.id, message.sessionID, index),
   );
-  return url ? (
-    <button type="button" className="thumb" onClick={() => onOpen(url)} aria-label="Open image">
-      <img src={url} alt="" />
+  if (url)
+    return (
+      <button
+        type="button"
+        className="thumb"
+        onClick={() => onOpen(url)}
+        aria-label={`Open ${name}`}
+        title={name}
+      >
+        <img src={url} alt="" />
+      </button>
+    );
+  // An image that failed to load says so, and a click tries again.
+  return failed ? (
+    <button
+      type="button"
+      className="attachment-chip"
+      data-failed
+      title="Click to try again"
+      onClick={retry}
+    >
+      ↻ {name} · couldn't load
     </button>
   ) : (
-    <span className="thumb loading" />
+    <span className="thumb loading" aria-label={`Loading ${name}`} />
   );
 };
 
-const DraftThumb = ({ image, onRemove }: { image: DraftImage; onRemove: () => void }) => {
+/** A local image's preview, released when it leaves the screen. */
+const LocalThumb = ({
+  image,
+  className,
+  onRemove,
+}: {
+  image: DraftImage;
+  className: string;
+  onRemove?: () => void;
+}) => {
   const url = useMemo(
     () => URL.createObjectURL(new Blob([new Uint8Array(image.data)], { type: image.mime })),
     [image],
   );
   useEffect(() => () => URL.revokeObjectURL(url), [url]);
   return (
-    <span className="draft-thumb">
-      <img src={url} alt={image.name} />
-      <button type="button" aria-label={`Remove ${image.name}`} onClick={onRemove}>
-        ×
-      </button>
+    <span className={className}>
+      <img src={url} alt={image.name} title={image.name} />
+      {onRemove ? (
+        <button type="button" aria-label={`Remove ${image.name}`} onClick={onRemove}>
+          ×
+        </button>
+      ) : null}
     </span>
   );
 };
@@ -156,24 +220,34 @@ interface Toast {
 
 type Row =
   | { kind: "message"; key: string; message: MessageView }
-  | { kind: "pending"; key: string; pending: PendingView; sent?: Captured | undefined }
-  | { kind: "attempt"; key: string; attempt: Attempt };
+  | { kind: "pending"; key: string; pending: PendingView; sent?: Sent | undefined }
+  | { kind: "attempt"; key: string; attempt: Attempt; sent?: Sent | undefined };
 
 const singleEmoji = /^\p{RGI_Emoji}$/v;
+
+const without = <K, V>(map: ReadonlyMap<K, V>, key: K) => {
+  const next = new Map(map);
+  next.delete(key);
+  return next;
+};
 
 const App = () => {
   const [dots, setDots] = useState<DotView[]>([]);
   const [dotsError, setDotsError] = useState<string>();
   const [selected, setSelected] = useState<string>();
-  const [conversations, setConversations] = useState(new Map<string, Conversation>());
+  const [conversations, conversationsRef, updateConversations] = useLive(
+    new Map<string, Conversation>(),
+  );
   const [readErrors, setReadErrors] = useState(new Map<string, string>());
+  const [olderErrors, setOlderErrors] = useState(new Map<string, string>());
   const [recent, setRecent] = useState<string[]>([]);
-  const [intents, setIntents] = useState(new Map<string, Map<string, Intent>>());
-  const [drafts, setDrafts] = useState(new Map<string, Draft>());
+  const [intents, intentsRef, updateIntents] = useLive(new Map<string, Map<string, Intent>>());
+  const [drafts, draftsRef, updateDrafts] = useLive(new Map<string, Draft>());
   const [seen, setSeen] = useState(new Map<string, string>());
   const [attempts, setAttempts] = useState<Attempt[]>([]);
   const [sending, setSending] = useState(new Set<string>());
-  const [sent, setSent] = useState(new Map<string, Captured>());
+  const [sent, sentRef, updateSent] = useLive(new Map<string, Sent>());
+  const [changing, setChanging] = useState(new Set<string>());
   const [showHidden, setShowHidden] = useState(false);
   const [menu, setMenu] = useState<Menu>();
   const [viewer, setViewer] = useState<string>();
@@ -182,14 +256,27 @@ const App = () => {
   const [capturing, setCapturing] = useState<{ dot: string; message: MessageView }>();
   const [shortcut, setShortcut] = useState(true);
   const [sendAnyway, setSendAnyway] = useState(false);
-  const [composerError, setComposerError] = useState<string>();
+  const [composerErrors, setComposerErrors] = useState(new Map<string, string>());
+  // Messages a selection spans in the open chat, which history trimming keeps.
+  const selectionKeep = useRef<ReadonlySet<string>>(new Set());
 
   const conversation = selected ? conversations.get(selected) : undefined;
   const dot = dots.find((item) => item.name === selected);
   const draft = (selected && drafts.get(selected)) || emptyDraft();
+  const composerError = selected ? composerErrors.get(selected) : undefined;
 
-  const setDraft = useCallback((name: string, change: (draft: Draft) => Draft) => {
-    setDrafts((current) => new Map(current).set(name, change(current.get(name) ?? emptyDraft())));
+  const setDraft = useCallback(
+    (name: string, change: (draft: Draft) => Draft) =>
+      updateDrafts((current) =>
+        new Map(current).set(name, change(current.get(name) ?? emptyDraft())),
+      ),
+    [updateDrafts],
+  );
+
+  const setComposerError = useCallback((name: string, text: string | undefined) => {
+    setComposerErrors((current) =>
+      text === undefined ? without(current, name) : new Map(current).set(name, text),
+    );
   }, []);
 
   const showToast = useCallback((next: Toast) => {
@@ -206,48 +293,65 @@ const App = () => {
   const dotsRef = useRef(dots);
   dotsRef.current = dots;
 
-  const applyPage = useCallback((name: string, page: PageView) => {
-    setConversations((current) => {
-      const previous = current.get(name);
+  /** Drops the intents a read that started at `startedAt` settles. */
+  const settle = useCallback(
+    (name: string, messages: readonly MessageView[], startedAt: number) => {
+      const mine = intentsRef.current.get(name);
+      if (!mine?.size) return;
+      const done = settledBy(messages, mine, startedAt);
+      if (!done.length) return;
+      updateIntents((all) => {
+        const next = new Map(all.get(name));
+        for (const id of done) next.delete(id);
+        return new Map(all).set(name, next);
+      });
+    },
+    [intentsRef, updateIntents],
+  );
+
+  const applyPage = useCallback(
+    (name: string, page: PageView, startedAt: number) => {
+      const previous = conversationsRef.current.get(name);
       if (previous && previous.sessionID !== page.sessionID) {
         // A new session: old actions, quotes and intents no longer apply; the draft text stays.
-        setIntents((all) => {
-          const next = new Map(all);
-          next.delete(name);
-          return next;
-        });
-        setDrafts((all) => {
+        updateIntents((all) => without(all, name));
+        updateDrafts((all) => {
           const kept = all.get(name);
           return kept?.quote ? new Map(all).set(name, { ...kept, quote: undefined }) : all;
         });
         setMenu(undefined);
         setCapturing(undefined);
+        setOlderErrors((all) => without(all, name));
       }
-      return new Map(current).set(name, mergeLatest(previous, page));
-    });
-    setRecent(page.recentEmojis);
-    setReadErrors((current) => {
-      const next = new Map(current);
-      if (page.refreshError) next.set(name, page.refreshError);
-      else next.delete(name);
-      return next;
-    });
-    setSeen((current) => {
-      const last = page.messages.at(-1)?.id;
-      // The first successful read is the baseline: nothing before it counts as unread.
-      if (!last || (current.has(name) && !(name === selectedRef.current && document.hasFocus())))
-        return current;
-      return new Map(current).set(name, last);
-    });
-  }, []);
+      const keep = name === selectedRef.current ? selectionKeep.current : new Set<string>();
+      updateConversations((current) =>
+        new Map(current).set(name, mergeLatest(current.get(name), page, keep)),
+      );
+      settle(name, page.messages, startedAt);
+      updateSent((current) => keepSent(current, name, page, Date.now()));
+      setRecent(page.recentEmojis);
+      setReadErrors((current) =>
+        page.refreshError ? new Map(current).set(name, page.refreshError) : without(current, name),
+      );
+      setSeen((current) => {
+        const last = page.messages.at(-1)?.id;
+        // The first successful read is the baseline: nothing before it counts as unread.
+        if (!last || (current.has(name) && !(name === selectedRef.current && document.hasFocus())))
+          return current;
+        return new Map(current).set(name, last);
+      });
+    },
+    [conversationsRef, settle, updateConversations, updateDrafts, updateIntents, updateSent],
+  );
 
   const readChat = useCallback(
     async (name: string) => {
+      const startedAt = Date.now();
       const result = await bridge.messages(name);
       const count = failures.current.get(name) ?? 0;
       if (result.ok) {
         failures.current.set(name, 0);
-        applyPage(name, result.value);
+        applyPage(name, result.value, startedAt);
       } else {
         failures.current.set(name, count + 1);
         due.current.set(name, Date.now() + backoff(count + 1) * 1000);
@@ -257,11 +361,74 @@ const App = () => {
     [applyPage],
   );
 
+  /** Reads one message pinned to its session, wherever it's loaded, and settles its intent. */
+  const refreshMessage = useCallback(
+    async (name: string, id: string, sessionID: string) => {
+      const startedAt = Date.now();
+      const result = await bridge.message(name, id, sessionID);
+      if (result.ok) {
+        updateConversations((current) => {
+          const known = current.get(name);
+          return known ? new Map(current).set(name, replaceMessage(known, result.value)) : current;
+        });
+        settle(name, [result.value], startedAt);
+      } else if (result.status === 404 || result.status === 409) {
+        // Gone, or its session moved on: nothing more can change it, so it blocks nothing.
+        updateIntents((all) => {
+          const intent = all.get(name)?.get(id);
+          if (intent?.settledAt === undefined || startedAt < intent.settledAt) return all;
+          const next = new Map(all.get(name));
+          next.delete(id);
+          return new Map(all).set(name, next);
+        });
+      }
+    },
+    [settle, updateConversations, updateIntents],
+  );
+
+  /** What an attempt's receipt says about the draft it was captured from. */
+  const settleSend = useCallback(
+    (attempt: Attempt, status: ReceiptStatus) => {
+      const item = sentRef.current.get(attempt.messageID);
+      if (status === "unknown") return;
+      if (status === "cancelled") {
+        updateSent((current) => without(current, attempt.messageID));
+        setComposerError(
+          attempt.dot,
+          "open-dot cancelled a message it hadn't confirmed, so it wasn't sent. It's still in the message box.",
+        );
+        return;
+      }
+      // The daemon has it: what it captured leaves the draft, keeping anything typed since.
+      if (item?.state === "unknown") {
+        setDraft(item.dot, (current) => afterSend(current, item.captured));
+        updateSent((current) =>
+          new Map(current).set(attempt.messageID, {
+            ...item,
+            state: "pending",
+            at: Date.now(),
+            listed: false,
+          }),
+        );
+      }
+      setComposerError(
+        attempt.dot,
+        status === "held"
+          ? "open-dot has the message and is holding it until the dot can take it."
+          : undefined,
+      );
+    },
+    [sentRef, setComposerError, setDraft, updateSent],
+  );
+
   const refreshAttempts = useCallback(async () => {
     const known = await bridge.attempts();
-    for (const attempt of known) await bridge.reconcile(attempt);
+    for (const attempt of known) {
+      const result = await bridge.reconcile(attempt);
+      if (result.ok) settleSend(attempt, result.value);
+    }
     setAttempts(await bridge.attempts());
-  }, []);
+  }, [settleSend]);
 
   useEffect(() => {
     const run = { stopped: false };
@@ -300,6 +467,10 @@ const App = () => {
           if (!name || now < (due.current.get(name) ?? 0)) return;
           due.current.set(name, Infinity);
           await readChat(name);
+          // Changes whose call returned are settled by reading their own message, which may be
+          // far older than the latest page.
+          for (const [id, intent] of intentsRef.current.get(name) ?? [])
+            if (intent.settledAt !== undefined) await refreshMessage(name, id, intent.sessionID);
           if (due.current.get(name) === Infinity)
             due.current.set(name, Date.now() + (name === selectedRef.current ? 1000 : 30_000));
         }),
@@ -315,7 +486,7 @@ const App = () => {
     return () => {
       run.stopped = true;
     };
-  }, [readChat, refreshAttempts]);
+  }, [intentsRef, readChat, refreshAttempts, refreshMessage]);
 
   useEffect(() => {
     if (selected) due.current.set(selected, 0);
@@ -335,7 +506,7 @@ const App = () => {
       new Map(
         dots.map((item) => [
           item.name,
-          unreadSince(conversations.get(item.name)?.messages ?? [], seen.get(item.name)),
+          unreadSince(conversations.get(item.name)?.latest ?? [], seen.get(item.name)),
         ]),
       ),
     [dots, conversations, seen],
@@ -348,80 +519,79 @@ const App = () => {
 
   // Looking at a chat marks it read.
   useEffect(() => {
-    const last = conversation?.messages.at(-1)?.id;
+    const last = conversation?.latest.at(-1)?.id;
     if (selected && last && seen.get(selected) !== last && document.hasFocus())
       setSeen((current) => new Map(current).set(selected, last));
   }, [selected, conversation, seen]);
 
-  const shown = useMemo(() => {
-    if (!conversation || !selected) return [];
-    return applyIntents(conversation.messages, intents.get(selected) ?? new Map()).messages;
-  }, [conversation, intents, selected]);
-
-  // Intents a read has shown are done.
-  useEffect(() => {
-    if (!conversation || !selected) return;
-    const mine = intents.get(selected);
-    if (!mine?.size) return;
-    const { waiting } = applyIntents(conversation.messages, mine);
-    if (waiting.size !== mine.size)
-      setIntents((current) => new Map(current).set(selected, waiting));
-  }, [conversation, intents, selected]);
+  const mine = (selected && intents.get(selected)) || undefined;
+  const shown = useMemo(
+    () => (conversation ? applyIntents(conversation.messages, mine ?? new Map()) : []),
+    [conversation, mine],
+  );
 
   const blocked = (id: string) => intents.get(selected ?? "")?.has(id) ?? false;
 
-  const intend = (name: string, message: MessageView, intent: Omit<Intent, "sessionID">) =>
-    setIntents((current) => {
-      const mine = new Map(current.get(name));
-      mine.set(message.id, { ...mine.get(message.id), ...intent, sessionID: message.sessionID });
-      return new Map(current).set(name, mine);
-    });
+  /** The message as it's shown now, with any change the owner made, rather than as captured. */
+  const currentMessage = (name: string, id: string) => {
+    const known = conversationsRef.current.get(name)?.messages.find((item) => item.id === id);
+    return known && applyIntents([known], intentsRef.current.get(name) ?? new Map())[0];
+  };
 
-  const dropIntent = (name: string, id: string) =>
-    setIntents((current) => {
-      const mine = new Map(current.get(name));
-      mine.delete(id);
-      return new Map(current).set(name, mine);
-    });
-
-  /** A change the daemon refused is dropped; a lost one stays shown until a read settles it. */
+  /**
+   * One change to one message at a time: a refused one is dropped; one that returned, or whose
+   * outcome is lost, stays shown and blocks other changes until a read of that message settles it.
+   */
   const mutate = async (
     name: string,
     message: MessageView,
-    intent: Omit<Intent, "sessionID">,
+    intent: Omit<Intent, "sessionID" | "settledAt">,
     call: () => Promise<Result<true>>,
   ) => {
-    if (blocked(message.id)) return false;
-    intend(name, message, intent);
+    if (intentsRef.current.get(name)?.has(message.id)) {
+      showToast({ text: "Waiting for saved message state before another change." });
+      return false;
+    }
+    const setIntent = (value: Intent | undefined) =>
+      updateIntents((all) => {
+        const next = new Map(all.get(name));
+        if (value) next.set(message.id, value);
+        else next.delete(message.id);
+        return new Map(all).set(name, next);
+      });
+    setIntent({ ...intent, sessionID: message.sessionID });
     const result = await call();
     if (!result.ok && !result.lost) {
-      dropIntent(name, message.id);
+      setIntent(undefined);
       showToast({ text: result.error });
-    } else if (!result.ok)
-      showToast({ text: "Couldn't confirm that change. It shows once open-dot does." });
+      return false;
+    }
+    if (!result.ok)
+      showToast({ text: "Couldn't confirm that change. The app shows what open-dot saved." });
+    setIntent({ ...intent, sessionID: message.sessionID, settledAt: Date.now() });
+    void refreshMessage(name, message.id, message.sessionID);
     due.current.set(name, 0);
     return result.ok;
   };
 
-  const react = (message: MessageView, emoji: string) => {
-    if (!selected) return;
-    const next = reactionOf(message, "owner") === emoji ? null : emoji;
-    void mutate(selected, message, { emoji: next }, () =>
-      bridge.react(selected, message.id, message.sessionID, next),
-    );
+  const react = (name: string, target: MessageView, emoji: string) => {
     setMenu(undefined);
+    const message = currentMessage(name, target.id) ?? target;
+    if (message.sessionID !== target.sessionID) return;
+    const next = reactionOf(message, "owner") === emoji ? null : emoji;
+    void mutate(name, message, { emoji: next }, () =>
+      bridge.react(name, message.id, message.sessionID, next),
+    );
   };
 
-  const hide = (message: MessageView, hidden: boolean) => {
-    if (!selected) return;
-    const name = selected;
+  const hide = (name: string, message: MessageView, hidden: boolean) => {
     void mutate(name, message, { hidden }, () =>
       bridge.hide(name, message.id, message.sessionID, hidden),
     ).then((done) => {
       if (done && hidden)
         showToast({
           text: "Message deleted from the app.",
-          undo: () => hide({ ...message, hidden: true }, false),
+          undo: () => hide(name, message, false),
         });
     });
   };
@@ -437,11 +607,12 @@ const App = () => {
     if (!captured.text.trim() && !captured.images.length) return;
     if (unknownHere.length && !sendAnyway) {
       setComposerError(
+        name,
         "An earlier message's delivery is still unknown. Check the conversation first, or choose Send anyway.",
       );
       return;
     }
-    setComposerError(undefined);
+    setComposerError(name, undefined);
     setSending((current) => new Set(current).add(name));
     const result = await bridge.send({
       dot: name,
@@ -456,38 +627,54 @@ const App = () => {
       return next;
     });
     setSendAnyway(false);
-    if (result.ok) {
-      setSent((current) => new Map(current).set(result.value.id, captured));
+    const track = (id: string, state: Sent["state"]) =>
+      updateSent((current) =>
+        keepSentLimit(
+          new Map(current).set(id, {
+            dot: name,
+            sessionID: conversation.sessionID,
+            captured,
+            at: Date.now(),
+            state,
+            listed: false,
+          }),
+        ),
+      );
+    if (result.outcome === "saved") {
+      track(result.id, "pending");
       setDraft(name, (current) => afterSend(current, captured));
+      if (result.warning) setComposerError(name, result.warning);
       due.current.set(name, 0);
       return;
     }
     // The draft stays either way; nothing is sent again on its own.
-    setComposerError(
-      sendOutcome(result) === "unknown"
-        ? "open-dot didn't confirm this message. It may still arrive; the app is checking."
-        : result.error,
-    );
-    setAttempts(await bridge.attempts());
+    if (result.outcome === "unknown") {
+      track(result.id, "unknown");
+      setComposerError(
+        name,
+        "open-dot didn't confirm this message. It may still arrive; the app is checking and won't send it again.",
+      );
+      setAttempts(await bridge.attempts());
+    } else setComposerError(name, result.error);
   };
 
   const attach = async (name: string, files: File[]) => {
     for (const file of files) {
       if (!file.type.startsWith("image/")) continue;
-      const count = drafts.get(name)?.images.length ?? 0;
-      if (count >= imageLimits.count) return setComposerError("Attach at most five images.");
+      const count = draftsRef.current.get(name)?.images.length ?? 0;
+      if (count >= imageLimits.count) return setComposerError(name, "Attach at most five images.");
       if (file.size === 0 || file.size > imageLimits.bytes)
-        return setComposerError("Each image can be at most 10 MiB.");
+        return setComposerError(name, "Each image can be at most 10 MiB.");
       const data = new Uint8Array(await file.arrayBuffer());
       const result = await bridge.ingest({ name: file.name, data });
-      if (!result.ok) return setComposerError(result.error);
+      if (!result.ok) return setComposerError(name, result.error);
       setDraft(name, (current) =>
         current.images.length >= imageLimits.count
           ? current
           : { ...current, images: [...current.images, result.value] },
       );
     }
-    setComposerError(undefined);
+    setComposerError(name, undefined);
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -540,44 +727,83 @@ const App = () => {
       .filter((message) => showHidden || !message.hidden)
       .map((message) => ({ kind: "message", key: message.id, message }));
     const ids = new Set(shown.map((message) => message.id));
-    for (const pending of conversation?.pending ?? [])
-      if (!ids.has(pending.id))
-        listed.push({
-          kind: "pending",
-          key: `p:${pending.id}`,
-          pending,
-          sent: sent.get(pending.id),
-        });
+    if (!conversation?.detached)
+      for (const pending of conversation?.pending ?? [])
+        if (!ids.has(pending.id))
+          listed.push({
+            kind: "pending",
+            key: `p:${pending.id}`,
+            pending,
+            sent: sent.get(pending.id),
+          });
     for (const attempt of unknownHere)
-      listed.push({ kind: "attempt", key: `a:${attempt.messageID}`, attempt });
+      listed.push({
+        kind: "attempt",
+        key: `a:${attempt.messageID}`,
+        attempt,
+        sent: sent.get(attempt.messageID),
+      });
     return listed;
   }, [shown, showHidden, conversation, sent, unknownHere]);
 
-  const delivered = conversation ? deliveredID(shown, conversation.pending) : undefined;
+  const delivered = conversation
+    ? deliveredID(applyIntents(conversation.latest, mine ?? new Map()), conversation.pending)
+    : undefined;
 
   const loadOlder = async () => {
-    if (!selected || !conversation?.next) return;
-    const name = selected;
-    const result = await bridge.messages(name, conversation.next);
-    if (result.ok)
-      setConversations((current) => {
-        const known = current.get(name);
-        return known ? new Map(current).set(name, mergeOlder(known, result.value)) : current;
-      });
+    const name = selectedRef.current;
+    const known = name ? conversationsRef.current.get(name) : undefined;
+    if (!name || !known?.next) return;
+    const result = await bridge.messages(name, known.next, known.generation);
+    if (!result.ok) {
+      setOlderErrors((current) => new Map(current).set(name, result.error));
+      return;
+    }
+    setOlderErrors((current) => without(current, name));
+    updateConversations((current) => {
+      const latest = current.get(name);
+      return latest
+        ? new Map(current).set(name, mergeOlder(latest, result.value, selectionKeep.current))
+        : current;
+    });
   };
 
   const backToLatest = () => {
     if (!selected) return;
-    setConversations((current) => {
-      const next = new Map(current);
-      next.delete(selected);
-      return next;
-    });
+    updateConversations((current) => without(current, selected));
+    setOlderErrors((current) => without(current, selected));
     due.current.set(selected, 0);
   };
 
+  const changePending = (name: string, pending: PendingView, change: "steer" | "cancel") => {
+    if (changing.has(pending.id)) return;
+    setChanging((current) => new Set(current).add(pending.id));
+    void bridge.pending(name, pending.id, change).then((result) => {
+      setChanging((current) => {
+        const next = new Set(current);
+        next.delete(pending.id);
+        return next;
+      });
+      const verb = change === "steer" ? "sent now" : "cancelled";
+      if (!result.ok)
+        showToast({
+          text: result.lost
+            ? `Outcome unknown: it may be ${verb} after the next refresh. No automatic retry.`
+            : `Not ${verb}. ${result.error}`,
+        });
+      due.current.set(name, 0);
+    });
+  };
+
+  const menuMessage = menu && selected ? currentMessage(selected, menu.message.id) : undefined;
+
   return (
-    <div className="app" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
+    <div
+      className="app"
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={onDrop}
+      data-sent={sent.size}
+    >
       <aside className="sidebar">
         <div className="sidebar-title">open-dot</div>
         {dotsError ? <div className="banner">{dotsError}</div> : null}
@@ -650,22 +876,26 @@ const App = () => {
               delivered={delivered}
               busy={dot.busy}
               blocked={blocked}
+              changing={changing}
+              olderError={olderErrors.get(dot.name)}
+              keep={selectionKeep}
               onMenu={setMenu}
               onOpenImage={setViewer}
               onOlder={loadOlder}
               onLatest={backToLatest}
-              onRestore={(message) => hide(message, false)}
-              onPending={(pending, change) => {
-                void bridge.pending(dot.name, pending.id, change).then((result) => {
-                  if (!result.ok) showToast({ text: result.error });
-                  due.current.set(dot.name, 0);
-                });
-              }}
+              onRestore={(message) => hide(dot.name, message, false)}
+              onPending={(pending, change) => changePending(dot.name, pending, change)}
+              onCopyText={(text) => void bridge.copyText(text)}
+              onShareText={(text) => void bridge.shareText(text)}
               onForget={(attempt) => {
                 setConfirm({
                   text: "Stop tracking this message? open-dot never confirmed it, and it won't be sent again.",
                   action: "Stop tracking",
-                  run: () => void bridge.forget(attempt.messageID).then(refreshAttempts),
+                  run: () =>
+                    void bridge.forget(attempt.messageID).then(() => {
+                      updateSent((current) => without(current, attempt.messageID));
+                      return refreshAttempts();
+                    }),
                 });
               }}
             />
@@ -688,8 +918,9 @@ const App = () => {
               {draft.images.length ? (
                 <div className="draft-images">
                   {draft.images.map((image, index) => (
-                    <DraftThumb
+                    <LocalThumb
                       key={index}
+                      className="draft-thumb"
                       image={image}
                       onRemove={() =>
                         setDraft(dot.name, (current) => ({
@@ -702,7 +933,7 @@ const App = () => {
                 </div>
               ) : null}
               {composerError ? (
-                <div className="composer-error">
+                <div className="composer-error" data-composer-error>
                   {composerError}
                   {unknownHere.length ? (
                     <button type="button" onClick={() => setSendAnyway(true)}>
@@ -741,14 +972,16 @@ const App = () => {
           </div>
         )}
       </main>
-      {menu && selected ? (
+      {menu && selected && menuMessage ? (
         <MessageMenu
-          menu={menu}
+          menu={{ ...menu, message: menuMessage }}
+          dot={selected}
           recent={recent}
+          blocked={blocked(menuMessage.id)}
           onClose={() => setMenu(undefined)}
-          onReact={(emoji) => react(menu.message, emoji)}
+          onReact={(emoji) => react(selected, menuMessage, emoji)}
           onEmoji={() => {
-            setCapturing({ dot: selected, message: menu.message });
+            setCapturing({ dot: selected, message: menuMessage });
             setMenu(undefined);
           }}
           onDetails={() => setMenu({ ...menu, details: true })}
@@ -756,16 +989,16 @@ const App = () => {
             setDraft(selected, (current) => ({
               ...current,
               quote: {
-                id: menu.message.id,
-                author: menu.message.kind === "owner" ? "owner" : "dot",
-                text: menu.message.text.slice(0, 240),
+                id: menuMessage.id,
+                author: menuMessage.kind === "owner" ? "owner" : "dot",
+                text: menuMessage.text.slice(0, 240),
               },
             }));
             setMenu(undefined);
           }}
           onCopy={() => {
             void bridge
-              .copyMessage(selected, menu.message.id, menu.message.sessionID)
+              .copyMessage(selected, menuMessage.id, menuMessage.sessionID)
               .then((result) => {
                 if (!result.ok) showToast({ text: `Nothing was copied: ${result.error}` });
               });
@@ -773,19 +1006,18 @@ const App = () => {
           }}
           onShare={() => {
             void bridge
-              .shareMessage(selected, menu.message.id, menu.message.sessionID)
+              .shareMessage(selected, menuMessage.id, menuMessage.sessionID)
               .then((result) => {
                 if (!result.ok) showToast({ text: result.error });
               });
             setMenu(undefined);
           }}
           onDelete={() => {
-            const message = menu.message;
             setMenu(undefined);
             setConfirm({
               text: "Delete this message from the app? It stays in the dot's history and context.",
               action: "Delete",
-              run: () => hide(message, true),
+              run: () => hide(selected, menuMessage, true),
             });
           }}
         />
@@ -800,7 +1032,8 @@ const App = () => {
             const value = event.currentTarget.value.trim();
             const target = capturing;
             setCapturing(undefined);
-            if (singleEmoji.test(value) && target.dot === selected) react(target.message, value);
+            if (singleEmoji.test(value) && target.dot === selectedRef.current)
+              react(target.dot, target.message, value);
           }}
         />
       ) : null}
@@ -856,15 +1089,44 @@ const App = () => {
   );
 };
 
+/** Keeps the newest sends when more pile up than any chat could show as pending. */
+const keepSentLimit = (sent: Map<string, Sent>) =>
+  sent.size <= sentLimit
+    ? sent
+    : new Map([...sent].toSorted(([, a], [, b]) => b.at - a.at).slice(0, sentLimit));
+
 const time = (value: number) =>
   new Date(value).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 
-/** The index of the list row holding a node, when it's in this list. */
-const rowIndex = (list: HTMLElement | null, node: Node | null | undefined) => {
+/** The key of the list row holding a node, when it's in this list. */
+const rowKey = (list: HTMLElement | null, node: Node | null | undefined) => {
   const element = node instanceof Element ? node : node?.parentElement;
-  const row = element?.closest<HTMLElement>("[data-index]");
-  return row && list?.contains(row) ? Number(row.dataset.index) : undefined;
+  const row = element?.closest<HTMLElement>("[data-key]");
+  return row && list?.contains(row) ? row.dataset.key : undefined;
 };
+
+/** A send's captured quote, text and image previews, shown dimmed until the dot has it. */
+const SentPreview = ({ dot, sent }: { dot: string; sent: Captured }) => (
+  <>
+    {sent.quote ? (
+      <div className="quote">
+        {sent.quote.author === "owner" ? "You" : dot}: {sent.quote.text}
+      </div>
+    ) : null}
+    {sent.text ? (
+      <div className="bubble">
+        <div className="plain">{sent.text}</div>
+      </div>
+    ) : null}
+    {sent.images.length ? (
+      <div className="thumbs">
+        {sent.images.map((image, index) => (
+          <LocalThumb key={index} className="pending-thumb" image={image} />
+        ))}
+      </div>
+    ) : null}
+  </>
+);
 
 const MessageList = ({
   dot,
@@ -873,12 +1135,17 @@ const MessageList = ({
   delivered,
   busy,
   blocked,
+  changing,
+  olderError,
+  keep,
   onMenu,
   onOpenImage,
   onOlder,
   onLatest,
   onRestore,
   onPending,
+  onCopyText,
+  onShareText,
   onForget,
 }: {
   dot: string;
@@ -887,27 +1154,37 @@ const MessageList = ({
   delivered: string | undefined;
   busy: boolean;
   blocked: (id: string) => boolean;
+  changing: ReadonlySet<string>;
+  olderError: string | undefined;
+  keep: RefObject<ReadonlySet<string>>;
   onMenu: (menu: Menu) => void;
   onOpenImage: (url: string) => void;
   onOlder: () => Promise<void>;
   onLatest: () => void;
   onRestore: (message: MessageView) => void;
   onPending: (pending: PendingView, change: "steer" | "cancel") => void;
+  onCopyText: (text: string) => void;
+  onShareText: (text: string) => void;
   onForget: (attempt: Attempt) => void;
 }) => {
   const scroller = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
   const [latest, setLatest] = useState(false);
   const loading = useRef(false);
-  // Rows a selection spans stay rendered, so a selection across messages survives scrolling.
-  const selection = useRef<[number, number] | undefined>(undefined);
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  // The rows a selection starts and ends in, by key, so prepends and polls can't shift it; every
+  // row between them stays rendered, and history trimming keeps their messages.
+  const selection = useRef<[string, string] | undefined>(undefined);
 
   const rangeExtractor = useCallback((range: Range) => {
     const indexes = new Set(defaultRangeExtractor(range));
     const span = selection.current;
-    if (span)
-      for (let index = span[0]; index <= Math.min(span[1], span[0] + 300); index++)
-        indexes.add(index);
+    if (span) {
+      const at = span.map((key) => rowsRef.current.findIndex((row) => row.key === key));
+      const [from, to] = [Math.min(...at), Math.max(...at)];
+      if (from >= 0) for (let index = from; index <= to; index++) indexes.add(index);
+    }
     return [...indexes].filter((index) => index < range.count).toSorted((a, b) => a - b);
   }, []);
 
@@ -918,26 +1195,45 @@ const MessageList = ({
     overscan: 6,
     getItemKey: (index) => rows[index]?.key ?? index,
     rangeExtractor,
+    // Older pages go above without moving what's being read; new rows follow at the bottom.
+    anchorTo: "end",
+    followOnAppend: true,
   });
 
   useEffect(() => {
     const update = () => {
       const current = document.getSelection();
-      const anchor = rowIndex(scroller.current, current?.anchorNode);
-      const focus = rowIndex(scroller.current, current?.focusNode);
+      const anchor = rowKey(scroller.current, current?.anchorNode);
+      const focus = rowKey(scroller.current, current?.focusNode);
       selection.current =
         current && !current.isCollapsed && anchor !== undefined && focus !== undefined
-          ? [Math.min(anchor, focus), Math.max(anchor, focus)]
+          ? [anchor, focus]
           : undefined;
+      const ids = new Set<string>();
+      if (selection.current) {
+        const at = selection.current.map((key) =>
+          rowsRef.current.findIndex((row) => row.key === key),
+        );
+        for (let index = Math.min(...at); index >= 0 && index <= Math.max(...at); index++) {
+          const row = rowsRef.current[index];
+          if (row?.kind === "message") ids.add(row.message.id);
+        }
+      }
+      keep.current = ids;
     };
     document.addEventListener("selectionchange", update);
-    return () => document.removeEventListener("selectionchange", update);
-  }, []);
+    return () => {
+      document.removeEventListener("selectionchange", update);
+      keep.current = new Set();
+    };
+  }, [keep]);
 
-  // New rows keep the view at the bottom when it was there.
+  // A chat opens at its newest message.
+  const opened = useRef(false);
   useLayoutEffect(() => {
-    if (atBottom.current && rows.length)
-      virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
+    if (opened.current || !rows.length) return;
+    opened.current = true;
+    virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
   }, [rows.length, virtualizer]);
 
   const onScroll = () => {
@@ -945,7 +1241,7 @@ const MessageList = ({
     if (!element) return;
     atBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
     setLatest(!atBottom.current || conversation.detached);
-    if (element.scrollTop < 300 && conversation.next && !loading.current) {
+    if (element.scrollTop < 300 && conversation.next && !olderError && !loading.current) {
       loading.current = true;
       void onOlder().finally(() => {
         loading.current = false;
@@ -954,7 +1250,28 @@ const MessageList = ({
   };
 
   return (
-    <div className="messages" ref={scroller} onScroll={onScroll} data-messages>
+    <div
+      className="messages"
+      ref={scroller}
+      onScroll={onScroll}
+      data-messages
+      data-count={conversation.messages.length}
+      data-first={conversation.messages[0]?.id}
+      data-detached={conversation.detached ? "" : undefined}
+    >
+      {olderError ? (
+        <div className="older-error" role="status" data-older-error>
+          Couldn't load older messages: {olderError}
+          {conversation.next ? (
+            <button type="button" onClick={() => void onOlder()}>
+              Try again
+            </button>
+          ) : null}
+          <button type="button" onClick={onLatest}>
+            Back to latest
+          </button>
+        </div>
+      ) : null}
       <div className="messages-inner" style={{ height: virtualizer.getTotalSize() }}>
         {virtualizer.getVirtualItems().map((item) => {
           const row = rows[item.index];
@@ -963,6 +1280,7 @@ const MessageList = ({
             <div
               key={item.key}
               data-index={item.index}
+              data-key={row.key}
               ref={virtualizer.measureElement}
               className="row"
               style={{ transform: `translateY(${item.start}px)` }}
@@ -978,29 +1296,18 @@ const MessageList = ({
                   onRestore={onRestore}
                 />
               ) : row.kind === "pending" ? (
-                <div className="message owner pending" data-pending={row.pending.status}>
-                  <div className="bubble">
-                    {row.sent?.text ? <div className="plain">{row.sent.text}</div> : null}
-                    {row.sent?.images.length ? (
-                      <div className="note">{row.sent.images.length} image(s)</div>
-                    ) : null}
-                  </div>
-                  <div className="status">
-                    {pendingLabel[row.pending.status]}
-                    {row.pending.status !== "confirming" && row.pending.delivery !== "steer" ? (
-                      <button type="button" onClick={() => onPending(row.pending, "steer")}>
-                        Send now
-                      </button>
-                    ) : null}
-                    {row.pending.status !== "confirming" ? (
-                      <button type="button" onClick={() => onPending(row.pending, "cancel")}>
-                        Cancel
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
+                <PendingRow
+                  dot={dot}
+                  pending={row.pending}
+                  sent={row.sent}
+                  changing={changing.has(row.pending.id)}
+                  onPending={onPending}
+                  onCopyText={onCopyText}
+                  onShareText={onShareText}
+                />
               ) : (
                 <div className="message owner pending" data-attempt-unknown>
+                  {row.sent ? <SentPreview dot={dot} sent={row.sent.captured} /> : null}
                   <div className="status warning">
                     open-dot hasn't confirmed a message sent at {time(row.attempt.createdAt)}. It
                     won't be sent again; the app keeps checking.
@@ -1019,6 +1326,7 @@ const MessageList = ({
         <button
           type="button"
           className="latest"
+          data-latest
           onClick={() => {
             if (conversation.detached) onLatest();
             else virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
@@ -1028,6 +1336,68 @@ const MessageList = ({
           {conversation.detached ? "Back to latest" : "Latest ↓"}
         </button>
       ) : null}
+    </div>
+  );
+};
+
+const PendingRow = ({
+  dot,
+  pending,
+  sent,
+  changing,
+  onPending,
+  onCopyText,
+  onShareText,
+}: {
+  dot: string;
+  pending: PendingView;
+  sent: Sent | undefined;
+  changing: boolean;
+  onPending: (pending: PendingView, change: "steer" | "cancel") => void;
+  onCopyText: (text: string) => void;
+  onShareText: (text: string) => void;
+}) => {
+  const actions = pendingActions(pending);
+  const captured = sent?.captured;
+  return (
+    <div className="message owner pending" data-pending={pending.status} data-id={pending.id}>
+      {captured ? <SentPreview dot={dot} sent={captured} /> : null}
+      <div className="status">
+        {pendingLabel[pending.status]}
+        {actions.sendNow ? (
+          <button
+            type="button"
+            disabled={changing}
+            title="Join the dot's running turn at its next step instead of waiting for it to end"
+            onClick={() => onPending(pending, "steer")}
+          >
+            Send now
+          </button>
+        ) : null}
+        {actions.cancel ? (
+          <button
+            type="button"
+            disabled={changing}
+            title="Withdraw this message before the dot gets it"
+            onClick={() => onPending(pending, "cancel")}
+          >
+            Cancel
+          </button>
+        ) : null}
+        {captured?.text ? (
+          <button type="button" onClick={() => onCopyText(captured.text)}>
+            Copy
+          </button>
+        ) : null}
+        {captured?.text && !captured.images.length ? (
+          <button type="button" onClick={() => onShareText(captured.text)}>
+            Share…
+          </button>
+        ) : null}
+        {captured?.images.length ? (
+          <span className="note">Its images copy and share once delivered.</span>
+        ) : null}
+      </div>
     </div>
   );
 };
@@ -1058,6 +1428,7 @@ const MessageRow = ({
       className={`message ${message.kind} ${message.hidden ? "hidden" : ""}`}
       data-message={message.id}
       data-kind={message.kind}
+      data-blocked={blocked ? "" : undefined}
       onContextMenu={(event) => {
         event.preventDefault();
         open(event.clientX, event.clientY);
@@ -1092,15 +1463,26 @@ const MessageRow = ({
         ) : null}
         {message.attachments.length ? (
           <div className="thumbs">
-            {message.attachments.map((attachment) => (
-              <Thumb
-                key={attachment.index}
-                dot={dot}
-                message={message}
-                index={attachment.index}
-                onOpen={onOpenImage}
-              />
-            ))}
+            {message.attachments.map((attachment) =>
+              isImageType(attachment.mime) ? (
+                <Thumb
+                  key={attachment.index}
+                  dot={dot}
+                  message={message}
+                  index={attachment.index}
+                  name={fileName(attachment)}
+                  onOpen={onOpenImage}
+                />
+              ) : (
+                <span
+                  key={attachment.index}
+                  className="attachment-chip"
+                  title={fileName(attachment)}
+                >
+                  📄 {fileName(attachment)}
+                </span>
+              ),
+            )}
           </div>
         ) : null}
       </div>
@@ -1121,7 +1503,7 @@ const MessageRow = ({
         <span>{time(message.time)}</span>
         {delivered ? <span className="delivered">Delivered</span> : null}
         {message.hidden ? (
-          <button type="button" onClick={() => onRestore(message)}>
+          <button type="button" disabled={blocked} onClick={() => onRestore(message)}>
             Restore
           </button>
         ) : (
@@ -1129,6 +1511,7 @@ const MessageRow = ({
             type="button"
             className="more"
             aria-label="Message actions"
+            aria-haspopup="menu"
             disabled={blocked}
             onClick={(event) => {
               const box = event.currentTarget.getBoundingClientRect();
@@ -1143,9 +1526,20 @@ const MessageRow = ({
   );
 };
 
+const tapbackNames: Record<string, string> = {
+  "❤️": "Heart",
+  "👍": "Thumbs Up",
+  "👎": "Thumbs Down",
+  "😂": "Ha Ha",
+  "‼️": "Exclamation Marks",
+  "❓": "Question Mark",
+};
+
 const MessageMenu = ({
   menu,
+  dot,
   recent,
+  blocked,
   onClose,
   onReact,
   onEmoji,
@@ -1156,7 +1550,9 @@ const MessageMenu = ({
   onDelete,
 }: {
   menu: Menu;
+  dot: string;
   recent: string[];
+  blocked: boolean;
   onClose: () => void;
   onReact: (emoji: string) => void;
   onEmoji: () => void;
@@ -1167,91 +1563,152 @@ const MessageMenu = ({
   onDelete: () => void;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  // Focus moves into the menu once when it opens, and returns where it was when it closes; polls
+  // re-rendering the menu never move it.
   useEffect(() => {
-    ref.current?.querySelector("button")?.focus();
-    const close = (event: globalThis.KeyboardEvent) => event.key === "Escape" && onClose();
+    const before = document.activeElement;
+    ref.current?.querySelector<HTMLElement>("[role^='menuitem']:not(:disabled)")?.focus();
+    const close = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") closeRef.current();
+    };
     document.addEventListener("keydown", close);
-    return () => document.removeEventListener("keydown", close);
-  }, [onClose]);
+    return () => {
+      document.removeEventListener("keydown", close);
+      if (before instanceof HTMLElement && before.isConnected) before.focus();
+    };
+  }, []);
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const items = [
+      ...(ref.current?.querySelectorAll<HTMLElement>("[role^='menuitem']:not(:disabled)") ?? []),
+    ];
+    const active = document.activeElement;
+    const at = active instanceof HTMLElement ? items.indexOf(active) : -1;
+    const move: Record<string, number> = {
+      ArrowDown: at + 1,
+      ArrowRight: at + 1,
+      ArrowUp: at - 1,
+      ArrowLeft: at - 1,
+      Home: 0,
+      End: items.length - 1,
+    };
+    const target = move[event.key];
+    if (target === undefined || !items.length) return;
+    event.preventDefault();
+    items[(target + items.length) % items.length]?.focus();
+  };
   const { message } = menu;
-  const reactable = canReact(message);
+  const reactable = canReact(message) && !blocked;
   const mine = reactionOf(message, "owner");
+  const row = recentTapbacks(recent);
+  const unlisted = unlistedTapback(mine, row);
+  const reacted = message.reactions.some((reaction) => reaction.emoji);
+  const repliable = message.kind === "owner" || message.kind === "dot";
+  const content = message.text !== "" || message.attachments.some((item) => isImageType(item.mime));
   const style = {
     left: Math.min(menu.x, window.innerWidth - 260),
-    top: Math.min(menu.y, window.innerHeight - 320),
+    top: Math.min(menu.y, window.innerHeight - 360),
   };
+  const tapback = (emoji: string, name: string) => (
+    <button
+      key={emoji}
+      type="button"
+      role="menuitemradio"
+      aria-checked={mine === emoji}
+      aria-label={mine === emoji ? `${name}, selected. Remove your Tapback` : `${name} Tapback`}
+      title={mine === emoji ? `Remove your ${name}` : name}
+      className={mine === emoji ? "chosen" : ""}
+      disabled={!reactable}
+      onClick={() => onReact(emoji)}
+    >
+      {emoji}
+    </button>
+  );
+  const reasons = [
+    blocked ? "Waiting for saved message state before another change." : undefined,
+    message.kind === "dot" ? undefined : `Tapbacks are only for ${dot}'s messages.`,
+    repliable ? undefined : `Reply is only for your messages and ${dot}'s.`,
+    content ? undefined : "There's no text or image to copy or share.",
+  ].filter((reason) => reason !== undefined);
   return (
     <div className="menu-backdrop" onClick={onClose}>
       <div
         className="menu"
         role="menu"
+        aria-label="Message actions"
         ref={ref}
         style={style}
+        onKeyDown={onKeyDown}
         onClick={(event) => event.stopPropagation()}
       >
         {menu.details ? (
           <div className="details">
-            {message.reactions.filter((reaction) => reaction.emoji).length
+            {reacted
               ? message.reactions
                   .filter((reaction) => reaction.emoji)
                   .map((reaction) => (
                     <div key={reaction.actor}>
-                      {reaction.emoji} {reaction.actor === "owner" ? "You" : "The dot"}
+                      {reaction.emoji} {reaction.actor === "owner" ? "You" : dot}
                     </div>
                   ))
               : "No Tapbacks yet."}
           </div>
         ) : null}
-        {reactable ? (
-          <>
-            <div className="emoji-row">
-              {tapbacks.map((emoji) => (
-                <button
-                  key={emoji}
-                  type="button"
-                  role="menuitem"
-                  className={mine === emoji ? "chosen" : ""}
-                  onClick={() => onReact(emoji)}
-                >
-                  {emoji}
-                </button>
-              ))}
-            </div>
-            <div className="emoji-row">
-              {recent.slice(0, 5).map((emoji) => (
-                <button
-                  key={emoji}
-                  type="button"
-                  role="menuitem"
-                  className={mine === emoji ? "chosen" : ""}
-                  onClick={() => onReact(emoji)}
-                >
-                  {emoji}
-                </button>
-              ))}
-              <button type="button" role="menuitem" aria-label="More emoji" onClick={onEmoji}>
-                ☺︎…
-              </button>
-            </div>
-          </>
-        ) : null}
-        <button type="button" role="menuitem" onClick={onDetails}>
-          Tapback details
-        </button>
-        {message.kind === "owner" || message.kind === "dot" ? (
-          <button type="button" role="menuitem" onClick={onReply}>
-            Reply
+        <div className="emoji-row" role="group" aria-label="Tapbacks">
+          {tapbacks.map((emoji) => tapback(emoji, tapbackNames[emoji] ?? emoji))}
+        </div>
+        <div className="emoji-row" role="group" aria-label="More Tapbacks">
+          {row.map((emoji) => tapback(emoji, emoji))}
+          <button
+            type="button"
+            role="menuitem"
+            aria-label="Choose any emoji as a Tapback"
+            disabled={!reactable}
+            onClick={onEmoji}
+          >
+            ☺︎…
+          </button>
+        </div>
+        {unlisted ? (
+          <button
+            type="button"
+            role="menuitemradio"
+            aria-checked
+            aria-label={`${unlisted}, selected. Remove your Tapback`}
+            data-unlisted-tapback
+            disabled={!reactable}
+            onClick={() => onReact(unlisted)}
+          >
+            Your Tapback: {unlisted}
           </button>
         ) : null}
-        <button type="button" role="menuitem" onClick={onCopy}>
+        <button type="button" role="menuitem" disabled={!reacted} onClick={onDetails}>
+          Tapback details
+        </button>
+        <button type="button" role="menuitem" disabled={!repliable} onClick={onReply}>
+          Reply
+        </button>
+        <button type="button" role="menuitem" disabled={!content} onClick={onCopy}>
           Copy
         </button>
-        <button type="button" role="menuitem" onClick={onShare}>
+        <button type="button" role="menuitem" disabled={!content} onClick={onShare}>
           Share…
         </button>
-        <button type="button" role="menuitem" className="danger" onClick={onDelete}>
+        <button
+          type="button"
+          role="menuitem"
+          className="danger"
+          disabled={blocked}
+          onClick={onDelete}
+        >
           Delete
         </button>
+        {reasons.map((reason) => (
+          <div key={reason} className="menu-note">
+            {reason}
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -1266,6 +1723,7 @@ const Workers = ({
   onConfirm: (confirm: { text: string; action: string; run: () => void }) => void;
   onToast: (toast: Toast) => void;
 }) => {
+  const [busy, setBusy] = useState(new Set<number>());
   if (!dot.workers.length && !dot.sessions.length) return null;
   const opened = (result: Result<{ opened: boolean; command?: string; error?: string }>) => {
     if (!result.ok) onToast({ text: result.error });
@@ -1273,6 +1731,22 @@ const Workers = ({
       onToast({
         text: `Couldn't open a terminal${result.value.command ? "; the command is on the clipboard" : ""}.`,
       });
+  };
+  const stop = (id: number) => {
+    setBusy((current) => new Set(current).add(id));
+    void bridge.stopWorker(id).then((result) => {
+      setBusy((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+      if (!result.ok)
+        onToast({
+          text: result.lost
+            ? "Couldn't confirm the stop. It may have stopped; the list shows what open-dot has."
+            : `Not stopped. ${result.error}`,
+        });
+    });
   };
   const state = (needs: string[], waiting: string[], fallback: string) =>
     needs.length ? (
@@ -1286,32 +1760,39 @@ const Workers = ({
     );
   return (
     <div className="workers">
-      {dot.workers.map((worker) => (
-        <div key={worker.id} className="worker" data-worker={worker.id}>
-          <span className="worker-task">{worker.task}</span>
-          {state(worker.needs, worker.waiting, worker.state)}
-          <button type="button" onClick={() => void bridge.openWorker(worker.id).then(opened)}>
-            Open
-          </button>
-          {worker.state === "running" ? (
-            <button
-              type="button"
-              onClick={() =>
-                onConfirm({
-                  text: `Stop this worker? ${worker.task}`,
-                  action: "Stop",
-                  run: () =>
-                    void bridge.stopWorker(worker.id).then((result) => {
-                      if (!result.ok) onToast({ text: result.error });
-                    }),
-                })
-              }
-            >
-              Stop
-            </button>
-          ) : null}
-        </div>
-      ))}
+      {dot.workers.map((worker) => {
+        const actions = workerActions(worker.state);
+        return (
+          <div key={worker.id} className="worker" data-worker={worker.id} data-state={worker.state}>
+            <span className="worker-task">{worker.task}</span>
+            {state(
+              worker.needs,
+              worker.waiting,
+              worker.state === "stopping" ? "stopping, not confirmed" : worker.state,
+            )}
+            {actions.open ? (
+              <button type="button" onClick={() => void bridge.openWorker(worker.id).then(opened)}>
+                Open
+              </button>
+            ) : null}
+            {actions.stop ? (
+              <button
+                type="button"
+                disabled={busy.has(worker.id)}
+                onClick={() =>
+                  onConfirm({
+                    text: `Stop this worker? ${worker.task}`,
+                    action: "Stop",
+                    run: () => stop(worker.id),
+                  })
+                }
+              >
+                {worker.state === "stopping" ? "Stop again" : "Stop"}
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
       {dot.sessions.map((item) => (
         <div key={item.sessionID} className="worker" data-session={item.sessionID}>
           <span className="worker-task">{item.title ?? item.sessionID}</span>
