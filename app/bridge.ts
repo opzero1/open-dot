@@ -325,12 +325,6 @@ export interface ObservationPage {
   superseded?: number;
 }
 
-export interface NoteSearch {
-  query: string;
-  results: (Versioned & { snippet: string; source: NoteSource | null })[];
-  more: boolean;
-}
-
 export type RecallResult =
   | { kind: "note"; note: number; updated: string; snippet: string; source: unknown }
   | {
@@ -527,12 +521,11 @@ export interface FreshResult {
 export interface Operations {
   feed: [[], FeedPage];
   dismiss: [[id: number], true];
-  dismissAll: [[ids: number[]], unknown];
+  dismissAll: [[ids: number[]], { dismissed: number[]; missing: number[] }];
   memory: [[dot: string], Memory];
   observations: [[dot: string, before: number], ObservationPage];
   observationSource: [[dot: string, id: number, message: string], SourceText];
   noteSource: [[dot: string, id: number], NoteSourceRead];
-  search: [[dot: string, query: string], NoteSearch];
   recall: [[dot: string, query: string, offset: number], Recall];
   archived: [[dot: string, message: string, offset: number], Archived];
   archiveStatus: [[dot: string], ArchiveStatus];

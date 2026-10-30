@@ -835,3 +835,275 @@ button:disabled {
   overflow-x: auto;
   overflow-y: hidden;
 }
+
+/* Panes: the Feed and a dot's Memory, Instructions, Library, Health and Slack. */
+.feed-button {
+  margin: 0 8px 8px;
+  text-align: left;
+}
+
+.feed-button.selected {
+  background: var(--accent);
+  color: #fff;
+}
+
+.dot-row {
+  display: flex;
+  align-items: center;
+}
+
+.dot-row .dot {
+  flex: 1;
+  min-width: 0;
+}
+
+.dot-more {
+  border: none;
+  background: none;
+  padding: 2px 6px;
+  color: var(--muted);
+}
+
+.dot-menu .shortcut {
+  float: right;
+  color: var(--muted);
+}
+
+.dot-menu hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 4px 0;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.pane-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.pane-tools,
+.item-actions,
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.field-row input {
+  flex: 1;
+  min-width: 120px;
+}
+
+.pane-body {
+  flex: 1;
+  overflow: auto;
+  padding: 12px 20px 24px;
+}
+
+.pane > .note,
+.pane > .item-error,
+.pane > .notice,
+.pane > .conflict {
+  margin: 8px 20px 0;
+}
+
+.pane-section {
+  margin: 16px 0;
+}
+
+.pane-section h3 {
+  font-size: 13px;
+  margin: 0 0 6px;
+}
+
+.items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.item {
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.item-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.item-title {
+  font-weight: 600;
+}
+
+.item-text {
+  white-space: pre-wrap;
+}
+
+.item-error,
+.feed .item-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.notice {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.warn {
+  font-size: 12px;
+  color: #c2410c;
+}
+
+.empty-line {
+  color: var(--muted);
+}
+
+.mono,
+.source,
+.conflict-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.source,
+.conflict-text {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.editor textarea,
+.reply-box textarea {
+  min-height: 72px;
+  font: inherit;
+}
+
+.instructions-editor {
+  flex: 1;
+  margin: 8px 20px;
+  font-family: var(--mono);
+  font-size: 13px;
+  resize: none;
+}
+
+.feed-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feed-item {
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.feed-line {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.feed-title {
+  font-weight: 600;
+}
+
+.feed-context {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.reply-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.reply-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  border: none;
+  padding: 0;
+}
+
+.draft-chip {
+  font-size: 12px;
+  background: var(--bubble);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.health-status.healthy {
+  color: #16a34a;
+}
+
+.health-status.failed {
+  color: var(--danger);
+}
+
+.health-status.stale,
+.health-status.unknown {
+  color: #c2410c;
+}
+
+.secret {
+  font-family: var(--mono);
+}
+
+.modal-title {
+  font-weight: 600;
+}
+
+.modal-text {
+  white-space: pre-wrap;
+  max-height: 50vh;
+  overflow: auto;
+}
+
+.modal-box {
+  max-width: 460px;
+}

@@ -889,10 +889,6 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
       return isID(a)
         ? { method: "GET", path: `${memory}/notes/${a}/source`, timeout: 30_000 }
         : undefined;
-    case "search":
-      return isQuery(a)
-        ? { method: "GET", path: `${memory}/search?q=${segment(a.trim())}` }
-        : undefined;
     case "recall":
       return isQuery(a) && isOffset(b)
         ? { method: "GET", path: `${memory}/recall?q=${segment(a.trim())}&offset=${b}` }
@@ -1070,7 +1066,6 @@ const operationNames = new Set<string>([
   "observations",
   "observationSource",
   "noteSource",
-  "search",
   "recall",
   "archived",
   "archiveStatus",

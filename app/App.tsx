@@ -17,7 +17,6 @@ import {
 import { createRoot } from "react-dom/client";
 import type {
   Attempt,
-  Bridge,
   DotView,
   DraftImage,
   MessageView,
@@ -65,11 +64,26 @@ import {
   unreadSince,
   workerActions,
 } from "./chat";
+import { Feed } from "./Feed";
+import { Instructions } from "./Instructions";
 import { Markdown } from "./Markdown";
+import { Memory } from "./Memory";
+import { Health, Library } from "./Panes";
+import { Slack } from "./SlackView";
+import { InstructionsState } from "./surfaces";
+import { type Ask, bridge, Dialog } from "./ui";
 
-const loaded = globalThis.openDot;
-if (!loaded) throw new Error("The app's preload didn't load.");
-const bridge: Bridge = loaded;
+/** What the window shows for the selected dot; the Feed shows over any of them. */
+type Pane = "chat" | "memory" | "instructions" | "library" | "health" | "slack";
+
+const paneNames: [Pane, string][] = [
+  ["chat", "Chat"],
+  ["memory", "Memory"],
+  ["instructions", "Instructions"],
+  ["library", "Library"],
+  ["health", "Health"],
+  ["slack", "Slack"],
+];
 
 // Older pages a list too short to scroll loads on its own before it waits for Load older.
 const autoFillLimit = 10;
@@ -265,6 +279,22 @@ const App = () => {
   const [shortcut, setShortcut] = useState(true);
   const [sendAnyway, setSendAnyway] = useState(false);
   const [composerErrors, setComposerErrors] = useState(new Map<string, string>());
+  const [pane, setPane] = useState<Pane>("chat");
+  const [feedOpen, setFeedOpen] = useState(false);
+  const [ask, setAsk] = useState<Ask>();
+  const [dotMenu, setDotMenu] = useState<{ dot: string; x: number; y: number }>();
+  const [freshening, setFreshening] = useState(new Set<string>());
+  // Each dot's instructions editor, kept while the window lives so no pane switch drops a draft.
+  const editors = useRef(new Map<string, InstructionsState>());
+  const [, setEditorTick] = useState(0);
+  const editorFor = (name: string) => {
+    let editor = editors.current.get(name);
+    if (!editor) {
+      editor = new InstructionsState();
+      editors.current.set(name, editor);
+    }
+    return editor;
+  };
   // Messages a selection spans in the open chat, which history trimming keeps.
   const selectionKeep = useRef<ReadonlySet<string>>(new Set());
 
@@ -627,17 +657,19 @@ const App = () => {
     [dots, conversations, seen],
   );
 
+  const unsaved = [...editors.current.values()].filter((editor) => editor.dirty).length;
   useEffect(() => {
     const total = [...unread.values()].reduce((sum, count) => sum + count, 0);
-    void bridge.setTray({ busy: dots.some((item) => item.busy), unread: total });
-  }, [dots, unread]);
+    void bridge.setTray({ busy: dots.some((item) => item.busy), unread: total, unsaved });
+  }, [dots, unread, unsaved]);
 
-  // Looking at a chat marks it read.
+  // Looking at a chat marks it read; the Feed and a dot's other panes don't.
+  const looking = pane === "chat" && !feedOpen;
   useEffect(() => {
     const last = conversation?.latest.at(-1)?.id;
-    if (selected && last && seen.get(selected) !== last && document.hasFocus())
+    if (looking && selected && last && seen.get(selected) !== last && document.hasFocus())
       setSeen((current) => new Map(current).set(selected, last));
-  }, [selected, conversation, seen]);
+  }, [selected, conversation, seen, looking]);
 
   const mine = (selected && intents.get(selected)) || undefined;
   const shown = useMemo(
@@ -970,6 +1002,105 @@ const App = () => {
 
   const menuMessage = menu && selected ? currentMessage(selected, menu.message.id) : undefined;
 
+  // Panes. Leaving one keeps its drafts; only the owner discards them.
+
+  const show = (name: string, next: Pane) => {
+    setSelected(name);
+    setPane(next);
+    setFeedOpen(false);
+    setMenu(undefined);
+    setDotMenu(undefined);
+  };
+
+  const sessionFor = async (name: string) => {
+    const known = conversationsRef.current.get(name)?.sessionID;
+    if (known) return known;
+    const result = await bridge.messages(name);
+    return result.ok ? result.value.sessionID : undefined;
+  };
+
+  /** A fresh start, confirmed first; one refused mid-turn is forced only on a second answer. */
+  const startFresh = (name: string, force: boolean) => {
+    if (freshening.has(name)) return;
+    setFreshening((current) => new Set(current).add(name));
+    void bridge.call("fresh", name, force).then((result) => {
+      setFreshening((current) => {
+        const next = new Set(current);
+        next.delete(name);
+        return next;
+      });
+      if (result.ok) {
+        // The old session's window goes; drafts stay, and the next read shows the new session.
+        epochs.current.set(name, (epochs.current.get(name) ?? 0) + 1);
+        updateConversations((current) => without(current, name));
+        setOlderErrors((current) => without(current, name));
+        due.current.set(name, 0);
+        showToast({ text: `${name} started fresh.` });
+        return;
+      }
+      if (result.status === 409 && !force) {
+        setAsk({
+          title: `${name} is in the middle of a turn`,
+          text: `${result.error}\n\nStarting fresh now leaves that turn running in the old session.`,
+          buttons: [
+            { label: "Cancel" },
+            { label: "Start Fresh Anyway", danger: true, run: () => startFresh(name, true) },
+          ],
+        });
+        return;
+      }
+      setAsk({
+        title: `${name} didn't start fresh`,
+        text: result.lost
+          ? "Couldn't confirm whether it did. Nothing was retried; its chat shows the session it's in."
+          : result.error,
+        buttons: [{ label: "OK" }],
+      });
+      due.current.set(name, 0);
+    });
+  };
+
+  const confirmFresh = (name: string) => {
+    setDotMenu(undefined);
+    setAsk({
+      title: `Start ${name} fresh?`,
+      text: `${name} moves to a new OpenCode session and starts with a short handoff instead of its long history. Its notes, responsibilities, reminders, workers, grants, Slack threads and instructions carry over. Its current session is renamed as archived and kept, and its messages no longer show here.`,
+      buttons: [{ label: "Cancel" }, { label: "Start Fresh", run: () => startFresh(name, false) }],
+    });
+  };
+
+  // Command-1, 2 and 3 pick Chat, Memory and Instructions; Escape goes back to the chat. None of
+  // them discards a draft, and Escape does nothing while a dialog, a menu or IME input is open.
+  const modal = !!(ask || confirm || menu || viewer || capturing || dotMenu);
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.isComposing || event.defaultPrevented) return;
+      if (event.metaKey && !event.shiftKey && !event.altKey && !event.ctrlKey) {
+        const next =
+          event.key === "1"
+            ? "chat"
+            : event.key === "2"
+              ? "memory"
+              : event.key === "3"
+                ? "instructions"
+                : undefined;
+        if (next && selectedRef.current && !modal) {
+          event.preventDefault();
+          show(selectedRef.current, next);
+        }
+        return;
+      }
+      if (event.key !== "Escape" || modal) return;
+      if (feedOpen || pane !== "chat") {
+        event.preventDefault();
+        setFeedOpen(false);
+        setPane("chat");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   return (
     <div
       className="app"
@@ -983,42 +1114,101 @@ const App = () => {
         {!shortcut ? (
           <div className="banner">Control-Option-Space is taken by another app.</div>
         ) : null}
-        <nav>
+        <button
+          type="button"
+          className={`feed-button ${feedOpen ? "selected" : ""}`}
+          aria-pressed={feedOpen}
+          data-open-feed
+          onClick={() => {
+            setFeedOpen((open) => !open);
+            setMenu(undefined);
+          }}
+        >
+          Feed
+        </button>
+        <nav aria-label="Dots">
           {dots.map((item) => {
             const count = unread.get(item.name) ?? 0;
             const needs = needsCount(item);
             return (
-              <button
-                key={item.name}
-                type="button"
-                data-dot={item.name}
-                data-busy={item.busy ? "" : undefined}
-                className={`dot ${item.name === selected ? "selected" : ""}`}
-                onClick={() => {
-                  setSelected(item.name);
-                  setMenu(undefined);
-                }}
-              >
-                <Avatar dot={item} />
-                <span className="dot-name">{item.name}</span>
-                {item.busy ? <span className="badge busy" aria-label="Busy" /> : null}
-                {needs ? (
-                  <span className="badge needs" aria-label={`${needs} need you`}>
-                    {needs}
-                  </span>
-                ) : null}
-                {count ? (
-                  <span className="badge unread" aria-label={`${count} unread`}>
-                    {count}
-                  </span>
-                ) : null}
-              </button>
+              <div key={item.name} className="dot-row">
+                <button
+                  type="button"
+                  data-dot={item.name}
+                  data-busy={item.busy ? "" : undefined}
+                  className={`dot ${item.name === selected && !feedOpen ? "selected" : ""}`}
+                  aria-current={item.name === selected && !feedOpen ? "page" : undefined}
+                  onClick={() => {
+                    setSelected(item.name);
+                    setFeedOpen(false);
+                    setMenu(undefined);
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setDotMenu({ dot: item.name, x: event.clientX, y: event.clientY });
+                  }}
+                >
+                  <Avatar dot={item} />
+                  <span className="dot-name">{item.name}</span>
+                  {item.busy ? <span className="badge busy" aria-label="Busy" /> : null}
+                  {needs ? (
+                    <span className="badge needs" aria-label={`${needs} need you`}>
+                      {needs}
+                    </span>
+                  ) : null}
+                  {count ? (
+                    <span className="badge unread" aria-label={`${count} unread`}>
+                      {count}
+                    </span>
+                  ) : null}
+                </button>
+                <button
+                  type="button"
+                  className="dot-more"
+                  aria-label={`${item.name} menu`}
+                  aria-haspopup="menu"
+                  data-dot-menu={item.name}
+                  onClick={(event) => {
+                    const box = event.currentTarget.getBoundingClientRect();
+                    setDotMenu({ dot: item.name, x: box.left, y: box.bottom });
+                  }}
+                >
+                  ⋯
+                </button>
+              </div>
             );
           })}
         </nav>
       </aside>
       <main className="chat">
-        {dot && conversation ? (
+        {feedOpen ? (
+          <Feed
+            dots={dots}
+            selected={selected}
+            sessionFor={sessionFor}
+            onSent={(name) => {
+              due.current.set(name, 0);
+              void bridge.attempts().then(setAttempts);
+            }}
+            onOpenChat={(name) => show(name, "chat")}
+          />
+        ) : dot && pane === "memory" ? (
+          <Memory key={dot.name} dot={dot.name} sessionID={conversation?.sessionID} ask={setAsk} />
+        ) : dot && pane === "instructions" ? (
+          <Instructions
+            key={dot.name}
+            dot={dot.name}
+            state={editorFor(dot.name)}
+            ask={setAsk}
+            onChange={() => setEditorTick((tick) => tick + 1)}
+          />
+        ) : dot && pane === "library" ? (
+          <Library key={dot.name} dot={dot.name} />
+        ) : dot && pane === "health" ? (
+          <Health />
+        ) : dot && pane === "slack" ? (
+          <Slack key={dot.name} dot={dot.name} ask={setAsk} />
+        ) : dot && conversation ? (
           <>
             <header className="chat-head">
               <div>
@@ -1247,6 +1437,16 @@ const App = () => {
           </div>
         </div>
       ) : null}
+      {dotMenu ? (
+        <DotMenu
+          menu={dotMenu}
+          fresh={!freshening.has(dotMenu.dot)}
+          onPick={(next) => show(dotMenu.dot, next)}
+          onFresh={() => confirmFresh(dotMenu.dot)}
+          onClose={() => setDotMenu(undefined)}
+        />
+      ) : null}
+      {ask ? <Dialog ask={ask} onClose={() => setAsk(undefined)} /> : null}
       {toast ? (
         <div className="toast" role="status">
           {toast.text}
@@ -1269,6 +1469,67 @@ const App = () => {
 };
 
 /** Keeps the newest sends when more pile up than any chat could show as pending. */
+/** A dot's menu, from its ⋯ button or a right-click: its panes and Start Fresh. */
+const DotMenu = ({
+  menu,
+  fresh,
+  onPick,
+  onFresh,
+  onClose,
+}: {
+  menu: { dot: string; x: number; y: number };
+  fresh: boolean;
+  onPick: (pane: Pane) => void;
+  onFresh: () => void;
+  onClose: () => void;
+}) => {
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => box.current?.querySelector("button")?.focus(), []);
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const items = [
+      ...(box.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? []),
+    ];
+    const at = items.findIndex((item) => item === document.activeElement);
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      items[(at + step + items.length) % items.length]?.focus();
+    }
+  };
+  return (
+    <div
+      className="menu-backdrop"
+      onClick={onClose}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      <div
+        ref={box}
+        className="menu dot-menu"
+        role="menu"
+        aria-label={`${menu.dot} menu`}
+        style={{ left: menu.x, top: menu.y }}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={onKeyDown}
+      >
+        {paneNames.map(([pane, label], index) => (
+          <button key={pane} type="button" role="menuitem" onClick={() => onPick(pane)}>
+            {label}
+            {index < 3 ? <span className="shortcut">⌘{index + 1}</span> : null}
+          </button>
+        ))}
+        <hr />
+        <button type="button" role="menuitem" disabled={!fresh} onClick={onFresh}>
+          Start Fresh…
+        </button>
+      </div>
+    </div>
+  );
+};
+
 const keepSentLimit = (sent: Map<string, Sent>) =>
   sent.size <= sentLimit
     ? sent
