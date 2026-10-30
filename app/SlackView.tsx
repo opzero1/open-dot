@@ -27,6 +27,9 @@ import { type AskOwner, bridge } from "./ui";
 
 type Field = "access" | "refresh" | "bot" | "app" | "linkBot" | "linkApp" | "challenge";
 
+/** How long typed tokens wait for the owner to confirm they replace the dot's app. */
+const replaceMilliseconds = 120_000;
+
 const open = (url: string | undefined) => {
   if (url && isSlackAppPage(url)) void bridge.openLink(url);
 };
@@ -48,6 +51,16 @@ export const Slack = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   // The secret fields' values stay in the DOM; only whether each has text is state.
   const fields = useRef(new Map<Field, HTMLInputElement>());
   const [filled, setFilled] = useState(new Set<Field>());
+  // Whether this view is still open, and the setup it shows, for a dialog answered later.
+  const shown = useRef(true);
+  const setupRef = useRef<SlackSetup>(undefined);
+  setupRef.current = setup;
+  useEffect(() => {
+    shown.current = true;
+    return () => {
+      shown.current = false;
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     const result = await bridge.call("slack", dot);
@@ -143,6 +156,12 @@ export const Slack = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
     return value;
   };
 
+  /** Clears both typed tokens of a link. */
+  const dropLink = () => {
+    take("linkBot");
+    take("linkApp");
+  };
+
   const secretField = (field: Field, label: string) => (
     <input
       type="password"
@@ -208,10 +227,9 @@ export const Slack = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   };
 
   const connectLink = () => {
-    const bot = take("linkBot");
-    const app = take("linkApp");
-    if (!bot || !app) return;
-    const named = linkAppID(app);
+    // Only the app ID is read here. If the tokens would replace the dot's app, they stay in their
+    // fields while the owner decides, and the dialog's buttons hold IDs alone.
+    const named = linkAppID(fields.current.get("linkApp")?.value.trim() ?? "");
     const current = setup?.app;
     const other =
       current?.appID &&
@@ -219,7 +237,10 @@ export const Slack = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
       named !== current.appID
         ? current.appID
         : undefined;
-    const send = (replaceAppID?: string) =>
+    const send = (replaceAppID?: string) => {
+      const bot = take("linkBot");
+      const app = take("linkApp");
+      if (!bot || !app) return;
       void run(
         () =>
           bridge.secret({
@@ -231,14 +252,37 @@ export const Slack = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           }),
         "Both tokens sent to the daemon once. Saved isn't connected: this view says Connected only once the daemon checked them.",
       );
-    if (!other) {
-      send();
-      return;
-    }
+    };
+    if (!other) return send();
+    const asked = Date.now();
     ask({
       title: `Replace ${dot}'s Slack app?`,
       text: `${dot} is bound to the app ${other}. These tokens belong to another app, which would take its place, and open-dot would forget ${other}'s bot. ${other} stays in Slack until you delete it there.`,
-      buttons: [{ label: "Cancel" }, { label: "Replace it", danger: true, run: () => send(other) }],
+      buttons: [
+        { label: "Cancel", run: dropLink },
+        {
+          label: "Replace it",
+          danger: true,
+          run: () => {
+            // Sent only from this view as it still is: the same app bound, the same app's token
+            // in the field, and within the 2 minutes a held token is kept. Otherwise both go.
+            const now = fields.current.get("linkApp")?.value.trim() ?? "";
+            if (
+              !shown.current ||
+              Date.now() - asked > replaceMilliseconds ||
+              setupRef.current?.app?.appID !== other ||
+              linkAppID(now) !== named
+            ) {
+              dropLink();
+              setError(
+                "Nothing was sent: this view changed or 2 minutes passed. Enter both tokens again.",
+              );
+              return;
+            }
+            send(other);
+          },
+        },
+      ],
     });
   };
 

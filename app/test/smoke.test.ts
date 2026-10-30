@@ -2776,6 +2776,79 @@ test("Slack: leaving the view while a copy is read, or Stop while it's cleared, 
   );
 }, 170_000);
 
+test("Slack: tokens for another app wait in their fields while asked, and go once only on a timely Replace it", async () => {
+  const bot = ["xoxb", "5555555555", "6666666666666", "d".repeat(24)].join("-");
+  const other = ["xapp", "1", "AOTHER01", "7777777777", "e".repeat(64)].join("-");
+  await scenario(
+    "slack-replace",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+    },
+    async (app) => {
+      const { fake, js, until, press } = app;
+      const links = () => mutations(fake, "/dots/jojo/slack/link");
+      const cleared = `document.querySelector('[data-secret="linkBot"]').value === "" && document.querySelector('[data-secret="linkApp"]').value === ""`;
+      const enter = async () => {
+        await js(`t.fill('[data-secret="linkBot"]', ${JSON.stringify(bot)})`);
+        await js(`t.fill('[data-secret="linkApp"]', ${JSON.stringify(other)})`);
+        await press('[data-pane="slack"]', "Connect this app");
+        await until(`!!document.querySelector("[role=alertdialog]")`, "the replace question");
+      };
+      await openPane(app, "Slack");
+      await until(`!!document.querySelector('[data-secret="linkBot"]')`, "the link fields");
+      // Cancel drops both tokens.
+      await enter();
+      await press("[role=alertdialog]", "Cancel");
+      await until(cleared, "both fields cleared by Cancel");
+      // Replace it more than 2 minutes after asking sends nothing and drops both.
+      await enter();
+      await js(`(() => {
+        const real = Date.now;
+        window.realNow = real;
+        Date.now = () => real() + 121_000;
+        return true;
+      })()`);
+      await press("[role=alertdialog]", "Replace it");
+      await js(`(Date.now = window.realNow), true`);
+      await until(cleared, "both fields cleared after 2 minutes");
+      await until(`document.body.innerText.includes("Nothing was sent")`, "the late answer");
+      // Replace it with the field now naming the bound app's own token sends nothing too.
+      await enter();
+      await js(
+        `t.fill('[data-secret="linkApp"]', ${JSON.stringify(other.replace("AOTHER01", "AJOJO01"))})`,
+      );
+      await press("[role=alertdialog]", "Replace it");
+      await until(cleared, "both fields cleared after the token changed");
+      await delay(500);
+      expect(links()).toEqual([]);
+      // A timely answer sends both once, naming the app replaced.
+      await enter();
+      await press("[role=alertdialog]", "Replace it");
+      for (let tick = 0; tick < 50 && !links().length; tick++) await delay(100);
+      expect(links()).toEqual([
+        {
+          method: "POST",
+          path: "/dots/jojo/slack/link",
+          body: { bot, app: other, replaceAppID: "AJOJO01" },
+        },
+      ]);
+      expect(await js(cleared)).toBe(true);
+      expect(
+        await js(
+          `[${JSON.stringify(bot)}, ${JSON.stringify(other)}].some((token) => document.documentElement.outerHTML.includes(token))`,
+        ),
+      ).toBe(false);
+    },
+  );
+  const written = Bun.spawnSync([
+    "grep",
+    "-rlE",
+    "xoxb-|xapp-",
+    join(scratch, "slack-replace", "app-data"),
+  ]);
+  expect(written.stdout.toString()).toBe("");
+}, 170_000);
+
 test("avatars: a failed read is asked for again, a deleted one clears, and Command-2 and Escape keep the draft", async () => {
   await scenario(
     "avatar",
