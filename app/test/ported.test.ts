@@ -15,6 +15,9 @@ import {
   AvatarState,
   grantRemaining,
   nextRunLine,
+  requestAsked,
+  requestLine,
+  requestTimes,
   requestTitle,
   runAttribution,
   runTitle,
@@ -147,6 +150,59 @@ test("the request audit says what became of each answer", () => {
   expect(requestTitle({ state: "stale" })).toBe("not sent");
   expect(requestTitle({ state: "unknown" })).toBe("outcome unknown");
   expect(requestTitle({ state: "escalated" })).toBe("escalated to you");
+});
+
+test("the audit names each request's source, what it asked, and who answered when", () => {
+  const escalated = {
+    id: 3,
+    source: "worker",
+    worker: 1,
+    kind: "permission",
+    state: "escalated",
+    summary: "Approved once (not sent)",
+    detail: { kind: "permission", action: "shell", resources: ["git push --force"] },
+    sessionID: "ses_w",
+    createdAt: 1000,
+    actorSession: "ses_jojo",
+    queuedAt: 2000,
+    attemptedAt: null,
+    confirmedAt: null,
+    escalatedAt: 3000,
+  };
+  const answered = {
+    id: 4,
+    source: "threads",
+    worker: null,
+    kind: "question",
+    state: "answered",
+    summary: "Answered branch: dev",
+    detail: { kind: "question", title: "Which?", fields: [{ key: "branch", title: "Branch" }] },
+    sessionID: "ses_t",
+    createdAt: 1000,
+    actorSession: "ses_jojo",
+    queuedAt: 2000,
+    attemptedAt: 2100,
+    confirmedAt: 2200,
+    escalatedAt: null,
+  };
+  expect([escalated, answered].map(requestLine)).toEqual([
+    "#3 permission from worker #1 · escalated to you · Approved once (not sent)",
+    "#4 question from Threads · confirmed · Answered branch: dev",
+  ]);
+  expect([escalated, answered].map(requestAsked)).toEqual([
+    "shell: git push --force",
+    "Which? · Branch",
+  ]);
+  const times = requestTimes(answered);
+  expect(times).toStartWith("ses_t · seen ");
+  expect(times).toContain("by ses_jojo");
+  expect(times).toContain(" · sent ");
+  expect(times).toContain(" · confirmed ");
+  expect(times).not.toContain("escalated");
+  expect(requestTimes(escalated)).toContain(" · escalated ");
+  expect(requestTimes(escalated)).not.toContain("confirmed");
+  // A request nobody answered yet shows only when it was seen.
+  expect(requestTimes({ sessionID: "s", createdAt: 1 }).split(" · ")).toHaveLength(2);
 });
 
 const responsibility = (

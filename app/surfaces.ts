@@ -249,6 +249,16 @@ export const runAttribution = (run: Pick<RunView, "attribution">) =>
 
 export const runWorkerLine = (worker: RunView["workers"][number]) => {
   const status = worker.needs?.length
+/** The GitHub reasons a trigger filters on, in the words the feed and the daemon use. */
+export const triggerReasons = [
+  "Review requested",
+  "Mentioned",
+  "Team mentioned",
+  "Assigned",
+  "Comment",
+  "Author",
+] as const;
+
     ? `needs you: ${worker.needs.join(", ")}`
     : worker.state === "done"
       ? `finished (${worker.outcome ?? "unknown"})`
@@ -413,6 +423,50 @@ export class InstructionsState {
     this.conflictFromRevert = false;
   }
 
+/** "#3 permission from worker #1 · escalated to you · Approved once (not sent)". */
+export const requestLine = (
+  request: Pick<RequestAudit, "id" | "kind" | "source" | "worker" | "state" | "goneAt" | "summary">,
+) => {
+  const from = request.source === "worker" ? `worker #${request.worker ?? 0}` : "Threads";
+  return `#${request.id} ${request.kind} from ${from} · ${requestTitle(request)}${request.summary ? ` · ${request.summary}` : ""}`;
+};
+
+/** What the worker asked, in its own words, which are the worker's data. */
+export const requestAsked = (request: Pick<RequestAudit, "detail">) => {
+  const detail = request.detail;
+  if (!detail) return "";
+  if (detail.kind === "permission")
+    return `${detail.action ?? "?"}: ${(detail.resources ?? []).join(", ")}`;
+  const fields = (detail.fields ?? []).map(
+    (field) => field.title ?? field.description ?? field.key,
+  );
+  return [detail.title ?? "", ...fields].filter((part) => part !== "").join(" · ");
+};
+
+/** When a request was seen, answered and by which dot session, sent, confirmed and escalated. */
+export const requestTimes = (
+  request: Pick<
+    RequestAudit,
+    | "sessionID"
+    | "createdAt"
+    | "queuedAt"
+    | "actorSession"
+    | "attemptedAt"
+    | "confirmedAt"
+    | "escalatedAt"
+  >,
+) => {
+  const parts = [request.sessionID, `seen ${when(request.createdAt)}`];
+  if (typeof request.queuedAt === "number")
+    parts.push(
+      `answered ${when(request.queuedAt)}${request.actorSession ? ` by ${request.actorSession}` : ""}`,
+    );
+  if (typeof request.attemptedAt === "number") parts.push(`sent ${when(request.attemptedAt)}`);
+  if (typeof request.confirmedAt === "number") parts.push(`confirmed ${when(request.confirmedAt)}`);
+  if (typeof request.escalatedAt === "number") parts.push(`escalated ${when(request.escalatedAt)}`);
+  return parts.join(" · ");
+};
+
   /** What to send: the draft and the revision it replaces, the conflict's for Overwrite. */
   beginSave(overwrite: boolean) {
     if (!this.base || this.busy) return undefined;
@@ -424,6 +478,86 @@ export class InstructionsState {
       this.error = "Instructions must be at most 64 KiB of UTF-8 text.";
       return undefined;
     }
+export interface Draft<T> {
+  /** The version the edit started from: every save of this draft names it. */
+  version: number;
+  /** The values when the edit started, so only what the owner changed is sent. */
+  original: T;
+  edited: T;
+  /** What a save in flight sent; while set, the draft takes no typing. */
+  sending?: T;
+}
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/**
+ * The owner's unsaved memory edits, by row. An edit keeps the version and values it started from
+ * through polls, pane changes and failures, so a save never names a newer version the owner didn't
+ * see. Only a confirmed save, or a conflict that shows the rejected text beside the value now, ends
+ * it; a refused or unconfirmed save keeps it for the owner to try again.
+ */
+export class Drafts<T> {
+  readonly rows = new Map<string, Draft<T>>();
+
+  /** Starts editing a row; one already being edited keeps its draft and version. */
+  start(row: string, version: number, original: T) {
+    const known = this.rows.get(row);
+    if (known) return known;
+    const draft = { version, original, edited: original };
+    this.rows.set(row, draft);
+    return draft;
+  }
+
+  get(row: string) {
+    return this.rows.get(row);
+  }
+
+  /** The owner's typing, refused while a save of this draft is out. */
+  edit(row: string, edited: T) {
+    const draft = this.rows.get(row);
+    if (!draft || draft.sending !== undefined) return false;
+    draft.edited = edited;
+    return true;
+  }
+
+  cancel(row: string) {
+    const draft = this.rows.get(row);
+    if (draft?.sending !== undefined) return false;
+    return this.rows.delete(row);
+  }
+
+  /** What to send, once: undefined while a save of this draft is already out. */
+  begin(row: string) {
+    const draft = this.rows.get(row);
+    if (!draft || draft.sending !== undefined) return undefined;
+    draft.sending = draft.edited;
+    return { version: draft.version, original: draft.original, edited: draft.edited };
+  }
+
+  /**
+   * A save's answer. `saved` ends the draft; `conflict` ends it too, for the caller to show the
+   * rejected text beside the value now; `kept` leaves it, with its version, to try again.
+   */
+  finish(
+    row: string,
+    result: Reply<unknown>,
+    conflictShown: boolean,
+  ): "saved" | "conflict" | "kept" {
+    const draft = this.rows.get(row);
+    const sent = draft?.sending;
+    if (draft) delete draft.sending;
+    if (result.ok) {
+      if (draft && same(draft.edited, sent)) this.rows.delete(row);
+      return "saved";
+    }
+    if (result.status === 409 && conflictShown) {
+      this.rows.delete(row);
+      return "conflict";
+    }
+    return "kept";
+  }
+}
+
     let revision: string;
     if (overwrite) {
       if (!this.canOverwrite || !this.conflict) return undefined;
@@ -455,6 +589,86 @@ export class InstructionsState {
     this.busy = undefined;
     if (result.ok) {
       this.base = result.value;
+const nextOf = (value: unknown) =>
+  typeof value === "object" && value !== null && "next" in value && typeof value.next === "number"
+    ? value.next
+    : undefined;
+
+export interface SearchTicket {
+  number: number;
+  changes: number;
+  query: string;
+  offset: number;
+}
+
+/**
+ * One memory search box: only the newest search shows, a search begun before or during a change
+ * the owner makes is dropped, and the change's end runs the shown search again. Clearing drops any
+ * search out. A page of more results counts only while the results still end where it began.
+ */
+export class Searches<T> {
+  shown: { query: string; value: T } | undefined;
+  error: string | undefined;
+  searching = false;
+  private submitted: string | undefined;
+  private number = 0;
+  private changes = 0;
+
+  start(raw: string): SearchTicket | undefined {
+    const query = raw.trim();
+    if (!query) {
+      this.clear();
+      return undefined;
+    }
+    this.submitted = query;
+    this.searching = true;
+    this.error = undefined;
+    return { number: ++this.number, changes: this.changes, query, offset: 0 };
+  }
+
+  /** The next page of the shown results. */
+  more(): SearchTicket | undefined {
+    const next = nextOf(this.shown?.value);
+    if (!this.shown || next === undefined) return undefined;
+    this.searching = true;
+    return { number: ++this.number, changes: this.changes, query: this.shown.query, offset: next };
+  }
+
+  /** A change began or ended: every search out now is dropped. */
+  changed() {
+    this.changes++;
+  }
+
+  /** The search the owner last submitted, again, once a change settled. */
+  rerun() {
+    return this.submitted === undefined ? undefined : this.start(this.submitted);
+  }
+
+  clear() {
+    this.number++;
+    this.submitted = undefined;
+    this.shown = undefined;
+    this.error = undefined;
+    this.searching = false;
+  }
+
+  /** False when a newer search, a clear or a change overtook this one. */
+  finish(ticket: SearchTicket, result: Reply<T>, append?: (shown: T, page: T) => T) {
+    if (ticket.number !== this.number || ticket.changes !== this.changes) return false;
+    this.searching = false;
+    if (!result.ok) {
+      this.error = result.error;
+      if (!ticket.offset) this.shown = undefined;
+      return true;
+    }
+    this.error = undefined;
+    if (!ticket.offset) this.shown = { query: ticket.query, value: result.value };
+    else if (this.shown && nextOf(this.shown.value) === ticket.offset && append)
+      this.shown = { query: ticket.query, value: append(this.shown.value, result.value) };
+    return true;
+  }
+}
+
       this.draft = result.value.content;
       this.conflict = undefined;
       this.conflictFromRevert = false;

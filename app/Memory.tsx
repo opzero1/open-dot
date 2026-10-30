@@ -13,6 +13,7 @@ import type {
   MemoryNote,
   MemoryReminder,
   MemoryResponsibility,
+  NoteSearch,
   Observation,
   Recall,
   Reply,
@@ -24,12 +25,17 @@ import type {
 } from "./bridge";
 import {
   changedFields,
+  Drafts,
   Fence,
   grantRemaining,
+  type SearchTicket,
+  Searches,
   memoryChange,
   memoryFailure,
   nextRunLine,
-  requestTitle,
+  requestAsked,
+  requestLine,
+  requestTimes,
   runAttribution,
   runTitle,
   runUnresolved,
@@ -37,32 +43,42 @@ import {
   runWorkersNotes,
   sourceSummary,
   supervisionTimes,
+  triggerReasons,
 } from "./surfaces";
 import { type AskOwner, bridge, Section, when } from "./ui";
 
-const triggerReasons = [
-  "review_requested",
-  "mention",
-  "team_mention",
-  "assign",
-  "comment",
-  "author",
-];
 const statuses = ["active", "done", "dropped"];
 
 const short = (text: string, limit = 200) =>
   text.length > limit ? `${text.slice(0, limit)}…` : text;
 
 type Fields = { goal: string; nextAction: string; status: string };
+type ReminderFields = { due: string; every: string };
 
 interface Kept {
-  edits: Map<string, string>;
-  fields: Map<number, { original: Fields; edited: Fields }>;
+  texts: Drafts<string>;
+  fields: Drafts<Fields>;
+  reminders: Drafts<ReminderFields>;
   rejected: Map<string, { mine: string; current: string }>;
 }
 
-// Unsent edits per dot, kept while the window lives so switching panes or dots doesn't drop them.
+// Unsent edits per dot, kept while the window lives so switching panes, dots or sessions doesn't
+// drop them. Each keeps the version it started from.
 const kept = new Map<string, Kept>();
+
+const keptFor = (dot: string) => {
+  let known = kept.get(dot);
+  if (!known) {
+    known = {
+      texts: new Drafts(),
+      fields: new Drafts(),
+      reminders: new Drafts(),
+      rejected: new Map(),
+    };
+    kept.set(dot, known);
+  }
+  return known;
+};
 
 const textOf = (value: unknown) =>
   typeof value === "object" && value !== null && "text" in value && typeof value.text === "string"
@@ -76,6 +92,17 @@ const fieldsOf = (value: unknown): string | undefined => {
   );
   return parts.length ? parts.join("\n") : undefined;
 };
+
+/** A reminder's time and repeat as a conflict shows them. */
+const reminderLine = (dueAt: number | null, everyMinutes: number | null | undefined) =>
+  [
+    dueAt === null ? undefined : `due: ${when(dueAt)}`,
+    everyMinutes === undefined
+      ? undefined
+      : `repeat: ${everyMinutes === null ? "once" : `every ${everyMinutes} minutes`}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 
 const local = (time: number) =>
   new Date(time - new Date(time).getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
@@ -92,13 +119,15 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(new Set<string>());
   const [rowErrors, setRowErrors] = useState(new Map<string, string>());
-  const initial = kept.get(dot) ?? { edits: new Map(), fields: new Map(), rejected: new Map() };
-  const [edits, setEdits] = useState(initial.edits);
-  const [fields, setFields] = useState(initial.fields);
-  const [rejected, setRejected] = useState(initial.rejected);
-  useEffect(() => {
-    kept.set(dot, { edits, fields, rejected });
-  }, [dot, edits, fields, rejected]);
+  const drafts = keptFor(dot);
+  const [, setTick] = useState(0);
+  const render = () => setTick((tick) => tick + 1);
+  const rejected = drafts.rejected;
+  const setRejected = (row: string, value: { mine: string; current: string } | undefined) => {
+    if (value) rejected.set(row, value);
+    else rejected.delete(row);
+    render();
+  };
 
   const read = useCallback(async () => {
     const at = keyRef.current;
@@ -131,42 +160,68 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
 
   /**
    * Sends one change once. Reads out meanwhile are dropped, and one read follows. A 409 shows
-   * the value now beside what the owner tried; nothing is retried.
+   * the value now beside what the owner tried; nothing is retried. Answers what the daemon said
+   * and whether a conflict is shown.
    */
   const mutate = async (
     row: string,
     work: () => Promise<Reply<unknown>>,
     rejectedText?: { mine: string; current: (value: unknown) => string | undefined },
   ) => {
-    if (busy.has(row)) return false;
+    if (busy.has(row)) return { result: undefined, conflict: false };
     const at = keyRef.current;
     fence.current.advance(at);
+    recalls.current.changed();
+    noteSearches.current.changed();
     setBusy((current) => new Set(current).add(row));
-    const result = await work();
+    let result: Reply<unknown>;
+    try {
+      result = await work();
+    } catch {
+      result = { ok: false, error: "No answer. Nothing was retried.", lost: true };
+    }
     fence.current.advance(at);
+    recalls.current.changed();
+    noteSearches.current.changed();
     setBusy((current) => {
       const next = new Set(current);
       next.delete(row);
       return next;
     });
+    let conflict = false;
     if (result.ok) setRowError(row, undefined);
     else {
       setRowError(row, memoryFailure(result));
       const current = result.status === 409 ? rejectedText?.current(result.current) : undefined;
-      if (rejectedText && current !== undefined)
-        setRejected((known) => new Map(known).set(row, { mine: rejectedText.mine, current }));
+      if (rejectedText && current !== undefined) {
+        conflict = true;
+        setRejected(row, { mine: rejectedText.mine, current });
+      }
+    }
+    // Sources and search results opened before the change may no longer be what's saved.
+    setOpened(new Map());
+    setSources(new Map());
+    setZoom(new Map());
+    // Older observed pages may hold the row as it was; Load older reads them again.
+    setOlder(undefined);
+    if (keyRef.current === at) {
+      void recallRun(recalls.current.rerun());
+      void noteSearchRun(noteSearches.current.rerun());
     }
     void read();
-    return result.ok;
+    return { result, conflict };
   };
 
-  const edit = (row: string, text: string | undefined) =>
-    setEdits((current) => {
-      const next = new Map(current);
-      if (text === undefined) next.delete(row);
-      else next.set(row, text);
-      return next;
-    });
+  /** Ends a save of a draft: confirmed or shown as a conflict ends it, anything else keeps it. */
+  const settle = <T,>(
+    store: Drafts<T>,
+    row: string,
+    outcome: { result: Reply<unknown> | undefined; conflict: boolean },
+  ) => {
+    if (outcome.result && store.finish(row, outcome.result, outcome.conflict) === "saved")
+      setRejected(row, undefined);
+    render();
+  };
 
   const rowState = (row: string) => (
     <>
@@ -181,16 +236,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           <pre className="conflict-text">{rejected.get(row)?.mine}</pre>
           <div className="note">As it is now</div>
           <pre className="conflict-text">{rejected.get(row)?.current}</pre>
-          <button
-            type="button"
-            onClick={() =>
-              setRejected((current) => {
-                const next = new Map(current);
-                next.delete(row);
-                return next;
-              })
-            }
-          >
+          <button type="button" onClick={() => setRejected(row, undefined)}>
             Discard rejected edit
           </button>
         </div>
@@ -198,51 +244,69 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
     </>
   );
 
-  /** A text row's editor: Save sends the text with the version it started from. */
-  const textEditor = (row: string, label: string, save: (text: string) => void) => {
-    const text = edits.get(row);
-    if (text === undefined) return null;
+  /**
+   * A text row's editor. Save sends the text with the version the edit started from, however the
+   * row changed since; the editor takes no typing while its save is out.
+   */
+  const textEditor = (
+    row: string,
+    label: string,
+    save: (version: number, text: string) => Promise<Reply<unknown>>,
+  ) => {
+    const draft = drafts.texts.get(row);
+    if (!draft) return null;
+    const sending = draft.sending !== undefined;
     return (
-      <div className="editor">
+      <div className="editor" data-editing={row}>
         <textarea
           aria-label={label}
-          value={text}
-          onChange={(event) => edit(row, event.target.value)}
+          value={draft.edited}
+          readOnly={sending}
+          onChange={(event) => {
+            if (drafts.texts.edit(row, event.target.value)) render();
+          }}
         />
         <div className="item-actions">
-          <button type="button" onClick={() => edit(row, undefined)}>
+          <button
+            type="button"
+            disabled={sending}
+            onClick={() => {
+              drafts.texts.cancel(row);
+              render();
+            }}
+          >
             Cancel
           </button>
           <button
             type="button"
             className="send"
-            disabled={busy.has(row) || !text.trim()}
-            onClick={() => save(text.trim())}
+            disabled={sending || busy.has(row) || !draft.edited.trim()}
+            onClick={() => {
+              const text = draft.edited.trim();
+              if (text === draft.original) {
+                drafts.texts.cancel(row);
+                return render();
+              }
+              const sent = drafts.texts.begin(row);
+              if (!sent) return;
+              render();
+              void mutate(row, () => save(sent.version, text), {
+                mine: text,
+                current: textOf,
+              }).then((outcome) => settle(drafts.texts, row, outcome));
+            }}
           >
-            {busy.has(row) ? "Saving…" : "Save"}
+            {sending ? "Saving…" : "Save"}
           </button>
         </div>
       </div>
     );
   };
 
-  const saveText = (
-    row: string,
-    original: string,
-    text: string,
-    work: () => Promise<Reply<unknown>>,
-  ) => {
-    if (text === original) return edit(row, undefined);
-    void mutate(row, work, { mine: text, current: textOf }).then((ok) => {
-      // A refused edit stays beside the value now; the editor closes either way.
-      edit(row, undefined);
-      if (ok)
-        setRejected((current) => {
-          const next = new Map(current);
-          next.delete(row);
-          return next;
-        });
-    });
+  /** Starts editing a text row, or goes back to its kept draft. */
+  const editText = (row: string, version: number, text: string) => {
+    drafts.texts.start(row, version, text);
+    render();
   };
 
   // Notes.
@@ -259,7 +323,10 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
       });
       return;
     }
+    const at = keyRef.current;
+    const generation = fence.current.current(at);
     const result = await bridge.call("noteSource", dot, note.id);
+    if (keyRef.current !== at || !fence.current.holds(at, generation)) return;
     const text = result.ok
       ? `${sourceSummary(result.value, dot)}${result.value.message ? `\n\n${result.value.message.text}` : ""}`
       : `Source unavailable: ${result.error}`;
@@ -273,13 +340,11 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
         <div className="item-text">{note.text}</div>
         <div className="note">{memoryChange(note.updatedAt, note.updatedBy, dot)}</div>
         {rowState(row)}
-        {textEditor(row, "Note", (text) =>
-          saveText(row, note.text, text, () =>
-            bridge.call("editNote", dot, note.id, note.version, text),
-          ),
+        {textEditor(row, "Note", (version, text) =>
+          bridge.call("editNote", dot, note.id, version, text),
         )}
         <div className="item-actions">
-          <button type="button" onClick={() => edit(row, note.text)}>
+          <button type="button" onClick={() => editText(row, note.version, note.text)}>
             Edit
           </button>
           <button type="button" onClick={() => void toggleSource(note)}>
@@ -404,21 +469,16 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
 
   const responsibilityRow = (row: MemoryResponsibility) => {
     const id = `responsibility:${row.id}`;
-    const editing = fields.get(row.id);
+    const editing = drafts.fields.get(id);
+    const sending = editing?.sending !== undefined;
     const shownRuns = runs.get(row.id);
-    const setEdited = (change: Partial<Fields>) =>
-      setFields((current) => {
-        const known = current.get(row.id);
-        return known
-          ? new Map(current).set(row.id, { ...known, edited: { ...known.edited, ...change } })
-          : current;
-      });
-    const close = () =>
-      setFields((current) => {
-        const next = new Map(current);
-        next.delete(row.id);
-        return next;
-      });
+    const setEdited = (change: Partial<Fields>) => {
+      if (editing && drafts.fields.edit(id, { ...editing.edited, ...change })) render();
+    };
+    const close = () => {
+      drafts.fields.cancel(id);
+      render();
+    };
     return (
       <li key={row.id} className="item" data-responsibility={row.id}>
         <div className="item-title">
@@ -434,16 +494,19 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           <div className="editor">
             <input
               aria-label="Goal"
+              readOnly={sending}
               value={editing.edited.goal}
               onChange={(event) => setEdited({ goal: event.target.value })}
             />
             <textarea
               aria-label="Next action"
+              readOnly={sending}
               value={editing.edited.nextAction}
               onChange={(event) => setEdited({ nextAction: event.target.value })}
             />
             <select
               aria-label="Status"
+              disabled={sending}
               value={editing.edited.status}
               onChange={(event) => setEdited({ status: event.target.value })}
             >
@@ -452,30 +515,34 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               ))}
             </select>
             <div className="item-actions">
-              <button type="button" onClick={close}>
+              <button type="button" disabled={sending} onClick={close}>
                 Cancel
               </button>
               <button
                 type="button"
                 className="send"
-                disabled={busy.has(id)}
+                disabled={sending || busy.has(id)}
                 onClick={() => {
-                  // Only the fields the owner changed, so one the dot changed meanwhile stays.
+                  // Only the fields the owner changed since the edit began, against the version
+                  // it began from, so one the dot changed meanwhile stays or conflicts.
                   const change = changedFields(editing.original, editing.edited);
                   if (!Object.keys(change).length) return close();
+                  const sent = drafts.fields.begin(id);
+                  if (!sent) return;
+                  render();
                   void mutate(
                     id,
-                    () => bridge.call("editResponsibility", dot, row.id, row.version, change),
+                    () => bridge.call("editResponsibility", dot, row.id, sent.version, change),
                     {
                       mine: Object.entries(change)
                         .map(([name, value]) => `${name}: ${value}`)
                         .join("\n"),
                       current: fieldsOf,
                     },
-                  ).then(close);
+                  ).then((outcome) => settle(drafts.fields, id, outcome));
                 }}
               >
-                {busy.has(id) ? "Saving…" : "Save"}
+                {sending ? "Saving…" : "Save"}
               </button>
             </div>
           </div>
@@ -485,7 +552,8 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
             type="button"
             onClick={() => {
               const original = { goal: row.goal, nextAction: row.nextAction, status: row.status };
-              setFields((current) => new Map(current).set(row.id, { original, edited: original }));
+              drafts.fields.start(id, row.version, original);
+              render();
             }}
           >
             Edit
@@ -527,14 +595,17 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
 
   const reminderRow = (reminder: MemoryReminder) => {
     const row = `reminder:${reminder.id}`;
-    const editing = edits.get(row);
-    const repeat = `reminder-every:${reminder.id}`;
-    const every = (edits.get(repeat) ?? "").trim();
+    const editing = drafts.reminders.get(row);
+    const sending = editing?.sending !== undefined;
+    const every = (editing?.edited.every ?? "").trim();
     // Empty repeats never; otherwise whole minutes, as the daemon takes them.
     const everyMinutes = every === "" ? null : /^\d+$/.test(every) ? Number(every) : Number.NaN;
     const everyValid =
       everyMinutes === null ||
       (Number.isSafeInteger(everyMinutes) && everyMinutes >= 1 && everyMinutes <= 525_600);
+    const setEdited = (change: Partial<ReminderFields>) => {
+      if (editing && drafts.reminders.edit(row, { ...editing.edited, ...change })) render();
+    };
     return (
       <li key={reminder.id} className="item" data-reminder={reminder.id}>
         <div className="item-text">{reminder.text}</div>
@@ -544,14 +615,15 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           {reminder.state}
         </div>
         {rowState(row)}
-        {editing !== undefined ? (
+        {editing ? (
           <div className="editor">
             <label>
               Due{" "}
               <input
                 type="datetime-local"
-                value={editing}
-                onChange={(event) => edit(row, event.target.value)}
+                readOnly={sending}
+                value={editing.edited.due}
+                onChange={(event) => setEdited({ due: event.target.value })}
               />
             </label>
             <label>
@@ -559,18 +631,20 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               <input
                 inputMode="numeric"
                 size={7}
+                readOnly={sending}
                 aria-invalid={!everyValid}
-                value={edits.get(repeat) ?? ""}
-                onChange={(event) => edit(repeat, event.target.value)}
+                value={editing.edited.every}
+                onChange={(event) => setEdited({ every: event.target.value })}
               />{" "}
               minutes (empty for once)
             </label>
             <div className="item-actions">
               <button
                 type="button"
+                disabled={sending}
                 onClick={() => {
-                  edit(row, undefined);
-                  edit(repeat, undefined);
+                  drafts.reminders.cancel(row);
+                  render();
                 }}
               >
                 Cancel
@@ -578,23 +652,49 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               <button
                 type="button"
                 className="send"
-                disabled={busy.has(row) || Number.isNaN(new Date(editing).getTime()) || !everyValid}
+                disabled={
+                  sending ||
+                  busy.has(row) ||
+                  Number.isNaN(new Date(editing.edited.due).getTime()) ||
+                  !everyValid
+                }
                 onClick={() => {
-                  const dueAt = new Date(editing).getTime();
-                  // Only what changed goes, against the version the edit started from.
+                  // Only what the owner changed since the edit began, against the version it
+                  // began from. The field shows whole minutes, so an untouched time keeps its
+                  // seconds.
+                  const { original, edited } = editing;
                   const change: { dueAt?: number; everyMinutes?: number | null } = {};
-                  // The field shows whole minutes, so an untouched time keeps its seconds.
-                  if (editing !== local(reminder.dueAt)) change.dueAt = dueAt;
-                  if (everyMinutes !== reminder.everyMinutes) change.everyMinutes = everyMinutes;
-                  edit(row, undefined);
-                  edit(repeat, undefined);
-                  if (Object.keys(change).length)
-                    void mutate(row, () =>
-                      bridge.call("editReminder", dot, reminder.id, reminder.version, change),
-                    );
+                  if (edited.due !== original.due) change.dueAt = new Date(edited.due).getTime();
+                  if (edited.every.trim() !== original.every) change.everyMinutes = everyMinutes;
+                  if (!Object.keys(change).length) {
+                    drafts.reminders.cancel(row);
+                    return render();
+                  }
+                  const sent = drafts.reminders.begin(row);
+                  if (!sent) return;
+                  render();
+                  void mutate(
+                    row,
+                    () => bridge.call("editReminder", dot, reminder.id, sent.version, change),
+                    {
+                      mine: reminderLine(change.dueAt ?? null, change.everyMinutes),
+                      current: (value) =>
+                        typeof value === "object" &&
+                        value !== null &&
+                        "dueAt" in value &&
+                        typeof value.dueAt === "number"
+                          ? reminderLine(
+                              value.dueAt,
+                              "everyMinutes" in value && typeof value.everyMinutes === "number"
+                                ? value.everyMinutes
+                                : null,
+                            )
+                          : undefined,
+                    },
+                  ).then((outcome) => settle(drafts.reminders, row, outcome));
                 }}
               >
-                Save
+                {sending ? "Saving…" : "Save"}
               </button>
             </div>
           </div>
@@ -603,8 +703,11 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           <button
             type="button"
             onClick={() => {
-              edit(row, local(reminder.dueAt));
-              edit(repeat, reminder.everyMinutes === null ? "" : String(reminder.everyMinutes));
+              drafts.reminders.start(row, reminder.version, {
+                due: local(reminder.dueAt),
+                every: reminder.everyMinutes === null ? "" : String(reminder.everyMinutes),
+              });
+              render();
             }}
           >
             Change time
@@ -689,13 +792,14 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           {memoryChange(observation.updatedAt, observation.updatedBy, dot)}
         </div>
         {rowState(row)}
-        {textEditor(row, "Observation", (text) =>
-          saveText(row, observation.text, text, () =>
-            bridge.call("editObservation", dot, observation.id, observation.version, text),
-          ),
+        {textEditor(row, "Observation", (version, text) =>
+          bridge.call("editObservation", dot, observation.id, version, text),
         )}
         <div className="item-actions">
-          <button type="button" onClick={() => edit(row, observation.text)}>
+          <button
+            type="button"
+            onClick={() => editText(row, observation.version, observation.text)}
+          >
             Edit
           </button>
           <button
@@ -752,13 +856,20 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
                                 next.delete(at);
                                 return next;
                               });
+                            const opening = keyRef.current;
+                            const generation = fence.current.current(opening);
                             void bridge
                               .call("observationSource", dot, observation.id, source.messageID)
-                              .then((result) =>
+                              .then((result) => {
+                                if (
+                                  keyRef.current !== opening ||
+                                  !fence.current.holds(opening, generation)
+                                )
+                                  return;
                                 setOpened((current) =>
                                   new Map(current).set(at, result.ok ? result.value : result.error),
-                                ),
-                              );
+                                );
+                              });
                           }}
                         >
                           {shown === undefined ? "Open" : "Close"}
@@ -791,37 +902,47 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
     );
   };
 
-  // Recall: notes, archived messages and observations matching the owner's words.
+  // Recall: notes, archived messages and observations matching the owner's words; and Search
+  // notes, the notes alone. A search begun before or during a change is dropped and runs again.
 
   const [query, setQuery] = useState("");
-  const [recall, setRecall] = useState<Recall & { offset: number }>();
-  const [recallError, setRecallError] = useState<string>();
+  const recalls = useRef(new Searches<Recall>());
+  const [noteQuery, setNoteQuery] = useState("");
+  const noteSearches = useRef(new Searches<NoteSearch>());
   const [zoom, setZoom] = useState(new Map<string, Archived | string>());
 
-  const search = async (offset: number) => {
-    const words = (offset ? recall?.query : query.trim()) ?? "";
-    if (!words) return;
-    const at = keyRef.current;
-    const result = await bridge.call("recall", dot, words, offset);
-    if (keyRef.current !== at) return;
-    if (!result.ok) return setRecallError(result.error);
-    setRecallError(undefined);
-    setRecall((current) =>
-      offset && current
-        ? { ...result.value, offset, results: [...current.results, ...result.value.results] }
-        : { ...result.value, offset },
-    );
+  const recallRun = async (ticket: SearchTicket | undefined) => {
+    if (!ticket) return render();
+    render();
+    const result = await bridge.call("recall", dot, ticket.query, ticket.offset);
+    if (
+      recalls.current.finish(ticket, result, (shown, page) => ({
+        ...page,
+        results: [...shown.results, ...page.results],
+      }))
+    )
+      render();
+  };
+
+  const noteSearchRun = async (ticket: SearchTicket | undefined) => {
+    if (!ticket) return render();
+    render();
+    const result = await bridge.call("searchNotes", dot, ticket.query);
+    if (noteSearches.current.finish(ticket, result)) render();
   };
 
   const readArchived = async (message: string, offset: number) => {
+    const at = keyRef.current;
+    const generation = fence.current.current(at);
     const result = await bridge.call("archived", dot, message, offset);
+    if (keyRef.current !== at || !fence.current.holds(at, generation)) return;
     setZoom((current) => {
       const known = current.get(message);
       const next = new Map(current);
       if (!result.ok) next.set(message, result.error);
-      else if (offset && typeof known === "object")
+      else if (offset && typeof known === "object" && known.next === offset)
         next.set(message, { ...result.value, text: known.text + result.value.text });
-      else next.set(message, result.value);
+      else if (!offset) next.set(message, result.value);
       return next;
     });
   };
@@ -1085,6 +1206,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
     const responsibility = Number(draft.responsibility);
     if (!Number.isSafeInteger(responsibility) || !draft.repository.trim() || !draft.reasons.length)
       return;
+    const sent = draft;
     void mutate("trigger:new", () =>
       bridge.call("createTrigger", dot, {
         responsibility,
@@ -1092,8 +1214,9 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
         reasons: draft.reasons,
         task: draft.task.trim(),
       }),
-    ).then((ok) => {
-      if (ok) setDraft(undefined);
+    ).then(({ result }) => {
+      // Only the draft as it was sent goes; one changed meanwhile stays.
+      if (result?.ok) setDraft((current) => (current === sent ? undefined : current));
     });
   };
 
@@ -1107,6 +1230,8 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
       </div>
     );
 
+  const recall = recalls.current.shown?.value;
+  const noteSearch = noteSearches.current.shown?.value;
   const observations = [...(memory.observations ?? []), ...(older?.rows ?? [])];
   const observationsNext = older ? older.next : (memory.observationsNext ?? null);
 
@@ -1126,27 +1251,36 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
         <form
           className="field-row"
           role="search"
+          aria-label="Recall"
           onSubmit={(event) => {
             event.preventDefault();
-            void search(0);
+            void recallRun(recalls.current.start(query));
           }}
         >
           <input
-            aria-label={`Search ${dot}'s memory`}
-            placeholder="Search notes, observations and archived messages"
+            aria-label={`Recall from ${dot}'s memory`}
+            placeholder="Recall notes, observations and archived messages"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
           <button type="submit" disabled={!query.trim()}>
-            Search
+            Recall
           </button>
-          {recall ? (
-            <button type="button" onClick={() => setRecall(undefined)}>
+          {recall || recalls.current.searching ? (
+            <button
+              type="button"
+              onClick={() => {
+                recalls.current.clear();
+                render();
+              }}
+            >
               Clear
             </button>
           ) : null}
         </form>
-        {recallError ? <div className="item-error">{recallError}</div> : null}
+        {recalls.current.error ? (
+          <div className="item-error">Search failed. {recalls.current.error}</div>
+        ) : null}
         {recall ? (
           <Section title="Results" id="recall">
             {!recall.archive ? (
@@ -1224,7 +1358,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               ))}
             </ul>
             {recall.next !== null ? (
-              <button type="button" onClick={() => void search(recall.next ?? 0)}>
+              <button type="button" onClick={() => void recallRun(recalls.current.more())}>
                 More results
               </button>
             ) : null}
@@ -1232,6 +1366,59 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
         ) : null}
 
         <Section title="Notes" id="notes">
+          <form
+            className="field-row"
+            role="search"
+            aria-label="Search notes"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void noteSearchRun(noteSearches.current.start(noteQuery));
+            }}
+          >
+            <input
+              aria-label={`Search ${dot}'s notes`}
+              placeholder="Search notes"
+              value={noteQuery}
+              onChange={(event) => setNoteQuery(event.target.value)}
+            />
+            <button type="submit" disabled={!noteQuery.trim()}>
+              Search notes
+            </button>
+            {noteSearch || noteSearches.current.searching ? (
+              <button
+                type="button"
+                onClick={() => {
+                  noteSearches.current.clear();
+                  render();
+                }}
+              >
+                Clear
+              </button>
+            ) : null}
+          </form>
+          {noteSearches.current.error ? (
+            <div className="item-error">Search failed. {noteSearches.current.error}</div>
+          ) : null}
+          {noteSearch ? (
+            <div data-note-search aria-live="polite">
+              {!noteSearch.results.length ? (
+                <p className="note">No note has every word of “{noteSearch.query}”.</p>
+              ) : null}
+              <ul className="items">
+                {noteSearch.results.map((match) => (
+                  <li key={match.id} className="item" data-note-match={match.id}>
+                    <div className="note">
+                      Note #{match.id} · {memoryChange(match.updatedAt, match.updatedBy, dot)}
+                    </div>
+                    <div className="item-text">{match.snippet}</div>
+                  </li>
+                ))}
+              </ul>
+              {noteSearch.more ? (
+                <p className="note">More notes match; add words to narrow it.</p>
+              ) : null}
+            </div>
+          ) : null}
           <ul className="items">{memory.notes.map(noteRow)}</ul>
           <form
             className="field-row"
@@ -1239,9 +1426,11 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               event.preventDefault();
               const text = newNote.trim();
               if (!text) return;
-              void mutate("note:new", () => bridge.call("addNote", dot, text)).then((ok) => {
-                if (ok) setNewNote("");
-              });
+              void mutate("note:new", () => bridge.call("addNote", dot, text)).then(
+                ({ result }) => {
+                  if (result?.ok) setNewNote((current) => (current.trim() === text ? "" : current));
+                },
+              );
             }}
           >
             <input
@@ -1286,8 +1475,9 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               const text = newObservation.trim();
               if (!text) return;
               void mutate("observation:new", () => bridge.call("addObservation", dot, text)).then(
-                (ok) => {
-                  if (ok) setNewObservation("");
+                ({ result }) => {
+                  if (result?.ok)
+                    setNewObservation((current) => (current.trim() === text ? "" : current));
                 },
               );
             }}
@@ -1365,13 +1555,18 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
               <ul className="items">
                 {requests.rows.map((request) => (
                   <li key={request.id} className="item" data-request={request.id}>
-                    <div className="item-title">
-                      {request.title} · {request.kind} · {requestTitle(request)}
-                      {request.needsYou ? " · needs you" : ""}
-                    </div>
-                    {request.summary ? <div className="note">{request.summary}</div> : null}
+                    <div className="item-title">{requestLine(request)}</div>
+                    <div className="note">{request.title}</div>
+                    {requestAsked(request) ? (
+                      <div className="note" data-asked>
+                        {requestAsked(request)}
+                      </div>
+                    ) : null}
+                    {request.needsYou ? <div className="note">Needs you</div> : null}
                     {request.reason ? <div className="note">{request.reason}</div> : null}
-                    <div className="note">{when(request.createdAt)}</div>
+                    <div className="note" data-request-times>
+                      {requestTimes(request)}
+                    </div>
                     <details>
                       <summary>Details</summary>
                       <div className="mono">OpenCode request {request.requestID}</div>

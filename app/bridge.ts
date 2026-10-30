@@ -344,6 +344,13 @@ export interface Recall {
   next: number | null;
 }
 
+/** Notes that contain every word, newest first: each a note's version and a snippet of it. */
+export interface NoteSearch {
+  query: string;
+  results: { id: number; version: number; updatedAt: number; updatedBy: string; snippet: string }[];
+  more: boolean;
+}
+
 export interface Archived {
   message: string;
   sessionID: string;
@@ -425,6 +432,20 @@ export interface RequestAudit {
   summary?: string | null;
   createdAt: number;
   goneAt?: number | null;
+  directory?: string | null;
+  detail?: {
+    kind?: string;
+    action?: string;
+    resources?: string[];
+    title?: string;
+    fields?: { key: string; title?: string; description?: string }[];
+  } | null;
+  /** The dot session that chose the answer. */
+  actorSession?: string | null;
+  queuedAt?: number | null;
+  attemptedAt?: number | null;
+  confirmedAt?: number | null;
+  escalatedAt?: number | null;
 }
 
 export interface RequestPage {
@@ -535,6 +556,7 @@ export interface Operations {
   observationSource: [[dot: string, id: number, message: string], SourceText];
   noteSource: [[dot: string, id: number], NoteSourceRead];
   recall: [[dot: string, query: string, offset: number], Recall];
+  searchNotes: [[dot: string, query: string], NoteSearch];
   archived: [[dot: string, message: string, offset: number], Archived];
   archiveStatus: [[dot: string], ArchiveStatus];
   runs: [[dot: string, responsibility: number, before: number | null], RunPage];

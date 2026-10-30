@@ -1,7 +1,15 @@
 import { expect, test } from "bun:test";
 import type { FeedItem, Instructions } from "../bridge";
 import { linkAppID, tokenMatches } from "../slack";
-import { changedFields, FeedState, Fence, InstructionsState, unsentRecipients } from "../surfaces";
+import {
+  changedFields,
+  Drafts,
+  FeedState,
+  Fence,
+  InstructionsState,
+  Searches,
+  unsentRecipients,
+} from "../surfaces";
 
 const item = (id: number): FeedItem => ({
   id,
@@ -220,4 +228,108 @@ test("Slack token forms are whole, anchored and only for their own step", () => 
     expect(tokenMatches("bot", text, undefined)).toBe(false);
   expect(tokenMatches("refresh", `xoxe-1-${"d".repeat(1100)}`, undefined)).toBe(false);
   expect(linkAppID(appToken)).toBe("AJOJO01");
+});
+
+test("an edit keeps the version it began from, so a save after a newer poll conflicts instead", () => {
+  const drafts = new Drafts<string>();
+  drafts.start("note:1", 1, "Likes tea");
+  drafts.edit("note:1", "Likes green tea");
+  // A poll now lists version 2; going back to Edit keeps the draft and its version.
+  expect(drafts.start("note:1", 2, "Likes coffee")).toMatchObject({
+    version: 1,
+    original: "Likes tea",
+    edited: "Likes green tea",
+  });
+  expect(drafts.begin("note:1")).toEqual({
+    version: 1,
+    original: "Likes tea",
+    edited: "Likes green tea",
+  });
+  // A second click while it's out sends nothing, and typing is refused until it answers.
+  expect(drafts.begin("note:1")).toBeUndefined();
+  expect(drafts.edit("note:1", "Likes green tea a lot")).toBe(false);
+  expect(drafts.cancel("note:1")).toBe(false);
+  // The conflict shows the rejected text, so the draft ends.
+  expect(
+    drafts.finish("note:1", { ok: false, error: "Changed.", status: 409, current: {} }, true),
+  ).toBe("conflict");
+  expect(drafts.get("note:1")).toBeUndefined();
+});
+
+test("a refused, unreachable or unconfirmed save keeps the draft and its version to try again", () => {
+  const drafts = new Drafts<{ goal: string }>();
+  for (const failed of [
+    { ok: false as const, error: "Can't reach the daemon.", lost: true },
+    { ok: false as const, error: "Too long.", status: 400 },
+    // A 409 whose current value couldn't be shown keeps the draft too.
+    { ok: false as const, error: "Changed.", status: 409 },
+  ]) {
+    drafts.start("responsibility:2", 3, { goal: "Ship" });
+    drafts.edit("responsibility:2", { goal: "Ship v1" });
+    drafts.begin("responsibility:2");
+    expect(drafts.finish("responsibility:2", failed, false)).toBe("kept");
+    expect(drafts.get("responsibility:2")).toMatchObject({
+      version: 3,
+      original: { goal: "Ship" },
+      edited: { goal: "Ship v1" },
+    });
+    expect(drafts.get("responsibility:2")?.sending).toBeUndefined();
+  }
+  drafts.begin("responsibility:2");
+  expect(drafts.finish("responsibility:2", { ok: true, value: true }, false)).toBe("saved");
+  expect(drafts.get("responsibility:2")).toBeUndefined();
+});
+
+const append = (old: { results: number[]; next: number | null }, more: typeof old) => ({
+  ...more,
+  results: [...old.results, ...more.results],
+});
+
+const sure = <T>(value: T | undefined): T => {
+  if (value === undefined) throw new Error("Expected a value.");
+  return value;
+};
+
+test("a search begun before or during a change is dropped, and the change's end runs it again", () => {
+  const searches = new Searches<{ results: number[]; next: number | null }>();
+  const before = searches.start(" tea ");
+  expect(before?.query).toBe("tea");
+  searches.changed();
+  const during = searches.rerun();
+  searches.changed();
+  expect(searches.finish(sure(before), { ok: true, value: { results: [1], next: null } })).toBe(
+    false,
+  );
+  expect(searches.finish(sure(during), { ok: true, value: { results: [1], next: null } })).toBe(
+    false,
+  );
+  expect(searches.searching).toBe(true);
+  const after = searches.rerun();
+  expect(searches.finish(sure(after), { ok: true, value: { results: [2], next: 1 } })).toBe(true);
+  expect(searches.shown?.value.results).toEqual([2]);
+  // A page counts only while the results still end where it began.
+  const page = searches.more();
+  expect(page?.offset).toBe(1);
+  expect(
+    searches.finish(sure(page), { ok: true, value: { results: [3], next: null } }, append),
+  ).toBe(true);
+  expect(searches.shown?.value.results).toEqual([2, 3]);
+  // Clearing drops a search still out, and a blank search clears.
+  const cleared = searches.start("coffee");
+  searches.clear();
+  expect(searches.finish(sure(cleared), { ok: true, value: { results: [9], next: null } })).toBe(
+    false,
+  );
+  expect(searches.shown).toBeUndefined();
+  expect(searches.start("   ")).toBeUndefined();
+  expect(searches.rerun()).toBeUndefined();
+  const failing = searches.start("x");
+  expect(
+    searches.finish(sure(failing), {
+      ok: false,
+      error: "The search must be at most 200 characters.",
+    }),
+  ).toBe(true);
+  expect(searches.error).toBe("The search must be at most 200 characters.");
+  expect(searches.searching).toBe(false);
 });
