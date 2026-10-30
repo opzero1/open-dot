@@ -70,7 +70,10 @@ button:disabled {
 .app {
   display: grid;
   grid-template-columns: 220px 1fr;
+  /* One row the window's height, so the message list scrolls instead of growing the page. */
+  grid-template-rows: minmax(0, 100%);
   height: 100%;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -173,6 +176,7 @@ button:disabled {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   height: 100%;
 }
 
@@ -209,6 +213,7 @@ button:disabled {
 .messages {
   position: relative;
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   overflow-anchor: none;
   user-select: text;
