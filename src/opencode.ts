@@ -10,6 +10,7 @@ import {
 import { Service } from "@opencode/client/service";
 import { Context, Data, DateTime, Effect, Layer, Schema, Stream } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
+import { redact } from "./memory";
 import type { RequestAnswer, RequestDetail } from "./schema";
 
 export class OpenCodeError extends Data.TaggedError("OpenCodeError")<{
@@ -433,6 +434,257 @@ const entry = (item: SessionMessage.Info): Entry[] =>
         ]
       : [];
 
+// A dot's tool calls, as the app's work log and live activity show them. Every string here comes
+// from tool input or output, so it is redacted whole before it is cut short, and the app renders
+// it as text only.
+
+/** Where a tool call stands: OpenCode's streaming input is "preparing". */
+export type ToolStatus = "preparing" | "running" | "done" | "error" | "unknown";
+
+/** A file a call names, with the line counts OpenCode reported, or null when it reported none. */
+export interface ToolFile {
+  readonly path: string;
+  readonly additions: number | null;
+  readonly deletions: number | null;
+}
+
+export interface ToolCall {
+  readonly messageID: string;
+  readonly callID: string;
+  readonly name: string;
+  readonly status: ToolStatus;
+  readonly startedAt: number | null;
+  readonly endedAt: number | null;
+  /** A short label: the command, the file, the pattern, or empty. */
+  readonly label: string;
+  readonly files: readonly ToolFile[];
+}
+
+/** One call in full, for the work log's expanded row. */
+export interface ToolDetail extends ToolCall {
+  readonly input: string | null;
+  readonly output: string | null;
+  readonly error: string | null;
+  /** Each reported file diff; `patch` is null when none was reported or it was too large. */
+  readonly patches: readonly (ToolFile & { readonly patch: string | null })[];
+  readonly truncated: boolean;
+}
+
+/**
+ * A history item as the work log groups it: an idle ends a turn; a message is shown in the chat
+ * when the app would show it, and carries an assistant's tool calls.
+ */
+export type WorkItem =
+  | { readonly type: "idle"; readonly id: string }
+  | { readonly type: "other"; readonly id: string }
+  | {
+      readonly type: "message";
+      readonly id: string;
+      readonly role: "user" | "assistant";
+      readonly shown: boolean;
+      readonly calls: readonly ToolCall[];
+    };
+
+/** What a busy session is doing now: its running calls, newest first, or none while it thinks. */
+export interface Activity {
+  readonly active: boolean;
+  readonly running: readonly ToolCall[];
+  /** When the newest running call, or the current step, started; null when OpenCode didn't say. */
+  readonly since: number | null;
+}
+
+export const labelLimit = 160;
+export const detailLimit = 64 * 1024;
+// A field larger than this is left out whole rather than redacted and cut: a cut could split a
+// secret so that redaction misses it.
+const sourceLimit = 1024 * 1024;
+
+const cut = (text: string, limit: number) =>
+  text.length > limit ? { text: `${text.slice(0, limit)}…`, cut: true } : { text, cut: false };
+
+/** A short, redacted, single-line label. */
+const short = (value: unknown) => {
+  if (typeof value !== "string" || value.length > sourceLimit) return "";
+  const line = redact(value).trim().split("\n")[0] ?? "";
+  return cut(line, labelLimit).text;
+};
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const secretKey =
+  /pass(word|phrase)?|secret|token|api[_-]?key|auth|credential|cookie|private[_-]?key/i;
+
+/** Structured input with each string redacted in its key's context, before any of it is cut. */
+export const redactInput = (value: unknown, key = ""): unknown => {
+  if (typeof value === "string")
+    return value.length > sourceLimit
+      ? "[omitted: too large]"
+      : secretKey.test(key)
+        ? "[redacted]"
+        : redact(value);
+  if (Array.isArray(value)) return value.map((item) => redactInput(item, key));
+  if (isObject(value))
+    return Object.fromEntries(
+      Object.entries(value).map(([name, item]) => [name, redactInput(item, name)]),
+    );
+  return value;
+};
+
+const millis = (time: DateTime.Utc | undefined) =>
+  time === undefined ? null : DateTime.toEpochMillis(time);
+
+type ToolPart = Extract<
+  Extract<SessionMessage.Info, { type: "assistant" }>["content"][number],
+  { type: "tool" }
+>;
+
+/** The file diffs OpenCode reported for an edit, checked field by field; anything else is none. */
+const reportedFiles = (metadata: unknown) => {
+  const files = isObject(metadata) ? metadata.files : undefined;
+  if (!Array.isArray(files)) return [];
+  return files.flatMap((file) =>
+    isObject(file) &&
+    typeof file.file === "string" &&
+    file.file.length <= 4096 &&
+    typeof file.additions === "number" &&
+    typeof file.deletions === "number"
+      ? [
+          {
+            path: redact(file.file),
+            additions: file.additions,
+            deletions: file.deletions,
+            patch: typeof file.patch === "string" ? file.patch : null,
+          },
+        ]
+      : [],
+  );
+};
+
+const patchPaths = (patch: unknown) =>
+  typeof patch === "string" && patch.length <= sourceLimit
+    ? [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].flatMap((match) =>
+        match[1] ? [redact(match[1].trim())] : [],
+      )
+    : [];
+
+/** The tools that change files, whose paths the work log counts as edits. */
+export const editTools: ReadonlySet<string> = new Set([
+  "edit",
+  "write",
+  "apply_patch",
+  "multiedit",
+]);
+export const commandTools: ReadonlySet<string> = new Set(["bash", "shell"]);
+
+export const toolCall = (messageID: string, part: ToolPart): ToolCall => {
+  const state = part.state;
+  const input = state.status === "streaming" ? undefined : state.input;
+  const metadata = "metadata" in state ? state.metadata : undefined;
+  const reported = reportedFiles(metadata);
+  const label =
+    input === undefined
+      ? ""
+      : short(
+          input.command ??
+            input.path ??
+            input.filePath ??
+            input.pattern ??
+            input.url ??
+            input.query ??
+            input.description,
+        );
+  const named =
+    input && typeof input.path === "string"
+      ? [{ path: short(input.path), additions: null, deletions: null }]
+      : input
+        ? patchPaths(input.patchText).map((path) => ({ path, additions: null, deletions: null }))
+        : [];
+  const files: ToolFile[] = reported.length
+    ? reported.map(({ path, additions, deletions }) => ({ path, additions, deletions }))
+    : named;
+  return {
+    messageID,
+    callID: part.id,
+    name: part.name,
+    status:
+      state.status === "streaming"
+        ? "preparing"
+        : state.status === "running"
+          ? "running"
+          : state.status === "completed"
+            ? "done"
+            : state.status === "error"
+              ? "error"
+              : "unknown",
+    startedAt: millis(part.time.ran ?? part.time.created),
+    endedAt: millis(part.time.completed),
+    label: label || (files.length > 1 ? `${files.length} files` : ""),
+    files: files.slice(0, 50),
+  };
+};
+
+export const toolDetail = (messageID: string, part: ToolPart): ToolDetail => {
+  const call = toolCall(messageID, part);
+  const state = part.state;
+  let truncated = false;
+  const bounded = (text: string | undefined, limit = detailLimit) => {
+    if (text === undefined) return null;
+    if (text.length > sourceLimit) {
+      truncated = true;
+      return "[omitted: too large]";
+    }
+    const done = cut(redact(text), limit);
+    truncated ||= done.cut;
+    return done.text;
+  };
+  const input =
+    state.status === "streaming"
+      ? null
+      : typeof state.input.command === "string" && Object.keys(state.input).length <= 3
+        ? bounded(state.input.command)
+        : bounded(JSON.stringify(redactInput(state.input), null, 2));
+  const content =
+    state.status === "completed" || state.status === "error" ? state.content : undefined;
+  const text = content?.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n");
+  let budget = 96 * 1024;
+  const patches = reportedFiles("metadata" in state ? state.metadata : undefined).map((file) => {
+    const patch =
+      file.patch === null || file.patch.length > sourceLimit ? null : redact(file.patch);
+    // A cut diff would be wrong, so one that doesn't fit is left out whole.
+    const fits = patch !== null && patch.length <= budget;
+    if (fits) budget -= patch.length;
+    else if (patch !== null) truncated = true;
+    return { ...file, patch: fits ? patch : null };
+  });
+  return {
+    ...call,
+    input,
+    output: bounded(text),
+    error: state.status === "error" ? bounded(state.error.message, 8 * 1024) : null,
+    patches,
+    truncated,
+  };
+};
+
+const workItem = (item: SessionMessage.Info): WorkItem => {
+  if (item.type === "idle") return { type: "idle", id: item.id };
+  if (item.type === "user")
+    return { type: "message", id: item.id, role: "user", shown: true, calls: [] };
+  if (item.type !== "assistant") return { type: "other", id: item.id };
+  const text = item.content.some((part) => part.type === "text" && part.text.trim());
+  const calls = item.content.flatMap((part) =>
+    part.type === "tool" ? [toolCall(item.id, part)] : [],
+  );
+  return {
+    type: "message",
+    id: item.id,
+    role: "assistant",
+    shown: text || calls.some((call) => call.name.startsWith("dot_")),
+    calls,
+  };
+};
+
 /**
  * A session's token use, as OpenCode 2.1.1 records each assistant message's: uncached `input`,
  * visible `output`, `reasoning`, and `cacheRead` and `cacheWrite`, which don't overlap, so their
@@ -598,11 +850,25 @@ export class OpenCode extends Context.Service<
       limit: number,
     ) => Effect.Effect<readonly Entry[], OpenCodeError>;
     readonly message: (ref: MessageRef) => Effect.Effect<Entry | undefined, OpenCodeError>;
+    /**
+     * One page of the conversation, newest first from the end or after an earlier page's `next`:
+     * its user and assistant entries and, for the work log, every item as a WorkItem, oldest first.
+     */
     readonly messagePage: (
       sessionID: string,
       limit: number,
       cursor?: string,
-    ) => Effect.Effect<{ entries: readonly Entry[]; next: string | undefined }, OpenCodeError>;
+    ) => Effect.Effect<
+      { entries: readonly Entry[]; work?: readonly WorkItem[]; next: string | undefined },
+      OpenCodeError
+    >;
+    /** One tool call of one message in full, redacted and bounded, or undefined when absent. */
+    readonly toolDetail: (
+      ref: MessageRef,
+      callID: string,
+    ) => Effect.Effect<ToolDetail | undefined, OpenCodeError>;
+    /** What the session is doing now, from OpenCode's running sessions and its newest items. */
+    readonly activity: (sessionID: string) => Effect.Effect<Activity, OpenCodeError>;
     /**
      * One page of the session's history in processing order, oldest first: from the start, or
      * after the item an earlier page's `next` cursor names. `next` is absent for an empty page.
@@ -985,6 +1251,7 @@ export class OpenCode extends Context.Service<
             .pipe(
               Effect.map((page) => ({
                 entries: page.data.flatMap(entry).toReversed(),
+                work: page.data.map(workItem).toReversed(),
                 next: page.data.length === limit ? page.cursor?.next : undefined,
               })),
               Effect.mapError(failed(`Could not read session ${sessionID}`)),
@@ -1000,6 +1267,45 @@ export class OpenCode extends Context.Service<
               Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
               Effect.mapError(failed(`Could not read message ${messageID}`)),
             ),
+        toolDetail: ({ sessionID, messageID }, callID) =>
+          client.session.message
+            .get({
+              sessionID: Session.ID.make(sessionID),
+              messageID: SessionMessage.ID.make(messageID),
+            })
+            .pipe(
+              Effect.map((item) => {
+                if (item.type !== "assistant") return undefined;
+                const part = item.content.find(
+                  (candidate): candidate is ToolPart =>
+                    candidate.type === "tool" && candidate.id === callID,
+                );
+                return part && toolDetail(item.id, part);
+              }),
+              Effect.catchTag("MessageNotFoundError", () => Effect.succeed(undefined)),
+              Effect.mapError(failed(`Could not read message ${messageID}`)),
+            ),
+        activity: (sessionID) =>
+          Effect.gen(function* () {
+            const active = yield* client.session.active();
+            if (!(sessionID in active)) return { active: false, running: [], since: null };
+            const page = yield* client.message.list({
+              sessionID: Session.ID.make(sessionID),
+              order: "desc",
+              limit: 5,
+            });
+            // The newest assistant message, unless an input arrived after it.
+            const newest = page.data[0];
+            const reply = newest?.type === "assistant" ? newest : undefined;
+            const running = (reply?.content ?? [])
+              .flatMap((part) => (part.type === "tool" ? [toolCall(reply?.id ?? "", part)] : []))
+              .filter((call) => call.status === "running" || call.status === "preparing")
+              .toReversed();
+            const since =
+              running[0]?.startedAt ??
+              (newest ? DateTime.toEpochMillis(newest.time.created) : null);
+            return { active: true, running, since };
+          }).pipe(Effect.mapError(failed(`Could not read what ${sessionID} is doing`))),
         historyPage: (sessionID, limit, cursor) =>
           client.message
             .list(

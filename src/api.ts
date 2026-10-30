@@ -66,7 +66,16 @@ import {
   listArtifacts,
   readArtifact,
 } from "./library";
-import { type Attachment, OpenCode, type Entry, OpenCodeError } from "./opencode";
+import {
+  type Attachment,
+  commandTools,
+  editTools,
+  OpenCode,
+  type Entry,
+  OpenCodeError,
+  type ToolCall,
+  type WorkItem,
+} from "./opencode";
 import {
   currentReactions,
   isReactionEmoji,
@@ -855,9 +864,120 @@ const decodeCursor = (token: string, value: string): string[] | undefined => {
   }
 };
 
+// The work log: each turn's tool calls, from the public history the conversation read already
+// traversed. A turn runs from one idle to the next, whatever inputs share it, and its log goes
+// beneath its last reply. Nothing is saved: OpenCode keeps the history.
+
+export interface WorkCounts {
+  commands: number;
+  /** Calls of the tools that change files, whatever their outcome. */
+  edits: number;
+  /** Distinct paths that edit tools changed successfully. */
+  edited: number;
+  failed: number;
+  total: number;
+}
+
+export interface WorkLog {
+  /** The message the log goes beneath, or null for a running turn with no reply yet. */
+  anchor: string | null;
+  /** The newest calls, oldest first, at most `workCallLimit`. */
+  calls: ToolCall[];
+  omitted: number;
+  counts: WorkCounts;
+  /** False when the turn's start is out of sight, so the counts are a lower bound. */
+  complete: boolean;
+  /** True while no idle has ended the turn. */
+  open: boolean;
+  /** An upstream cursor that continues to the turn's older calls; signed before it leaves. */
+  more: string | null;
+}
+
+export const workCallLimit = 100;
+const workPageLimit = 20;
+
+const callKey = (call: ToolCall) => `${call.messageID}\0${call.callID}`;
+
+/** Counts of every call, not only the listed ones. */
+export const workCounts = (calls: readonly ToolCall[]): WorkCounts => {
+  const edited = new Set<string>();
+  for (const call of calls)
+    if (call.status === "done" && editTools.has(call.name))
+      for (const file of call.files) edited.add(file.path);
+  return {
+    commands: calls.filter((call) => commandTools.has(call.name)).length,
+    edits: calls.filter((call) => editTools.has(call.name)).length,
+    edited: edited.size,
+    failed: calls.filter((call) => call.status === "error").length,
+    total: calls.length,
+  };
+};
+
+const uniqueCalls = (items: readonly WorkItem[]) => {
+  const seen = new Set<string>();
+  return items
+    .flatMap((item) => (item.type === "message" ? item.calls : []))
+    .filter((call) => !seen.has(callKey(call)) && seen.add(callKey(call)));
+};
+
+/**
+ * The logs of the turns whose end the items show, in order: a turn ends at an idle, or, on the
+ * latest page, is still open. A turn whose end lies on a newer page is that page's to show.
+ * `startKnown` says whether the first item begins a turn.
+ */
+export const groupWork = (
+  items: readonly WorkItem[],
+  { startKnown, latest }: { startKnown: boolean; latest: boolean },
+): WorkLog[] => {
+  const turns: { items: WorkItem[]; start: boolean; end: boolean }[] = [];
+  let current: WorkItem[] = [];
+  let start = startKnown;
+  for (const item of items) {
+    if (item.type !== "idle") {
+      current.push(item);
+      continue;
+    }
+    turns.push({ items: current, start, end: true });
+    current = [];
+    start = true;
+  }
+  if (current.length) turns.push({ items: current, start, end: false });
+  return turns.flatMap((turn) => {
+    if (!turn.end && !latest) return [];
+    const calls = uniqueCalls(turn.items);
+    if (!calls.length) return [];
+    const shown = turn.items.filter(
+      (item): item is Extract<WorkItem, { type: "message" }> =>
+        item.type === "message" && item.shown,
+    );
+    const anchor =
+      shown.findLast((item) => item.role === "assistant")?.id ?? shown.at(-1)?.id ?? null;
+    if (!anchor && turn.end) return [];
+    const listed = calls.slice(-workCallLimit);
+    return [
+      {
+        anchor,
+        calls: listed,
+        omitted: calls.length - listed.length,
+        counts: workCounts(calls),
+        complete: turn.start,
+        open: !turn.end,
+        more: null,
+      },
+    ];
+  });
+};
+
+/** Items after the page's last idle, and whether it had one: the tail of a turn read backwards. */
+const afterIdle = (work: readonly WorkItem[]) => {
+  const at = work.findLastIndex((item) => item.type === "idle");
+  return { items: work.slice(at + 1), found: at >= 0 };
+};
+
 interface ConversationPage {
   entries: Entry[];
   next: string | undefined;
+  work: WorkLog[];
 }
 
 const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
@@ -866,11 +986,13 @@ const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
     let next = cursor;
     let visible = 0;
     const entries: Entry[] = [];
+    let work: WorkItem[] = [];
     const visited = new Set<string>();
     for (let reads = 0; reads < 10; reads++) {
       if (next) visited.add(next);
       const page = yield* oc.messagePage(dot.sessionID, limit - visible, next);
       if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+      work = [...(page.work ?? []), ...work];
       // Attachments are loaded separately; never retain their base64 bytes in the latest cache.
       entries.unshift(
         ...page.entries.map((entry) => ({
@@ -883,7 +1005,25 @@ const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
       if (next && visited.has(next)) return error(502, "History cursor did not advance.");
       if (!next || visible >= limit) break;
     }
-    return { entries, next };
+    // A turn cut by the page's start: read back at most two more pages to find where it began.
+    let startKnown = !next;
+    let more: string | undefined = next;
+    const firstIdle = work.findIndex((item) => item.type === "idle");
+    if (more && uniqueCalls(firstIdle < 0 ? work : work.slice(0, firstIdle)).length)
+      for (let reads = 0; reads < 2 && more && !startKnown; reads++) {
+        const earlier: { work?: readonly WorkItem[]; next: string | undefined } =
+          yield* oc.messagePage(dot.sessionID, workPageLimit, more);
+        if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+        const tail = afterIdle(earlier.work ?? []);
+        work = [...tail.items, ...work];
+        startKnown = tail.found || !earlier.next;
+        more = earlier.next;
+      }
+    const logs = groupWork(work, { startKnown, latest: cursor === undefined });
+    const first = logs[0];
+    // Only the first turn can start out of sight.
+    if (first && !first.complete) first.more = more ?? null;
+    return { entries, next, work: logs };
   });
 
 type LatestConversation = (
@@ -912,7 +1052,7 @@ const conversation = (
       return error(400, "Use limit 1–50 and an optional before cursor.");
     const before = query.get("before");
     const cursor = before === null ? undefined : decodeCursor(token, before);
-    if (before !== null && (!cursor || cursor[0] !== dot.name))
+    if (before !== null && (!cursor || cursor[0] !== dot.name || cursor[2]?.startsWith(workScope)))
       return error(400, "Invalid conversation cursor. Refresh.");
     if (dot.sessionState !== "ready" || (cursor && cursor[1] !== dot.sessionID))
       return error(409, "The dot's conversation changed. Refresh.");
@@ -925,6 +1065,11 @@ const conversation = (
     const { entries, next } = page;
     return Response.json({
       messages: visibleMessages(db, dot, entries),
+      // Each turn's tool calls, beneath the message named by `anchor`.
+      work: page.work.map((log) => ({
+        ...log,
+        more: log.more ? encodeCursor(token, dot, `${workScope}${log.more}`) : null,
+      })),
       sessionID: dot.sessionID,
       next: next ? encodeCursor(token, dot, next) : null,
       pending: pendingSends(db, dot, entries),
@@ -934,6 +1079,106 @@ const conversation = (
       recentEmojis: recentEmojis(db),
       ...("refreshError" in page ? { refreshError: page.refreshError } : {}),
     });
+  });
+
+/** A work cursor's upstream value starts with this, so no conversation read accepts one. */
+const workScope = "work:";
+
+/** The one `sessionID` parameter a read takes, or undefined when the query has anything else. */
+const onlySession = (request: Request, extra: readonly string[] = []) => {
+  const query = new URL(request.url).searchParams;
+  const sessionID = query.get("sessionID");
+  return sessionID &&
+    sessionID.length <= 255 &&
+    [...query.keys()].every(
+      (key) => (key === "sessionID" || extra.includes(key)) && query.getAll(key).length === 1,
+    )
+    ? sessionID
+    : undefined;
+};
+
+/**
+ * Earlier calls of a turn whose start the conversation's log didn't reach, read back at most two
+ * pages from a signed work cursor and stopping at the idle before the turn.
+ */
+const workContinuation = (db: Db, dot: Dot, request: Request, token: string) =>
+  Effect.gen(function* () {
+    const sessionID = onlySession(request, ["cursor"]);
+    const raw = new URL(request.url).searchParams.get("cursor");
+    if (!sessionID || !raw) return error(400, "Use the log's sessionID and cursor.");
+    const cursor = decodeCursor(token, raw);
+    if (!cursor || cursor[0] !== dot.name || !cursor[2]?.startsWith(workScope))
+      return error(400, "Invalid work cursor. Refresh.");
+    if (dot.sessionState !== "ready" || sessionID !== dot.sessionID || cursor[1] !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh.");
+    const oc = yield* OpenCode;
+    let more: string | undefined = cursor[2].slice(workScope.length);
+    let items: WorkItem[] = [];
+    let complete = false;
+    for (let reads = 0; reads < 2 && more && !complete; reads++) {
+      const page: { work?: readonly WorkItem[]; next: string | undefined } = yield* oc.messagePage(
+        dot.sessionID,
+        workPageLimit,
+        more,
+      );
+      if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+      const tail = afterIdle(page.work ?? []);
+      items = [...tail.items, ...items];
+      complete = tail.found || !page.next;
+      more = page.next;
+    }
+    const calls = uniqueCalls(items);
+    const listed = calls.slice(-50);
+    return Response.json({
+      calls: listed,
+      omitted: calls.length - listed.length,
+      counts: workCounts(calls),
+      complete,
+      more: !complete && more ? encodeCursor(token, dot, `${workScope}${more}`) : null,
+    });
+  });
+
+/** One tool call in full: redacted and bounded in the daemon, shown as text by the app. */
+const toolRead = (db: Db, dot: Dot, id: string, callID: string, request: Request) =>
+  Effect.gen(function* () {
+    const sessionID = onlySession(request);
+    if (!sessionID) return error(400, "Use the message's sessionID.");
+    if (id.length > 255 || callID.length > 255) return error(404, "There's no such tool call.");
+    if (dot.sessionState !== "ready" || sessionID !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh.");
+    const detail = yield* (yield* OpenCode).toolDetail({ sessionID, messageID: id }, callID);
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    return detail
+      ? Response.json(detail, { headers: { "cache-control": "no-store" } })
+      : error(404, "There's no such tool call.");
+  });
+
+/**
+ * What the dot is doing now: "tool" with the newest running call's label and how many run, else
+ * "thinking" while its session runs, else "idle". `since` is OpenCode's own start time when it
+ * gave one; `observedAt` is when the daemon read it.
+ */
+const activityRead = (db: Db, dot: Dot, request: Request) =>
+  Effect.gen(function* () {
+    const sessionID = onlySession(request);
+    if (!sessionID) return error(400, "Use the dot's sessionID.");
+    if (dot.sessionState !== "ready" || sessionID !== dot.sessionID)
+      return error(409, "The dot's conversation changed. Refresh.");
+    const now = yield* (yield* OpenCode).activity(sessionID);
+    if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
+    const newest = now.running[0];
+    return Response.json(
+      {
+        sessionID,
+        state: !now.active ? "idle" : newest ? "tool" : "thinking",
+        tool: newest?.name ?? null,
+        label: newest?.label ?? null,
+        running: now.running.length,
+        since: now.active ? now.since : null,
+        observedAt: Date.now(),
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
   });
 
 const conversationMessage = (db: Db, dot: Dot, id: string, request: Request) =>
@@ -2192,6 +2437,17 @@ const route = (
       : Effect.succeed(error(404, "Not found"));
   if (rest === "messages" && id !== undefined && extra.length === 1 && request.method === "GET")
     return connect(conversationMessage(db, dot, id, request));
+  if (rest === "activity" && extra.length === 0 && request.method === "GET")
+    return connect(activityRead(db, dot, request));
+  if (
+    rest === "messages" &&
+    part === "tools" &&
+    id !== undefined &&
+    index !== undefined &&
+    more.length === 0 &&
+    request.method === "GET"
+  )
+    return connect(toolRead(db, dot, id, index, request));
   if (rest === "pending" && id !== undefined && extra.length === 1 && request.method === "GET")
     return connect(receipt(db, dot, id, request));
   if (
@@ -2666,6 +2922,22 @@ export const api = (
         return error(500, "Couldn't read or save the dot's memory.");
       });
     if (path[0] !== "dots") return Promise.resolve(error(404, "Not found"));
+    if (path.length === 3 && path[2] === "work" && request.method === "GET") {
+      let name: string;
+      try {
+        name = decodeURIComponent(path[1] ?? "");
+      } catch {
+        return Promise.resolve(error(400, "Bad dot name."));
+      }
+      const dot = findDot(db, name);
+      if (!dot) return Promise.resolve(error(404, `There's no dot named "${path[1]}".`));
+      return Effect.runPromise(
+        workContinuation(db, dot, request, token).pipe(
+          Effect.provide(sharedLayer),
+          Effect.catch((failure) => Effect.succeed(error(503, failure.message))),
+        ),
+      );
+    }
     if (path.length === 3 && path[2] === "messages" && request.method === "GET") {
       let name: string;
       try {

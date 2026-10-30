@@ -1,6 +1,7 @@
 import type { Model } from "@opencode/client/effect";
 import { Cause, Effect, Layer, Queue, Stream } from "effect";
 import {
+  type Activity,
   type Attachment,
   type Delivery,
   type Entry,
@@ -10,6 +11,9 @@ import {
   type PromptTurn,
   type SessionInput,
   type TextEvent,
+  type ToolCall,
+  type ToolDetail,
+  type WorkItem,
   type Written,
   type Turn,
   type ThreadsWorker,
@@ -93,6 +97,14 @@ export function fakeOpenCode() {
     threadsCalls: [] as { directory: string; coordinatorID: string }[],
     superviseFailure: false,
     history: new Map<string, Entry[]>(),
+    // The work log: each assistant entry's tool calls, the entries an idle follows, each call's
+    // detail by "message/call", and each session's activity.
+    calls: new Map<string, ToolCall[]>(),
+    idles: new Set<string>(),
+    details: new Map<string, ToolDetail>(),
+    activity: new Map<string, Activity>(),
+    activityReads: 0,
+    pageReads: [] as (string | undefined)[],
     // Each session's full history as the archive pages it, in processing order.
     items: new Map<string, HistoryItem[]>(),
     // Every archive page read, by its cursor. With `repeatCursor` a page hands back its own cursor.
@@ -246,7 +258,36 @@ export function fakeOpenCode() {
         const start = Math.max(0, end - limit);
         const entries = history.slice(start, end);
         state.onRecent();
-        return { entries, next: start > 0 ? String(start) : undefined };
+        state.pageReads.push(cursor);
+        // Each entry as a work item, with the calls a test gave it, then an idle if its turn ended.
+        const work = entries.flatMap((entry): WorkItem[] => [
+          {
+            type: "message",
+            id: entry.id,
+            role: entry.role,
+            shown:
+              entry.role === "user" ||
+              entry.text !== "" ||
+              entry.tools.some((tool) => tool.startsWith("dot_")),
+            calls: state.calls.get(entry.id) ?? [],
+          },
+          ...(state.idles.has(entry.id) ? [{ type: "idle" as const, id: `idle_${entry.id}` }] : []),
+        ]);
+        return { entries, work, next: start > 0 ? String(start) : undefined };
+      }),
+    toolDetail: ({ messageID }, callID) =>
+      Effect.suspend(() =>
+        state.readFailure
+          ? broken("history unavailable")
+          : Effect.succeed(state.details.get(`${messageID}/${callID}`)),
+      ),
+    activity: (sessionID) =>
+      Effect.suspend(() => {
+        if (state.readFailure) return broken("history unavailable");
+        state.activityReads++;
+        return Effect.succeed(
+          state.activity.get(sessionID) ?? { active: false, running: [], since: null },
+        );
       }),
     message: ({ sessionID, messageID }) =>
       Effect.suspend(() =>
