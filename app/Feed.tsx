@@ -355,7 +355,9 @@ const ReplyEditor = ({
   box: ReplyBox;
   dots: DotView[];
   canPick: (dot: string) => boolean;
-  onChange: (change: (box: ReplyBox) => Partial<ReplyBox>) => void;
+  onChange: (
+    change: (box: ReplyBox) => Partial<Pick<ReplyBox, "dots" | "text" | "images">>,
+  ) => void;
   onAttach: (files: File[]) => void;
   onSend: () => void;
   onCancel: () => void;

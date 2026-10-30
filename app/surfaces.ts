@@ -123,6 +123,10 @@ export interface FeedReply<Image> {
   sending: boolean;
   /** What each dot's send from this reply came to, kept across sends. */
   results: Map<string, ReplyResult>;
+  /** Counts the owner's changes to the text and images. */
+  revision: number;
+  /** The revision the last Send captured; a later change keeps the reply when that send ends. */
+  sent?: number;
 }
 
 /** Statuses a send's receipt has once the daemon holds it. */
@@ -148,16 +152,26 @@ export class FeedReplies<Image> {
       images: [],
       sending: false,
       results: new Map(),
+      revision: 0,
     };
     this.boxes.set(item.id, box);
     return box;
   }
 
-  /** The owner's change to a reply, refused while it sends. */
-  change(id: number, change: (box: FeedReply<Image>) => Partial<FeedReply<Image>>) {
+  /** The owner's change to a reply's dots, text or images, refused while it sends. */
+  change(
+    id: number,
+    change: (box: FeedReply<Image>) => Partial<Pick<FeedReply<Image>, "dots" | "text" | "images">>,
+  ) {
     const box = this.boxes.get(id);
     if (!box || box.sending) return false;
-    Object.assign(box, change(box));
+    const next = change(box);
+    if (
+      (next.text !== undefined && next.text !== box.text) ||
+      (next.images !== undefined && next.images !== box.images)
+    )
+      box.revision++;
+    Object.assign(box, next);
     box.dots = box.dots.filter((dot) => this.canPick(id, dot));
     return true;
   }
@@ -176,6 +190,7 @@ export class FeedReplies<Image> {
     const dots = box.dots.filter((dot) => this.canPick(id, dot));
     if (!text || !dots.length) return undefined;
     box.sending = true;
+    box.sent = box.revision;
     return { item: id, text, images: [...box.images], dots };
   }
 
@@ -224,9 +239,12 @@ export class FeedReplies<Image> {
     );
   }
 
+  // Ends a reply only when every dot saved it and it's still the text and images last sent: one
+  // the owner changed after that Send keeps its newer, unsent content.
   private finished(id: number) {
     const box = this.boxes.get(id);
     if (!box || box.sending || box.dots.length || !box.results.size) return false;
+    if (box.sent !== box.revision) return false;
     if (![...box.results.values()].every((result) => result.outcome === "saved")) return false;
     this.boxes.delete(id);
     return true;

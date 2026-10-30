@@ -149,6 +149,26 @@ test("a feed reply never sends again to a dot whose send saved or is unknown, an
   expect(replies.boxes.has(1)).toBe(false);
 });
 
+test("a late saved receipt keeps text and images changed after the send it settles", () => {
+  const replies = new FeedReplies<string>();
+  const box = replies.open(item(2), "jolyne");
+  replies.change(2, () => ({ text: "Look", images: ["a.png"] }));
+  const sent = replies.begin(2);
+  const attempt = { dot: "jolyne", sessionID: "ses_j", messageID: "msg_j", createdAt: 1 };
+  replies.record(2, "jolyne", { outcome: "unknown", attempt });
+  expect(replies.end(2, sent?.dots ?? [])).toBe("kept");
+  // Between the unknown answer and its receipt, the owner edits the text and adds an image.
+  replies.change(2, (current) => ({ text: "Look again", images: [...current.images, "b.png"] }));
+  expect(replies.settle(2, "jolyne", "sent")).toBe(true);
+  expect(replies.boxes.get(2)).toBe(box);
+  expect(box).toMatchObject({ text: "Look again", images: ["a.png", "b.png"], dots: [] });
+  expect(replies.canPick(2, "jolyne")).toBe(false);
+  // Picking a dot alone isn't a change to the content, and a dismissed reply goes.
+  replies.change(2, () => ({ dots: ["giorno"] }));
+  expect(box.revision).toBe(2);
+  expect(replies.cancel(2)).toBe(true);
+});
+
 const file = (content: string, revision: string, canRevert = false): Instructions => ({
   content,
   revision,
