@@ -468,10 +468,10 @@ export const ledger = sqliteTable("ledger", {
 export type Observation = typeof ledger.$inferSelect;
 
 /**
- * Observed rows the owner forgot: the IDs of the archived messages each came from and hashes of
- * its topic's and text's words, never its text, so the observer can't add the same fact back from
- * those messages or in much the same words. The owner's own edit or added row in such words clears
- * one.
+ * Observed rows the owner forgot: the IDs of the archived messages each came from, hashes of its
+ * text's words and a hash of its whole text, never its text, so the observer can't add the same
+ * fact back from those messages, in much the same words or under another topic. The owner's own
+ * edit or added row with that same text clears one.
  */
 export const forgottenObservations = sqliteTable("forgotten_observations", {
   id: integer().primaryKey({ autoIncrement: true }),
@@ -480,6 +480,7 @@ export const forgottenObservations = sqliteTable("forgotten_observations", {
     .references(() => dots.name),
   sources: text({ mode: "json" }).$type<readonly string[]>().notNull(),
   words: text({ mode: "json" }).$type<readonly string[]>().notNull(),
+  fingerprint: text().notNull(),
   forgottenAt: integer("forgotten_at").notNull(),
 });
 

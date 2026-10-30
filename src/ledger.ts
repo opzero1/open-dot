@@ -369,6 +369,9 @@ export function zoomObservation(db: Db, dot: string, id: number) {
   };
 }
 
+const hashed = (dot: string, value: string) =>
+  createHash("sha256").update(`${dot}\0${value}`).digest("hex").slice(0, 16);
+
 /**
  * A fact's words as a forget tombstone keeps them: letters and digits, three or more characters,
  * without a plural or third-person "s", not common words or "owner", each once and hashed with the
@@ -382,18 +385,26 @@ const factWords = (dot: string, text: string) => {
         .map((word) => (/[^s]s$/.test(word) && word.length > 3 ? word.slice(0, -1) : word)),
     ),
   ].filter((word) => Array.from(word).length >= 3 && !stopwords.has(word) && word !== "owner");
-  return (words.length ? words : [loose(text).trim()])
-    .map((word) => createHash("sha256").update(`${dot}\0${word}`).digest("hex").slice(0, 16))
-    .toSorted();
+  return (words.length ? words : [loose(text).trim()]).map((word) => hashed(dot, word)).toSorted();
 };
 
+/** A fact's exact text, ignoring case, diacritics, spacing and punctuation, hashed with the dot's name. */
+const fingerprint = (dot: string, text: string) =>
+  hashed(
+    dot,
+    loose(text)
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(Boolean)
+      .join(" "),
+  );
+
 /**
- * Whether a fact says much the same as a forgotten one: it has at least half the forgotten words,
- * and at least two of them (or all, when only one was kept), whatever it adds or rewords.
+ * Whether a fact says much the same as a forgotten one: it has more than half the forgotten text's
+ * words, and at least two of them (or all, when only one was kept), whatever it adds or rewords.
  */
 const sameFact = (forgotten: readonly string[], words: readonly string[]) => {
   const shared = forgotten.filter((word) => words.includes(word)).length;
-  return shared >= Math.min(forgotten.length, Math.max(2, Math.ceil(forgotten.length / 2)));
+  return shared >= Math.min(forgotten.length, Math.max(2, Math.floor(forgotten.length / 2) + 1));
 };
 
 type Tombstone = typeof forgottenObservations.$inferSelect;
@@ -404,7 +415,8 @@ const citesForgotten = (tombstones: readonly Tombstone[], sources: readonly stri
 
 /**
  * Whether a row the observer would write brings a forgotten fact back: it cites a message a
- * forgotten row came from, or says much the same in its topic and text.
+ * forgotten row came from, has the forgotten text, or has much the same words in its topic and
+ * text. Only the forgotten text's words count, so its topic, however long, can't change the match.
  */
 const bringsBack = (
   tombstones: readonly Tombstone[],
@@ -412,28 +424,30 @@ const bringsBack = (
   row: { readonly topic: string; readonly text: string; readonly sources: readonly string[] },
 ) => {
   const words = factWords(dot, `${row.topic} ${row.text}`);
+  const exact = fingerprint(dot, row.text);
   return (
     citesForgotten(tombstones, row.sources) ||
-    tombstones.some((tombstone) => sameFact(tombstone.words, words))
+    tombstones.some(
+      (tombstone) => tombstone.fingerprint === exact || sameFact(tombstone.words, words),
+    )
   );
 };
 
 /**
- * The owner stating a forgotten fact again is their explicit re-add: tombstones whose words the
- * text has, as `sameFact` counts them, are cleared, sources and all, so it may be observed again.
+ * The owner stating a forgotten fact again, in its text exactly as `fingerprint` compares it, is
+ * their explicit re-add: those tombstones are cleared, sources and all, so it may be observed
+ * again. A fact that only shares words with a forgotten one clears nothing.
  */
-const clearTombstones = (db: Db, dot: string, text: string) => {
-  const words = factWords(dot, text);
-  const cleared = db
-    .select()
-    .from(forgottenObservations)
-    .where(eq(forgottenObservations.dot, dot))
-    .all()
-    .filter((row) => sameFact(row.words, words))
-    .map((row) => row.id);
-  if (cleared.length)
-    db.delete(forgottenObservations).where(inArray(forgottenObservations.id, cleared)).run();
-};
+const clearTombstones = (db: Db, dot: string, text: string) =>
+  db
+    .delete(forgottenObservations)
+    .where(
+      and(
+        eq(forgottenObservations.dot, dot),
+        eq(forgottenObservations.fingerprint, fingerprint(dot, text)),
+      ),
+    )
+    .run();
 
 const bump = (db: Db, dot: string) => {
   stateOf(db, dot);
@@ -580,7 +594,8 @@ export const forgetObservation = (
         .values({
           dot,
           sources: removed.sources,
-          words: factWords(dot, `${removed.topic} ${removed.text}`),
+          words: factWords(dot, removed.text),
+          fingerprint: fingerprint(dot, removed.text),
           forgottenAt: Date.now(),
         })
         .run();

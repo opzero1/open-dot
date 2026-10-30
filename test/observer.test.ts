@@ -8,6 +8,7 @@ import { archiveAll, saveArchiveSettings, settingsOf } from "../src/archive";
 import { type Db, openDatabase } from "../src/db";
 import { observerDirectory } from "../src/home";
 import {
+  addObservation,
   applyJob,
   buildHead,
   editObservation,
@@ -1652,6 +1653,88 @@ test("the owner's own edit restating a forgotten fact clears it too", async () =
   expect(rows().map((each) => each.text)).toEqual([
     "The owner prefers green tea in the afternoon.",
     "The owner prefers green tea in the afternoon.",
+  ]);
+});
+
+test("a forgotten fact stays forgotten under another topic, and only the owner restating its text clears it", async () => {
+  const file = join(process.env.OPEN_DOT_HOME ?? "", "open-dot.db");
+  db.$client.close();
+  db = openDatabase(file);
+  addDot("jojo");
+  observerOn();
+  const teaText = "The owner prefers green tea.";
+  const coffeeText = "The owner avoids coffee after noon.";
+  const said = message("I avoid coffee after noon.");
+  const [first = "", second = ""] = enough();
+  const third = message("The release ships on Tuesday.");
+  answering(() =>
+    JSON.stringify({
+      ops: [
+        // A long topic: more of its words than the text's.
+        fact("Personal beverage preferences and afternoon drinking habits", teaText, [first]),
+        fact("Coffee", coffeeText, [said]),
+        fact("Lisbon", "The Lisbon offsite budget is 40k.", [second]),
+        fact("Release", "The release ships on Tuesday.", [third]),
+      ],
+    }),
+  );
+  work();
+  await pass();
+  await pass();
+  const [preference, avoids, lisbon, release] = rows();
+  expect(forgetObservation(db, "jojo", preference?.id ?? 0, 1)).toEqual({ deleted: true });
+  expect(forgetObservation(db, "jojo", avoids?.id ?? 0, 1)).toEqual({ deleted: true });
+  db.$client.close();
+  db = openDatabase(file);
+  const kept = () =>
+    rows().map((each) => [each.topic, each.text, each.updatedBy, each.supersededBy]);
+  const before = [
+    ["Lisbon", "The Lisbon offsite budget is 40k.", "observer", null],
+    ["Release", "The release ships on Tuesday.", "observer", null],
+  ];
+
+  // The same text under a short topic, from a new message: added, updated in or superseding.
+  await laterJob((fresh) => [
+    fact("Drinks", teaText, [fresh]),
+    { op: "update", id: lisbon?.id, topic: "Drinks", text: teaText, sources: [fresh] },
+    { ...fact("Drinks", teaText, [fresh]), op: "supersede", id: release?.id },
+    fact("Afternoon", coffeeText, [fresh]),
+  ]);
+  expect(kept()).toEqual(before);
+
+  // A fact of the owner's that only shares words with a forgotten one clears nothing.
+  const dot = db.select().from(dots).where(eq(dots.name, "jojo")).get();
+  if (!dot) throw new Error("no dot");
+  addObservation(db, dot, "Green teaText gives the owner headaches.");
+  expect(
+    editObservation(db, "jojo", lisbon?.id ?? 0, 1, "The owner prefers green tea at the offsite."),
+  ).toMatchObject({ saved: { updatedBy: "owner" } });
+  const tombstones = () =>
+    db.$client.query<{ sources: string }, []>("SELECT sources FROM forgotten_observations").all();
+  expect(tombstones().map((each) => JSON.parse(each.sources))).toEqual([[first], [said]]);
+  await laterJob((fresh) => [
+    fact("Drinks", teaText, [fresh]),
+    fact("Release", "The release moved to Wednesday.", [first]),
+  ]);
+  expect(rows().map((each) => each.text)).toEqual([
+    "The owner prefers green tea at the offsite.",
+    "The release ships on Tuesday.",
+    "Green teaText gives the owner headaches.",
+  ]);
+
+  // Restating the forgotten text, whatever its case and punctuation, clears only its tombstone.
+  addObservation(db, dot, "the owner prefers green tea");
+  expect(tombstones().map((each) => JSON.parse(each.sources))).toEqual([[said]]);
+  await laterJob((fresh) => [
+    fact("Drinks", teaText, [first]),
+    fact("Afternoon", coffeeText, [fresh]),
+  ]);
+  expect(rows().map((each) => [each.updatedBy, each.text])).toEqual([
+    ["owner", "The owner prefers green tea at the offsite."],
+    ["observer", "The release ships on Tuesday."],
+    ["owner", "Green teaText gives the owner headaches."],
+    ["owner", "the owner prefers green tea"],
+    ["observer", teaText],
   ]);
 });
 
