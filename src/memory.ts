@@ -34,14 +34,17 @@ export function runsWordsTogether(value: string) {
   return glued >= 3 && glued * 40 >= words.length;
 }
 
+// A prefix starts wherever no letter or digit comes before it, so an underscore or dash joining it
+// to a filename or word, as in `report_ghp_…`, doesn't hide it the way `\b` would.
 const secrets = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
-  /\b(?:xox[abposre]-|xapp-|xoxe\.)[\w.-]{8,}/g,
-  /\b(?:gh[pousr]_|github_pat_|lin_api_|sk-|sk_live_|rk_live_)[\w-]{16,}/g,
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g,
+  /(?<![A-Za-z0-9])(?:xox[abposre]-|xapp-|xoxe\.)[\w.-]{8,}/g,
+  /(?<![A-Za-z0-9])(?:gh[pousr]_|github_pat_|lin_api_|sk-|sk_live_|rk_live_)[\w-]{16,}/g,
+  /(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g,
 ];
-const labelled = /\b(pass(?:word|phrase|code)?|secret|token|api[_ -]?key|otp)(\s*[:=]\s*)\S+/gi;
+const labelled =
+  /(?<![A-Za-z0-9])(pass(?:word|phrase|code)?|secret|token|api[_ -]?key|otp)(\s*[:=]\s*)\S+/gi;
 
 /**
  * Drops what looks like a credential before anything is saved, best effort: archived messages,

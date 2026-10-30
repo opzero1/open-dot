@@ -2466,6 +2466,8 @@ test("issue61: no memory tool stores a planted secret", async () => {
   try {
     for (const secret of planted) {
       await loaded.call("dot_note", { text: `Deploy key ${secret} for staging.` });
+      // Joined to a word by an underscore, as in a filename, it's still caught.
+      await loaded.call("dot_note", { text: `See deploy_${secret}.md for staging.` });
       await loaded.call("dot_remind", {
         text: `Rotate ${secret} soon.`,
         at: "2099-01-01T09:00:00Z",

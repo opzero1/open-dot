@@ -192,11 +192,24 @@ test("only the dot's own workers count, and a path can't leave that worker's dir
 });
 
 test("a file whose path looks like it holds a credential isn't added to the Library", () => {
-  for (const name of [`ghp_${"A1b2".repeat(9)}.md`, "password=hunter2.txt"]) {
+  const tokens = [
+    `ghp_${"A1b2".repeat(9)}`,
+    "xoxb-1234567890-abcdefghijkl",
+    `sk-proj${"Z9y8".repeat(5)}`,
+  ];
+  const names = [
+    ...tokens.flatMap((token) => [`${token}.md`, `report_${token}.md`, `notes-${token}.txt`]),
+    "password=hunter2.txt",
+    "db_password=hunter2.txt",
+  ];
+  for (const name of names) {
     writeFileSync(join(outputDirectory("jojo", 1), name), "# Findings\n");
     expect(add("jojo", 1, name)).toContain("looks like it holds a credential");
   }
   expect(db.select().from(artifacts).all()).toEqual([]);
+  // Nothing was copied into the Library's store either.
+  const store = libraryDirectory("jojo");
+  expect(existsSync(store) ? readdirSync(store) : []).toEqual([]);
 });
 
 test("links, swapped directories, hard links and special files are refused", () => {

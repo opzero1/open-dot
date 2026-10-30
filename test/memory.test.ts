@@ -406,6 +406,15 @@ test("the owner's notes, goals, next actions and trigger tasks never keep a plan
       await call("/dots/jojo/memory/notes", { method: "POST", body: { text: `Key ${secret}` } }),
     );
     expect(added.status).toBe(201);
+    // Joined to a word by an underscore, as in a filename, it's still caught.
+    expect(
+      (
+        await call("/dots/jojo/memory/notes", {
+          method: "POST",
+          body: { text: `See report_${secret}.md` },
+        })
+      ).status,
+    ).toBe(201);
     const id = (added.body.note as { id: number }).id;
     expect(
       (
