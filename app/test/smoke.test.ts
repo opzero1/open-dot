@@ -235,6 +235,10 @@ class FakeDaemon {
   failing = new Set<string>();
   workers: object[] = [];
   busy = false;
+  // The work log the latest page carries, the activity it reports and each call's detail.
+  work: object[] = [];
+  activity: object | null = null;
+  details = new Map<string, object>();
   // jojo's avatar: its listed revision, and how many reads of it fail before one answers.
   avatar: { revision: string; failures: number } | null = null;
   avatarReads = 0;
@@ -279,6 +283,8 @@ class FakeDaemon {
     latestReads: 0,
     receipts: 0,
     dotReads: 0,
+    activityReads: 0,
+    toolReads: [] as string[],
     // Requests each server instance got, by its number.
     requests: [] as number[],
   };
@@ -423,6 +429,7 @@ class FakeDaemon {
         pending: [...this.pending],
         recentEmojis: [],
         ...(this.capable ? { clientMessageIDs: true } : {}),
+        ...(before === null ? { work: this.work } : {}),
       };
       if (before === null && this.stallNext) {
         // A read that started before the owner's change answers after it, with the old state.
@@ -475,6 +482,18 @@ class FakeDaemon {
     }
     if (receipt?.[1] && (method === "PATCH" || method === "DELETE"))
       return Response.json({ pending: null });
+    if (path === "/dots/jojo/activity" && method === "GET") {
+      this.log.activityReads++;
+      return this.activity
+        ? Response.json({ ...this.activity, sessionID: url.searchParams.get("sessionID") })
+        : Response.json({ error: "Not found" }, { status: 404 });
+    }
+    const tool = /^\/dots\/jojo\/messages\/([^/]+)\/tools\/([^/]+)$/.exec(path);
+    if (tool && method === "GET") {
+      this.log.toolReads.push(`${tool[1]}/${tool[2]}`);
+      const detail = this.details.get(`${tool[1]}/${tool[2]}`);
+      return detail ? Response.json(detail) : Response.json({ error: "No." }, { status: 404 });
+    }
     const single =
       /^\/dots\/jojo\/messages\/([^/]+)(?:\/(reaction|hidden|attachments\/(\d+)))?$/.exec(path);
     const id = single?.[1];
@@ -938,6 +957,135 @@ const sample = [
   "+new",
   "```",
 ].join("\n");
+
+const toolCall = (
+  callID: string,
+  name: string,
+  label: string,
+  status: string,
+  files: object[] = [],
+) => ({
+  messageID: "msg_work",
+  callID,
+  name,
+  status,
+  startedAt: 1,
+  endedAt: status === "running" ? null : 2,
+  label,
+  files,
+});
+
+test("a busy dot shows what it is doing, and its turn's calls fold under its reply", async () => {
+  await scenario(
+    "work",
+    (fake) => {
+      fake.busy = true;
+      fake.messages = [
+        { id: "msg_owner", kind: "owner", text: "Fix it" },
+        {
+          id: "msg_reply",
+          kind: "dot",
+          text: "first line\nsecond line\n\n> [!WARNING]\n> Careful",
+        },
+      ];
+      fake.work = [
+        {
+          anchor: "msg_reply",
+          calls: [
+            toolCall("c1", "bash", "bun test", "done"),
+            toolCall("c2", "edit", "src/a.ts", "done", [
+              { path: "src/a.ts", additions: 2, deletions: 1 },
+            ]),
+            toolCall("c3", "bash", "false", "error"),
+          ],
+          omitted: 0,
+          counts: { commands: 2, edits: 1, edited: 1, failed: 1, total: 3 },
+          complete: true,
+          open: false,
+          more: null,
+        },
+      ];
+      fake.activity = {
+        state: "tool",
+        tool: "bash",
+        label: "bun run check",
+        running: 1,
+        since: Date.now() - 65_000,
+        observedAt: Date.now(),
+      };
+      fake.details.set("msg_work/c2", {
+        ...toolCall("c2", "edit", "src/a.ts", "done", [
+          { path: "src/a.ts", additions: 2, deletions: 1 },
+        ]),
+        input: '{ "path": "src/a.ts" }',
+        output: Array.from({ length: 30 }, (_, index) => `out ${index}`).join("\n"),
+        error: null,
+        patches: [
+          {
+            path: "src/a.ts",
+            additions: 2,
+            deletions: 1,
+            patch:
+              "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1,2 @@\n-const a = 1;\n+const a = 2;\n+const b = 3;\n",
+          },
+        ],
+        truncated: false,
+      });
+    },
+    async ({ fake, js, until }) => {
+      await until(`!!document.querySelector("[data-work-log='msg_reply']")`, "the work log");
+      await until(
+        `(document.querySelector("[data-activity]")?.textContent ?? "").includes("bun run check")`,
+        "the activity line",
+      );
+      expect(
+        await js(`(() => {
+          const log = document.querySelector("[data-work-log='msg_reply']");
+          const activity = document.querySelector("[data-activity]");
+          const reply = t.msg("msg_reply");
+          return {
+            summary: log.querySelector(".work-summary").textContent,
+            collapsed: !log.querySelector("[data-tool-call]"),
+            underReply: reply.contains(log),
+            activity: activity.textContent,
+            breaks: !!reply.querySelector(".markdown p br"),
+            alert: !!reply.querySelector("blockquote.markdown-alert-warning .markdown-alert-title"),
+          };
+        })()`),
+      ).toEqual({
+        summary: "▸ Ran 2 commands, edited 1 file, 1 failed",
+        collapsed: true,
+        underReply: true,
+        activity: expect.stringMatching(/^jojo is running bash: bun run check · 1:0\d$/),
+        breaks: true,
+        alert: true,
+      });
+      await js(`document.querySelector("[data-work-log='msg_reply'] .work-summary").click(), true`);
+      await until(`document.querySelectorAll("[data-tool-call]").length === 3`, "the calls");
+      expect(
+        await js(
+          `[...document.querySelectorAll("[data-tool-call]")].map((row) => row.querySelector(".tool-call-head").textContent)`,
+        ),
+      ).toEqual(["$bashbun testDone", "✎editsrc/a.ts+2 −1Done", "$bashfalseError"]);
+      await js(`document.querySelector("[data-tool-call='c2'] .tool-call-head").click(), true`);
+      await until(
+        `!!document.querySelector("[data-tool-call='c2'] .diff .diff-add")`,
+        "the edit's diff",
+      );
+      expect(
+        await js(`(() => {
+          const row = document.querySelector("[data-tool-call='c2']");
+          return {
+            output: row.querySelectorAll(".tool-text pre")[1].textContent.split("\\n").length,
+            more: [...row.querySelectorAll(".link-button")].map((b) => b.textContent),
+          };
+        })()`),
+      ).toEqual({ output: 20, more: ["Show more (10 more lines)"] });
+      expect(fake.log.toolReads).toEqual(["msg_work/c2"]);
+      expect(fake.log.activityReads).toBeGreaterThan(0);
+    },
+  );
+}, 60_000);
 
 test("renders safely, sends with its own ID, and settles a lost send from its receipt without resending", async () => {
   await scenario(

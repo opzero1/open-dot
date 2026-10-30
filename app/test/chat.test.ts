@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { MessageView, PageView } from "../bridge";
 import {
   afterSend,
@@ -35,6 +35,12 @@ import {
   unlistedTapback,
   unreadSince,
   workerActions,
+  activityLine,
+  elapsed,
+  firstLines,
+  mergeWork,
+  pageWork,
+  workSummary,
 } from "../chat";
 
 test("links open only as http, https or mailto, without credentials or hidden characters", () => {
@@ -492,4 +498,83 @@ test("Delivered marks only a trailing owner message with nothing pending, and un
   expect(unreadSince(messages, undefined)).toBe(0);
   expect(unreadSince(messages, "a")).toBe(2);
   expect(unreadSince(messages, "d")).toBe(0);
+});
+
+describe("work log", () => {
+  const counts = { commands: 0, edits: 0, edited: 0, failed: 0, total: 0 };
+  const log = (anchor: string | null, total: number) => ({
+    anchor,
+    calls: [],
+    omitted: 0,
+    counts: { ...counts, total },
+    complete: true,
+    open: anchor === null,
+    more: null,
+  });
+
+  test("summaries count commands, edited files, other calls and failures", () => {
+    expect(workSummary({ commands: 4, edits: 2, edited: 2, failed: 0, total: 6 }, true)).toBe(
+      "Ran 4 commands, edited 2 files",
+    );
+    expect(workSummary({ commands: 1, edits: 1, edited: 0, failed: 1, total: 3 }, true)).toBe(
+      "Ran 1 command, tried 1 edit, made 1 other call, 1 failed",
+    );
+    expect(workSummary({ ...counts, total: 2 }, false)).toBe("At least: Made 2 other calls");
+  });
+
+  test("logs are kept by the message they go under, newest read first, only while loaded", () => {
+    const first = mergeWork(
+      undefined,
+      { sessionID: "s", work: [log("m1", 1), log(null, 2)] },
+      true,
+      new Set(["m1"]),
+    );
+    expect(first.logs.get("m1")?.counts.total).toBe(1);
+    expect(first.open?.counts.total).toBe(2);
+    // An older page adds its logs and keeps the running turn; a newer read replaces a log.
+    const older = mergeWork(
+      first,
+      { sessionID: "s", work: [log("m0", 3)] },
+      false,
+      new Set(["m0", "m1"]),
+    );
+    expect([...older.logs.keys()]).toEqual(["m1", "m0"]);
+    expect(older.open?.counts.total).toBe(2);
+    const latest = mergeWork(
+      older,
+      { sessionID: "s", work: [log("m1", 5)] },
+      true,
+      new Set(["m1"]),
+    );
+    expect(latest.logs.get("m1")?.counts.total).toBe(5);
+    expect(latest.logs.has("m0")).toBe(false);
+    expect(latest.open).toBeUndefined();
+    // A new session starts over, and malformed logs or an old daemon's pages add nothing.
+    const fresh = mergeWork(
+      latest,
+      { sessionID: "t", work: [{ anchor: 7 } as never] },
+      true,
+      new Set(["m1"]),
+    );
+    expect(fresh.logs.size).toBe(0);
+    expect(pageWork({})).toEqual([]);
+  });
+
+  test("activity lines, timers and long output", () => {
+    expect(activityLine("jojo", undefined)).toBe("jojo is working");
+    expect(activityLine("jojo", { state: "thinking", tool: null, label: null, running: 0 })).toBe(
+      "jojo is thinking",
+    );
+    expect(
+      activityLine("jojo", { state: "tool", tool: "bash", label: "bun test", running: 3 }),
+    ).toBe("jojo is running bash: bun test (+2 more)");
+    expect(elapsed(0, 65_400)).toBe("1:05");
+    expect(elapsed(0, 3_725_000)).toBe("1:02:05");
+    expect(elapsed(10, 0)).toBe("0:00");
+    const text = Array.from({ length: 25 }, (_, index) => `l${index}`).join("\n");
+    expect(firstLines(text)).toEqual({
+      shown: text.split("\n").slice(0, 20).join("\n"),
+      hidden: 5,
+    });
+  });
 });

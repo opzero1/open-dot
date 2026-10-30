@@ -32,6 +32,30 @@ export const fits = (value: unknown, shape: Shape): boolean => {
   });
 };
 
+const toolFile = { path: "s", "additions?": "n", "deletions?": "n" } as const;
+const toolCall = {
+  messageID: "s",
+  callID: "s",
+  name: "s",
+  status: "s",
+  "startedAt?": "n",
+  "endedAt?": "n",
+  label: "s",
+  files: [toolFile],
+} as const;
+const workCounts = { commands: "n", edits: "n", edited: "n", failed: "n", total: "n" } as const;
+
+/** A work log as the renderer reads it, whether from a page or on its own. */
+export const workLogShape = {
+  "anchor?": "s",
+  calls: [toolCall],
+  omitted: "n",
+  counts: workCounts,
+  complete: "b",
+  open: "b",
+  "more?": "s",
+} as const;
+
 const versioned = { id: "n", version: "n", updatedAt: "n", updatedBy: "s" } as const;
 const feedItem = {
   id: "n",
@@ -169,6 +193,24 @@ export const shapes: Record<Operation, Shape> = {
   slackDMCheck: slackSetup,
   slackLogin: { attempt: "s", command: "s", expiresAt: "n" },
   fresh: { name: "s", sessionID: "s", previousSessionID: "s" },
+  activity: {
+    sessionID: "s",
+    state: "s",
+    "tool?": "s",
+    "label?": "s",
+    running: "n",
+    "since?": "n",
+    observedAt: "n",
+  },
+  work: { calls: [toolCall], omitted: "n", counts: workCounts, complete: "b", "more?": "s" },
+  toolDetail: {
+    ...toolCall,
+    "input?": "s",
+    "output?": "s",
+    "error?": "s",
+    patches: [{ ...toolFile, "patch?": "s" }],
+    truncated: "b",
+  },
 };
 
 /** An answer that doesn't fit its operation: a read failed, a change's outcome is unknown. */

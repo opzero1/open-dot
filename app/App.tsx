@@ -16,6 +16,7 @@ import {
 } from "react";
 import { createRoot } from "react-dom/client";
 import type {
+  ActivityView,
   Attempt,
   DotView,
   MessageView,
@@ -24,8 +25,13 @@ import type {
   ReceiptStatus,
   Result,
   SendResult,
+  ToolCallView,
+  ToolDetailView,
+  WorkCounts,
+  WorkLogView,
 } from "./bridge";
 import {
+  activityLine,
   afterSend,
   applyIntents,
   backoff,
@@ -37,7 +43,9 @@ import {
   deliveredID,
   type Draft,
   editDraft,
+  elapsed,
   emptyDraft,
+  firstLines,
   fenced,
   fencePage,
   imageLimits,
@@ -46,6 +54,7 @@ import {
   keepSent,
   mergeLatest,
   mergeOlder,
+  mergeWork,
   olderRead,
   pendingActions,
   pendingLabel,
@@ -57,15 +66,18 @@ import {
   type Sent,
   sentLimit,
   settledBy,
+  staleAfter,
   tapbacks,
   undoDraft,
   unlistedTapback,
   unreadSince,
   workerActions,
+  type WorkState,
+  workSummary,
 } from "./chat";
 import { Feed } from "./Feed";
 import { Instructions } from "./Instructions";
-import { Markdown } from "./Markdown";
+import { DiffBlock, Markdown } from "./Markdown";
 import { Memory } from "./Memory";
 import { Health, Library } from "./Panes";
 import { Slack } from "./SlackView";
@@ -231,6 +243,7 @@ const App = () => {
   const [conversations, conversationsRef, updateConversations] = useLive(
     new Map<string, Conversation>(),
   );
+  const [work, setWork] = useState(new Map<string, WorkState>());
   const [readErrors, setReadErrors] = useState(new Map<string, string>());
   const [olderErrors, setOlderErrors] = useState(new Map<string, string>());
   const [recent, setRecent] = useState<string[]>([]);
@@ -379,6 +392,10 @@ const App = () => {
       const keep = name === selectedRef.current ? selectionKeep.current : new Set<string>();
       updateConversations((current) =>
         new Map(current).set(name, mergeLatest(current.get(name), page, keep)),
+      );
+      const loaded = new Set(conversationsRef.current.get(name)?.messages.map((item) => item.id));
+      setWork((current) =>
+        new Map(current).set(name, mergeWork(current.get(name), page, true, loaded)),
       );
       settle(name, page.messages, startedAt);
       updateSent((current) => keepSent(current, name, page, Date.now()));
@@ -985,6 +1002,10 @@ const App = () => {
         ? new Map(current).set(name, mergeOlder(latest, result.value, read, selectionKeep.current))
         : current;
     });
+    const loaded = new Set(conversationsRef.current.get(name)?.messages.map((item) => item.id));
+    setWork((current) =>
+      new Map(current).set(name, mergeWork(current.get(name), result.value, false, loaded)),
+    );
   };
 
   const backToLatest = () => {
@@ -1263,6 +1284,7 @@ const App = () => {
               conversation={conversation}
               delivered={delivered}
               busy={dot.busy}
+              work={work.get(dot.name)}
               blocked={blocked}
               changing={changing}
               olderError={olderErrors.get(dot.name)}
@@ -1610,6 +1632,7 @@ const MessageList = ({
   conversation,
   delivered,
   busy,
+  work,
   blocked,
   changing,
   olderError,
@@ -1631,6 +1654,7 @@ const MessageList = ({
   conversation: Conversation;
   delivered: string | undefined;
   busy: boolean;
+  work: WorkState | undefined;
   blocked: (id: string) => boolean;
   changing: ReadonlySet<string>;
   olderError: string | undefined;
@@ -1809,6 +1833,12 @@ const MessageList = ({
                 <MessageRow
                   dot={dot}
                   message={row.message}
+                  log={
+                    work?.sessionID === row.message.sessionID
+                      ? work.logs.get(row.message.id)
+                      : undefined
+                  }
+                  busy={busy}
                   delivered={row.message.id === delivered}
                   blocked={blocked(row.message.id)}
                   onMenu={onMenu}
@@ -1842,7 +1872,10 @@ const MessageList = ({
           );
         })}
       </div>
-      {busy ? <div className="typing">{dot} is working…</div> : null}
+      {busy && work?.open && work.sessionID === conversation.sessionID ? (
+        <WorkLog dot={dot} sessionID={conversation.sessionID} log={work.open} running />
+      ) : null}
+      {busy ? <Activity dot={dot} sessionID={conversation.sessionID} /> : null}
       {latest ? (
         <button
           type="button"
@@ -1923,9 +1956,308 @@ const PendingRow = ({
   );
 };
 
+const toolIcons: Record<string, string> = {
+  bash: "$",
+  shell: "$",
+  edit: "✎",
+  write: "✎",
+  apply_patch: "✎",
+  multiedit: "✎",
+  read: "📄",
+  glob: "🔍",
+  grep: "🔍",
+  webfetch: "🌐",
+  websearch: "🌐",
+  todowrite: "☑",
+};
+
+const statusWords: Record<ToolCallView["status"], string> = {
+  preparing: "Preparing",
+  running: "Running",
+  done: "Done",
+  error: "Error",
+  unknown: "Unknown",
+};
+
+/** Text that may be long: its first lines, with Show more for the rest the daemon sent. */
+const LongText = ({ text, label }: { text: string; label: string }) => {
+  const [all, setAll] = useState(false);
+  const { shown, hidden } = firstLines(text);
+  return (
+    <div className="tool-text">
+      <div className="tool-text-label">{label}</div>
+      <pre>{all ? text : shown}</pre>
+      {hidden ? (
+        <button type="button" className="link-button" onClick={() => setAll(!all)}>
+          {all ? "Show less" : `Show more (${hidden} more lines)`}
+        </button>
+      ) : null}
+    </div>
+  );
+};
+
+/** One call's full input, output, error and diffs, read when its row opens. */
+const ToolDetailBody = ({
+  dot,
+  sessionID,
+  call,
+}: {
+  dot: string;
+  sessionID: string;
+  call: ToolCallView;
+}) => {
+  const [detail, setDetail] = useState<ToolDetailView>();
+  const [problem, setProblem] = useState<string>();
+  useEffect(() => {
+    let live = true;
+    void bridge.call("toolDetail", dot, call.messageID, sessionID, call.callID).then((result) => {
+      if (!live) return;
+      if (result.ok) setDetail(result.value);
+      else setProblem(result.error);
+    });
+    return () => {
+      live = false;
+    };
+  }, [dot, sessionID, call.messageID, call.callID, call.status]);
+  if (problem) return <div className="tool-detail status warning">{problem}</div>;
+  if (!detail) return <div className="tool-detail muted">Loading…</div>;
+  const unavailable = detail.files.filter(
+    (file) => file.additions === null && !detail.patches.some((patch) => patch.path === file.path),
+  );
+  return (
+    <div className="tool-detail">
+      {detail.input ? <LongText label="Input" text={detail.input} /> : null}
+      {detail.error ? <LongText label="Error" text={detail.error} /> : null}
+      {detail.output ? <LongText label="Output" text={detail.output} /> : null}
+      {detail.patches.map((patch, index) =>
+        patch.patch ? (
+          <DiffBlock key={index} code={patch.patch} />
+        ) : (
+          <div key={index} className="muted">
+            {patch.path}: diff unavailable
+          </div>
+        ),
+      )}
+      {editTools.has(detail.name)
+        ? unavailable.map((file) => (
+            <div key={file.path} className="muted">
+              {file.path}: diff unavailable
+            </div>
+          ))
+        : null}
+      {detail.truncated ? (
+        <div className="muted">Some of this was too long, so it was cut or left out.</div>
+      ) : null}
+    </div>
+  );
+};
+
+const editTools: ReadonlySet<string> = new Set(["edit", "write", "apply_patch", "multiedit"]);
+
+const ToolRow = ({
+  dot,
+  sessionID,
+  call,
+}: {
+  dot: string;
+  sessionID: string;
+  call: ToolCallView;
+}) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <li className={`tool-call ${call.status}`} data-tool-call={call.callID}>
+      <button
+        type="button"
+        className="tool-call-head"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        <span className="tool-icon" aria-hidden="true">
+          {toolIcons[call.name] ?? "⚙"}
+        </span>
+        <span className="tool-name">{call.name}</span>
+        <span className="tool-label">{call.label}</span>
+        {editTools.has(call.name)
+          ? call.files.map((file) => (
+              <span key={file.path} className="tool-file">
+                {file.additions === null ? (
+                  <span className="muted">diff unavailable</span>
+                ) : (
+                  <>
+                    <span className="added">+{file.additions}</span>{" "}
+                    <span className="removed">−{file.deletions}</span>
+                  </>
+                )}
+              </span>
+            ))
+          : null}
+        <span className={`tool-status ${call.status}`}>{statusWords[call.status]}</span>
+      </button>
+      {open ? <ToolDetailBody dot={dot} sessionID={sessionID} call={call} /> : null}
+    </li>
+  );
+};
+
+/** A turn's tool calls: collapsed to one line, expanded to each call. */
+const WorkLog = ({
+  dot,
+  sessionID,
+  log,
+  running,
+}: {
+  dot: string;
+  sessionID: string;
+  log: WorkLogView;
+  running: boolean;
+}) => {
+  const [open, setOpen] = useState(false);
+  const [earlier, setEarlier] = useState<{ calls: ToolCallView[]; counts: WorkCounts[] }>({
+    calls: [],
+    counts: [],
+  });
+  const [more, setMore] = useState(log.more);
+  const [complete, setComplete] = useState(log.complete);
+  const [loading, setLoading] = useState(false);
+  const [problem, setProblem] = useState<string>();
+  // A newer read of the same turn starts the continuation over.
+  useEffect(() => {
+    setEarlier({ calls: [], counts: [] });
+    setMore(log.more);
+    setComplete(log.complete);
+  }, [log.more, log.complete]);
+  const counts = earlier.counts.reduce(
+    (sum, part) => ({
+      commands: sum.commands + part.commands,
+      edits: sum.edits + part.edits,
+      edited: sum.edited + part.edited,
+      failed: sum.failed + part.failed,
+      total: sum.total + part.total,
+    }),
+    log.counts,
+  );
+  const loadEarlier = () => {
+    if (!more || loading) return;
+    setLoading(true);
+    setProblem(undefined);
+    void bridge.call("work", dot, sessionID, more).then((result) => {
+      setLoading(false);
+      if (!result.ok) {
+        setProblem(result.error);
+        return;
+      }
+      setEarlier((current) => ({
+        calls: [...result.value.calls, ...current.calls],
+        counts: [...current.counts, result.value.counts],
+      }));
+      setMore(result.value.more);
+      setComplete(result.value.complete);
+    });
+  };
+  const calls = [...earlier.calls, ...log.calls];
+  return (
+    <div className="work-log" data-work-log={log.anchor ?? "open"}>
+      <button
+        type="button"
+        className="work-summary"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span> {running && log.open ? "Working: " : ""}
+        {workSummary(counts, complete)}
+      </button>
+      {open ? (
+        <div className="work-calls">
+          {!complete ? (
+            <div className="muted">
+              Partial history: this turn began earlier than open-dot read.{" "}
+              {more ? (
+                <button
+                  type="button"
+                  className="link-button"
+                  disabled={loading}
+                  onClick={loadEarlier}
+                >
+                  {loading ? "Loading…" : "Load earlier calls"}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {problem ? <div className="status warning">{problem}</div> : null}
+          {log.omitted ? (
+            <div className="muted">{log.omitted} earlier calls aren't listed.</div>
+          ) : null}
+          <ul>
+            {calls.map((call) => (
+              <ToolRow
+                key={`${call.messageID}/${call.callID}`}
+                dot={dot}
+                sessionID={sessionID}
+                call={call}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+/** What a busy dot is doing now, read once a second, with how long it has been at it. */
+const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
+  const [seen, setSeen] = useState<{ view: ActivityView; at: number; first: number }>();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    let live = true;
+    const read = () =>
+      void bridge.call("activity", dot, sessionID).then((result) => {
+        if (!live || !result.ok || result.value.sessionID !== sessionID) return;
+        const at = Date.now();
+        const view = result.value;
+        setSeen((previous) => ({
+          view,
+          at,
+          // Without OpenCode's own start time, the timer counts from when this was first seen.
+          first:
+            previous &&
+            previous.view.state === view.state &&
+            previous.view.tool === view.tool &&
+            previous.view.label === view.label
+              ? previous.first
+              : at,
+        }));
+      });
+    read();
+    const timer = setInterval(() => {
+      setNow(Date.now());
+      read();
+    }, 1000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [dot, sessionID]);
+  const stale = seen !== undefined && now - seen.at > staleAfter;
+  const from = seen?.view.since ?? seen?.first;
+  return (
+    <div className="typing" role="status" data-activity={seen?.view.state ?? "unknown"}>
+      {activityLine(dot, seen?.view)}
+      {from !== undefined ? (
+        <span className="activity-time">
+          {" "}
+          · {elapsed(from, stale && seen ? seen.at : now)}
+          {seen?.view.since === null ? " observed" : ""}
+          {stale ? " · not updated" : ""}
+        </span>
+      ) : null}
+    </div>
+  );
+};
+
 const MessageRow = ({
   dot,
   message,
+  log,
+  busy,
   delivered,
   blocked,
   onMenu,
@@ -1935,6 +2267,8 @@ const MessageRow = ({
 }: {
   dot: string;
   message: MessageView;
+  log: WorkLogView | undefined;
+  busy: boolean;
   delivered: boolean;
   blocked: boolean;
   onMenu: (menu: Menu) => void;
@@ -2010,6 +2344,9 @@ const MessageRow = ({
           </div>
         ) : null}
       </div>
+      {log && !message.hidden ? (
+        <WorkLog dot={dot} sessionID={message.sessionID} log={log} running={busy} />
+      ) : null}
       {reactions.length ? (
         <div className="reactions">
           {reactions.map((reaction) => (

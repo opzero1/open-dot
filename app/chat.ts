@@ -1,6 +1,7 @@
 // The app's plain logic, kept apart from Electron and the DOM so it can be tested: the daemon
 // address, the link policy, image checks, drafts, send outcomes and the chat's view of messages.
 import type {
+  ActivityView,
   DraftImage,
   MessageView,
   PageView,
@@ -8,7 +9,10 @@ import type {
   QuoteView,
   ReceiptStatus,
   Result,
+  WorkCounts,
+  WorkLogView,
 } from "./bridge";
+import { fits, workLogShape } from "./decode";
 
 /** The daemon's address and token from api.json, only as the daemon writes them. */
 export interface Endpoint {
@@ -628,3 +632,93 @@ export const isDiff = (language: string | undefined, code: string) =>
   language === "diff" ||
   language === "patch" ||
   (!language && /^(diff --git |--- \S.*\n\+\+\+ \S.*\n@@ )/m.test(code));
+
+// The work log: each turn's tool calls under its last reply, kept per dot beside its messages.
+
+export interface WorkState {
+  sessionID: string;
+  /** Logs by the message they go beneath. */
+  logs: Map<string, WorkLogView>;
+  /** The latest page's running turn that has no message to go beneath yet. */
+  open: WorkLogView | undefined;
+}
+
+/** The page's well-formed logs; a daemon without the work log sends none. */
+export const pageWork = (page: Pick<PageView, "work">): WorkLogView[] =>
+  Array.isArray(page.work) ? page.work.filter((log) => fits(log, workLogShape)) : [];
+
+/**
+ * Takes a page's logs into what's kept: a newer read of a turn replaces the older one, a latest
+ * page sets the running turn, and only logs under loaded messages stay, so memory stays bounded.
+ */
+export const mergeWork = (
+  current: WorkState | undefined,
+  page: Pick<PageView, "work" | "sessionID">,
+  latest: boolean,
+  loaded: ReadonlySet<string>,
+): WorkState => {
+  const base =
+    current?.sessionID === page.sessionID
+      ? current
+      : { sessionID: page.sessionID, logs: new Map<string, WorkLogView>(), open: undefined };
+  const logs = new Map([...base.logs].filter(([anchor]) => loaded.has(anchor)));
+  let open = latest ? undefined : base.open;
+  for (const log of pageWork(page)) {
+    if (log.anchor === null) open = latest ? log : open;
+    else if (loaded.has(log.anchor)) logs.set(log.anchor, log);
+  }
+  return { sessionID: page.sessionID, logs, open };
+};
+
+const plural = (count: number, one: string, many = `${one}s`) =>
+  `${count} ${count === 1 ? one : many}`;
+
+/** The one-line summary of a log, such as "Ran 4 commands, edited 2 files". */
+export const workSummary = (counts: WorkCounts, complete: boolean) => {
+  const other = counts.total - counts.commands - counts.edits;
+  const parts = [
+    counts.commands ? `ran ${plural(counts.commands, "command")}` : "",
+    counts.edited ? `edited ${plural(counts.edited, "file")}` : "",
+    counts.edits && !counts.edited ? `tried ${plural(counts.edits, "edit")}` : "",
+    other > 0 ? `made ${plural(other, "other call")}` : "",
+    counts.failed ? `${counts.failed} failed` : "",
+  ].filter(Boolean);
+  const text = parts.join(", ") || `made ${plural(counts.total, "call")}`;
+  return `${complete ? "" : "At least: "}${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+};
+
+/** Long output starts at this many lines, behind Show more. */
+export const outputLines = 20;
+
+/** The first `lines` lines of a text, and how many more it has. */
+export const firstLines = (text: string, lines = outputLines) => {
+  const all = text.split("\n");
+  return { shown: all.slice(0, lines).join("\n"), hidden: Math.max(0, all.length - lines) };
+};
+
+/** Whole seconds since `from` as m:ss or h:mm:ss. */
+export const elapsed = (from: number, now: number) => {
+  const total = Math.max(0, Math.floor((now - from) / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = String(total % 60).padStart(2, "0");
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`
+    : `${minutes}:${seconds}`;
+};
+
+/** An activity read older than this is stale: its timer stops and says so. */
+export const staleAfter = 5_000;
+
+/** What a busy dot's live line says, from its last activity read. */
+export const activityLine = (
+  dot: string,
+  activity: Pick<ActivityView, "state" | "tool" | "label" | "running"> | undefined,
+) => {
+  if (!activity || activity.state === "idle") return `${dot} is working`;
+  if (activity.state === "thinking") return `${dot} is thinking`;
+  const what = activity.label
+    ? `${activity.tool ?? "a tool"}: ${activity.label}`
+    : (activity.tool ?? "a tool");
+  return `${dot} is running ${what}${activity.running > 1 ? ` (+${activity.running - 1} more)` : ""}`;
+};

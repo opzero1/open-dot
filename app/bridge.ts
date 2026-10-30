@@ -82,8 +82,76 @@ export interface PendingView {
   delivery: string | null;
 }
 
+export type ToolStatus = "preparing" | "running" | "done" | "error" | "unknown";
+
+/** A file a tool call names; null counts mean OpenCode reported none. */
+export interface ToolFileView {
+  path: string;
+  additions: number | null;
+  deletions: number | null;
+}
+
+export interface ToolCallView {
+  messageID: string;
+  callID: string;
+  name: string;
+  status: ToolStatus;
+  startedAt: number | null;
+  endedAt: number | null;
+  label: string;
+  files: ToolFileView[];
+}
+
+export interface WorkCounts {
+  commands: number;
+  edits: number;
+  edited: number;
+  failed: number;
+  total: number;
+}
+
+/** One turn's tool calls, beneath the message `anchor` names, or none yet while it runs. */
+export interface WorkLogView {
+  anchor: string | null;
+  calls: ToolCallView[];
+  omitted: number;
+  counts: WorkCounts;
+  complete: boolean;
+  open: boolean;
+  more: string | null;
+}
+
+/** Earlier calls of a turn, read on request. */
+export interface WorkPage {
+  calls: ToolCallView[];
+  omitted: number;
+  counts: WorkCounts;
+  complete: boolean;
+  more: string | null;
+}
+
+export interface ToolDetailView extends ToolCallView {
+  input: string | null;
+  output: string | null;
+  error: string | null;
+  patches: (ToolFileView & { patch: string | null })[];
+  truncated: boolean;
+}
+
+export interface ActivityView {
+  sessionID: string;
+  state: "idle" | "thinking" | "tool";
+  tool: string | null;
+  label: string | null;
+  running: number;
+  since: number | null;
+  observedAt: number;
+}
+
 export interface PageView {
   messages: MessageView[];
+  /** Each turn's tool calls; absent from a daemon older than the work log. */
+  work?: WorkLogView[];
   sessionID: string;
   next: string | null;
   pending: PendingView[];
@@ -626,6 +694,9 @@ export interface Operations {
   slackDMCheck: [[dot: string], SlackSetup];
   slackLogin: [[], SlackTicket];
   fresh: [[dot: string, force: boolean], FreshResult];
+  activity: [[dot: string, sessionID: string], ActivityView];
+  work: [[dot: string, sessionID: string, cursor: string], WorkPage];
+  toolDetail: [[dot: string, id: string, sessionID: string, callID: string], ToolDetailView];
 }
 
 export type Operation = keyof Operations;

@@ -1072,6 +1072,21 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
       return { method: "POST", path: `${base}/slack/icon`, body: {} };
     case "slackDMCheck":
       return { method: "POST", path: `${base}/slack/dm-check`, body: {} };
+    case "activity":
+      return isName(a)
+        ? { method: "GET", path: `${base}/activity?sessionID=${segment(a)}`, timeout: 5_000 }
+        : undefined;
+    case "work":
+      return isName(a) && isText(b, 8192)
+        ? { method: "GET", path: `${base}/work?sessionID=${segment(a)}&cursor=${segment(b)}` }
+        : undefined;
+    case "toolDetail":
+      return isName(a) && isName(b) && isName(c)
+        ? {
+            method: "GET",
+            path: `${base}/messages/${segment(a)}/tools/${segment(c)}?sessionID=${segment(b)}`,
+          }
+        : undefined;
     case "fresh":
       return typeof a === "boolean"
         ? {
@@ -1131,6 +1146,9 @@ const operationNames = new Set<string>([
   "slackDMCheck",
   "slackLogin",
   "fresh",
+  "activity",
+  "work",
+  "toolDetail",
 ] satisfies Operation[]);
 
 const isOperation = (value: unknown): value is Operation =>

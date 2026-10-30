@@ -18,5 +18,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["App.tsx", "Markdown.tsx", "chat.ts", "bridge.ts", "env.d.ts"]
+  "include": ["App.tsx", "Markdown.tsx", "chat.ts", "bridge.ts", "decode.ts", "env.d.ts"]
 }
