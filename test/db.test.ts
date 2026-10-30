@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openDatabase, restoreDatabase } from "../src/db";
+import { forgetObservation } from "../src/ledger";
 import { readMemory } from "../src/memory";
 import {
   feed,
@@ -2001,6 +2002,69 @@ test("0032 adds the ledger and observer tables, every new switch off, and keeps 
     expect(found("porto")).toEqual([1]);
     db.$client.run("delete from ledger");
     expect(found("porto")).toEqual([]);
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0037 and 0038 add only the forget tables to a 0036 database, and a forget survives reopening", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-forget-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0037");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  old.run(
+    "insert into archive (dot,session_id,message_id,role,text,created_at,archived_at) values ('jojo','ses_jojo','msg_1','owner','I prefer green tea.',1,1), ('jojo','ses_jojo','msg_2','owner','The offsite is in Lisbon.',2,2)",
+  );
+  old.run(
+    "insert into ledger (dot,session_id,kind,topic,text,priority,valid_from,sources,updated_by,created_at,updated_at) values ('jojo','ses_jojo','preference','Tea','Prefers it green.',2,1,'[\"msg_1\"]','observer',1,1)",
+  );
+  const tables = tableNames(old);
+  const rows = (sqlite: Database) =>
+    tables.map((name) => [name, sqlite.query(`select * from "${name}"`).all()]);
+  const before = rows(old);
+  const ledgerOld = ledgerOf(old);
+  const triggers = triggerSQL(old);
+  old.close();
+  let db = openDatabase(path);
+  try {
+    expect(tableNames(db.$client)).toEqual([...tables, ...forgetTables].toSorted());
+    expect(rows(db.$client)).toEqual(before);
+    expect(triggerSQL(db.$client)).toEqual(triggers);
+    expectLedger(db.$client, ledgerOld, "0037");
+    expect(
+      db.$client
+        .query<{ name: string }, []>("select name from pragma_table_info('forgotten_observations')")
+        .all()
+        .map((column) => column.name),
+    ).toEqual(["id", "dot", "sources", "fingerprint", "forgotten_at"]);
+    const green = () =>
+      db.$client.query("select rowid from memory_fts where memory_fts match '\"green\"'").all();
+    expect(green()).toHaveLength(1);
+    expect(forgetObservation(db, "jojo", 1, 1, true)).toEqual({ deleted: true });
+    db.$client.close();
+    db = openDatabase(path);
+    // The forgotten row, its source message and that message's index entry stay gone.
+    expect(db.$client.query("select message_id from archive").all()).toEqual([
+      { message_id: "msg_2" },
+    ]);
+    expect(db.$client.query("select * from ledger").all()).toEqual([]);
+    expect(green()).toEqual([]);
+    expect(db.$client.query("select message_id from forgotten_messages").all()).toEqual([
+      { message_id: "msg_1" },
+    ]);
+    expect(
+      db.$client.query<{ sources: string }, []>("select sources from forgotten_observations").all(),
+    ).toEqual([{ sources: '["msg_1"]' }]);
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });
