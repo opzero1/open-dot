@@ -2138,3 +2138,76 @@ test("a Restore still connecting to OpenCode refuses once the dot rebinds and ke
     { dot: "jojo", sessionID: "ses_jojo", messageID: "msg_answer" },
   ]);
 });
+
+const json = (body: unknown) => ({
+  body: JSON.stringify(body),
+  headers: { "content-type": "application/json" },
+});
+
+test("M10: the owner's fact routes create, review and delete with versions, and refuse stale or malformed changes", async () => {
+  const id = crypto.randomUUID();
+  const mutationID = crypto.randomUUID();
+  const created = await call(`/owner/facts/${id}`, {
+    method: "PUT",
+    ...json({ version: 0, text: "Lives in Lisbon.", mutationID }),
+  });
+  expect(created.status).toBe(201);
+  expect(await created.json()).toMatchObject({
+    fact: { id, state: "approved", version: 1, origin: null, lastMutationID: mutationID },
+  });
+  // The same create again, as after a lost answer, is the saved fact; another is a conflict.
+  const replay = await call(`/owner/facts/${id}`, {
+    method: "PUT",
+    ...json({ version: 0, text: "Lives in Lisbon.", mutationID }),
+  });
+  expect(replay.status).toBe(201);
+  const clash = await call(`/owner/facts/${id}`, {
+    method: "PUT",
+    ...json({ version: 0, text: "Lives in Porto.", mutationID: crypto.randomUUID() }),
+  });
+  expect(clash.status).toBe(409);
+  const edit = (version: number, text: string) =>
+    call(`/owner/facts/${id}`, {
+      method: "PATCH",
+      ...json({ action: "edit", version, text, mutationID: crypto.randomUUID() }),
+    });
+  expect((await edit(1, "Lives in Lisbon, Portugal.")).status).toBe(200);
+  const stale = await edit(1, "Lives in Porto.");
+  expect(stale.status).toBe(409);
+  expect(await stale.json()).toMatchObject({
+    current: { version: 2, text: "Lives in Lisbon, Portugal." },
+  });
+  expect((await edit(2, "password: hunter2")).status).toBe(400);
+  for (const body of [
+    { action: "approve", version: 2 },
+    { action: "edit", version: 2, mutationID: crypto.randomUUID() },
+    { action: "reject", version: 2, mutationID: crypto.randomUUID(), text: "x" },
+    { action: "approve", version: 2, mutationID: crypto.randomUUID(), extra: true },
+  ])
+    expect((await call(`/owner/facts/${id}`, { method: "PATCH", ...json(body) })).status).toBe(400);
+  expect(
+    (await call(`/owner/facts/${id}`, { method: "PATCH", body: "x".repeat(17 * 1024) })).status,
+  ).toBe(413);
+  expect((await call(`/owner/facts/${crypto.randomUUID()}`)).status).toBe(404);
+  expect((await call("/owner/facts/not-a-uuid")).status).toBe(404);
+  expect((await call(`/owner/facts/${id}?version=2`, { method: "DELETE" })).status).toBe(400);
+  const removed = await call(`/owner/facts/${id}?version=2&mutationID=${crypto.randomUUID()}`, {
+    method: "DELETE",
+  });
+  expect(await removed.json()).toMatchObject({
+    fact: { state: "deleted", text: null, version: 3 },
+  });
+  const memory = (await (await call("/owner/memory")).json()) as {
+    pending: unknown[];
+    approved: unknown[];
+    removed: { id: string }[];
+  };
+  expect(memory).toMatchObject({ pending: [], approved: [], removed: [{ id }] });
+  // Unauthenticated callers get nothing.
+  const anonymous = await api(
+    db,
+    "secret",
+    fake.layer,
+  )(new Request("http://127.0.0.1/owner/memory"));
+  expect(anonymous.status).toBe(401);
+});

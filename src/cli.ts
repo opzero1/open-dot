@@ -7,6 +7,15 @@ import { api, spawnRun } from "./api";
 import { deleteArchived } from "./archive";
 import { addObservation, observationTextLimit } from "./ledger";
 import { memoryText } from "./memory";
+import {
+  type Change,
+  changeFact,
+  type FactView,
+  factText,
+  isUUID,
+  ownerMemory,
+  readFact,
+} from "./owner";
 import { avatarPath, iconSizeWarning, setAvatar } from "./avatar";
 import { daemonLoops } from "./daemon";
 import { backupDatabase, claimDaemon, openDatabase, restoreDatabase } from "./db";
@@ -91,6 +100,11 @@ const usage = `Usage:
                                      Delete one archived message from a dot's memory, once you confirm
   open-dot observation add <name> <text>
                                      Add your own observed row, such as a fact you forgot and want back, once you confirm
+  open-dot owner list|show <id>      List the facts about you every dot shares, or show one
+  open-dot owner add                 Add a fact about you, typed at the prompt, once you confirm
+  open-dot owner approve <id> <version> [--edit]
+  open-dot owner edit|reject|delete|restore <id> <version>
+                                     Review a dot's proposal or change a fact, once you confirm; text is typed at the prompt
 
 Forgetting: forget an observed row in the app's Memory view. The observer won't note it again
 from the messages it came from, or with the same text under any topic, but may if you say it again
@@ -144,6 +158,7 @@ if (
     "fresh",
     "archive",
     "observation",
+    "owner",
   ].includes(command ?? "")
 ) {
   console.log(usage);
@@ -417,6 +432,84 @@ const observationAdd = (name: string, given: string) =>
       return Effect.sync(() => console.log("Nothing changed."));
     const added = addObservation(db, dot, text);
     return Effect.sync(() => console.log(`Added observation #${added.id} to ${name}.`));
+  });
+
+const describeFact = (fact: FactView) =>
+  `${fact.id}\t${fact.state}\tversion ${fact.version}\t${fact.origin ? `proposed by ${fact.origin.dot} in ${fact.origin.sessionID} ${fact.origin.messageID}` : "added by you"}${fact.text === null ? "" : `\n  ${JSON.stringify(fact.text)}`}`;
+
+/**
+ * The owner's facts, shared with every dot. Each change needs the version the owner saw and a yes
+ * at a terminal, and its text is typed at the prompt, never taken from the command line.
+ */
+const ownerCommand = (sub: string | undefined, rest: string[]) =>
+  Effect.suspend(() => {
+    if (sub === "list" && rest.length === 0)
+      return Effect.sync(() => {
+        const { pending, approved, removed } = ownerMemory(db);
+        console.log(
+          "Pending proposals are a dot's suggestions, not evidence they're true. Approved facts reach every dot.",
+        );
+        for (const [title, facts] of [
+          ["Pending", pending],
+          ["Approved", approved],
+          ["Rejected or deleted", removed],
+        ] as const)
+          console.log(`${title}:\n${facts.length ? facts.map(describeFact).join("\n") : "(none)"}`);
+      });
+    if (sub === "show" && rest.length === 1) {
+      const fact = isUUID(rest[0]) ? readFact(db, rest[0]) : undefined;
+      return fact
+        ? Effect.sync(() => console.log(describeFact(fact)))
+        : fail("There's no such fact.");
+    }
+    if (!process.stdin.isTTY)
+      return fail(
+        "Run this in a terminal: a fact needs you to type it and confirm it. Nothing changed.",
+      );
+    const id = sub === "add" ? crypto.randomUUID() : rest[0];
+    const version = sub === "add" ? 0 : Number(rest[1]);
+    const editing = sub === "approve" && rest[2] === "--edit";
+    const arity = sub === "add" ? 0 : editing ? 3 : 2;
+    if (
+      !["add", "approve", "edit", "reject", "delete", "restore"].includes(sub ?? "") ||
+      rest.length !== arity ||
+      !isUUID(id) ||
+      !Number.isSafeInteger(version) ||
+      (sub !== "add" && version < 1)
+    )
+      return fail(usage);
+    const current = sub === "add" ? undefined : readFact(db, id);
+    if (sub !== "add" && !current) return fail("There's no such fact.");
+    if (current) console.log(describeFact(current));
+    let text: string | undefined;
+    if (sub === "add" || sub === "edit" || sub === "restore" || editing) {
+      const answer = factText(prompt("The fact's text:") ?? "");
+      if (typeof answer !== "string") return fail(`${answer.invalid} Nothing changed.`);
+      text = answer;
+    }
+    const change: Change =
+      sub === "add"
+        ? { action: "create", text: text ?? "" }
+        : sub === "approve"
+          ? text === undefined
+            ? { action: "approve" }
+            : { action: "approve", text }
+          : sub === "edit" || sub === "restore"
+            ? { action: sub, text: text ?? "" }
+            : { action: sub === "reject" ? "reject" : "delete" };
+    const shown = text ?? current?.text;
+    const question =
+      sub === "reject" || sub === "delete"
+        ? `${sub === "reject" ? "Reject" : "Delete"} this fact? No dot will propose it, or anything else from its message, again.`
+        : `Every dot will see this about you as your own word: ${JSON.stringify(shown)}. Save it?`;
+    if (!confirmed(question)) return Effect.sync(() => console.log("Nothing changed."));
+    const result = changeFact(db, id, version, crypto.randomUUID(), change);
+    if ("saved" in result) return Effect.sync(() => console.log(describeFact(result.saved)));
+    if ("missing" in result) return fail("There's no such fact. Nothing changed.");
+    if ("refused" in result) return fail(result.refused);
+    return fail(
+      `${result.reason} Nothing changed.${result.existing ? ` See ${result.existing.id}.` : ""}`,
+    );
   });
 
 const grantCommand = (sub: string | undefined, rest: string[]) => {
@@ -714,7 +807,9 @@ const program =
                             args[1] &&
                             args[2]
                           ? observationAdd(args[1], args[2])
-                          : Effect.sync(() => console.log(usage));
+                          : command === "owner"
+                            ? ownerCommand(args[0], args.slice(1))
+                            : Effect.sync(() => console.log(usage));
 
 await Effect.runPromise(
   program.pipe(

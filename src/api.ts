@@ -1,3 +1,12 @@
+import {
+  changeFact,
+  type FactOutcome,
+  isUUID,
+  ownerMemory,
+  parseCreate,
+  parsePatch,
+  readFact,
+} from "./owner";
 import { startFresh } from "./fresh";
 import { existsSync } from "node:fs";
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -2617,6 +2626,70 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
   return answer(editReminder(db, dot.name, id, edit.version, edit.change), "reminder");
 };
 
+/**
+ * The owner's facts, shared with every dot: `GET /owner/memory`, and `GET`, `PUT` (create),
+ * `PATCH` (approve, edit, reject, restore) and `DELETE ?version=&mutationID=` on
+ * `/owner/facts/<id>`. No dot can call these; they need no OpenCode and start no turn.
+ */
+const ownerRoute = async (db: Db, request: Request, path: string[]): Promise<Response> => {
+  const { method } = request;
+  if (path.length === 1 && path[0] === "memory" && method === "GET")
+    return Response.json(ownerMemory(db));
+  const [kind, id, ...extra] = path;
+  if (kind !== "facts" || id === undefined || extra.length) return error(404, "Not found");
+  if (!isUUID(id)) return error(404, "There's no such fact.");
+  const outcome = (result: FactOutcome, created = false) => {
+    if ("saved" in result)
+      return Response.json({ fact: result.saved }, { status: created ? 201 : 200 });
+    if ("missing" in result)
+      return error(404, "There's no such fact. It may never have been saved.");
+    if ("refused" in result) return error(422, result.refused);
+    return Response.json(
+      {
+        error: `${result.reason} Nothing was saved.`,
+        current: result.conflict,
+        existing: result.existing ?? null,
+      },
+      { status: 409 },
+    );
+  };
+  if (method === "GET") {
+    const fact = readFact(db, id);
+    return fact ? Response.json({ fact }) : error(404, "There's no such fact.");
+  }
+  if (method === "DELETE") {
+    const query = new URL(request.url).searchParams;
+    const version = query.get("version") ?? "";
+    const mutationID = query.get("mutationID");
+    if (
+      [...query].length !== 2 ||
+      query.getAll("version").length !== 1 ||
+      query.getAll("mutationID").length !== 1 ||
+      !positive.test(version) ||
+      !Number.isSafeInteger(Number(version)) ||
+      !isUUID(mutationID)
+    )
+      return error(400, "Send ?version=<the version you saw>&mutationID=<a new UUID>.");
+    return outcome(changeFact(db, id, Number(version), mutationID, { action: "delete" }));
+  }
+  if (method !== "PUT" && method !== "PATCH") return error(404, "Not found");
+  const body = await messageBody(request, factBodyLimit).catch(() => undefined);
+  if (body instanceof Response) return body;
+  if (method === "PUT") {
+    const create = parseCreate(body);
+    if ("invalid" in create) return error(400, create.invalid);
+    return outcome(
+      changeFact(db, id, 0, create.mutationID, { action: "create", text: create.text }),
+      true,
+    );
+  }
+  const patch = parsePatch(body);
+  if ("invalid" in patch) return error(400, patch.invalid);
+  return outcome(changeFact(db, id, patch.version, patch.mutationID, patch.change));
+};
+// A fact is at most 500 characters; 16 KiB holds any of them with JSON escapes.
+const factBodyLimit = 16 * 1024;
+
 const route = (
   db: Db,
   request: Request,
@@ -3124,6 +3197,11 @@ export const api = (
           500,
           "Couldn't confirm the change to the dot's Slack app. Check its state before trying again.",
         );
+      });
+    if (path[0] === "owner")
+      return ownerRoute(db, request, path.slice(1)).catch((cause) => {
+        console.error(`Owner facts: ${cause instanceof Error ? cause.message : String(cause)}`);
+        return error(500, "Couldn't read or save the owner's facts.");
       });
     if (path[0] === "workers") return workerRoute(db, request, path.slice(1), layer, run);
     if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);
