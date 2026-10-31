@@ -1,15 +1,20 @@
 import { expect, test } from "bun:test";
-import type { FeedItem, Instructions, OwnerFact } from "../bridge";
+import type { FeedItem, Instructions, OwnerFact, RequestCard } from "../bridge";
 import { linkAppID, tokenMatches } from "../slack";
 import {
+  cardDetail,
+  cardsFence,
   changedFields,
   Drafts,
   FeedReplies,
   FeedState,
   Fence,
+  formAnswer,
+  initialValues,
   InstructionsState,
   ownerOrphans,
   Searches,
+  shownFields,
 } from "../surfaces";
 
 const item = (id: number): FeedItem => ({
@@ -424,4 +429,116 @@ test("an owner's unsaved text stays reachable once its fact is rejected, deleted
     { row: "owner:d", factID: "d", state: "deleted" },
     { row: "owner:e", factID: "e", state: "missing" },
   ]);
+});
+
+const card = (change: Partial<RequestCard>): RequestCard => ({
+  id: 1,
+  dot: "alpha",
+  boundSessionID: "ses_bound",
+  source: "worker",
+  worker: 3,
+  sessionID: "ses_worker",
+  title: "Fix it",
+  directory: "/tmp/repo",
+  kind: "question",
+  requestID: "que_1",
+  detail: { kind: "question", title: "Pick", fields: [] },
+  sensitive: false,
+  state: "escalated",
+  reason: null,
+  needsYou: true,
+  revision: "r1",
+  actionable: true,
+  attempt: null,
+  createdAt: 1,
+  escalatedAt: 1,
+  ...change,
+});
+const question = (fields: unknown[]) =>
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- untrusted daemon data on purpose
+  card({ detail: { kind: "question", title: "Pick", fields } as RequestCard["detail"] });
+
+test("a request the app can't render exactly, or that may hold a secret, only opens in its terminal", () => {
+  const unsupported = [
+    question([{ key: "name", type: "string", pattern: "^a+$" }]),
+    question([{ key: "mail", type: "string", format: "email" }]),
+    question([{ key: "file", type: "upload" }]),
+    question([
+      { key: "a", type: "boolean" },
+      { key: "a", type: "boolean" },
+    ]),
+    question([]),
+    card({ sensitive: true, detail: { kind: "question", title: "Token", fields: [] } }),
+    card({ kind: "permission", detail: { kind: "question", title: "Pick", fields: [] } }),
+  ];
+  for (const each of unsupported) expect(cardDetail(each).kind).toBe("unsupported");
+  expect(
+    cardDetail(
+      card({
+        kind: "permission",
+        detail: { kind: "permission", action: "bash", resources: ["rm -rf x"], save: ["rm *"] },
+      }),
+    ),
+  ).toEqual({ kind: "permission", action: "bash", resources: ["rm -rf x"], save: ["rm *"] });
+});
+
+test("a form answers active fields only, hidden ones by default, and checks required and options", () => {
+  const detail = cardDetail(
+    question([
+      {
+        key: "mode",
+        type: "string",
+        options: [
+          { value: "a", label: "A" },
+          { value: "b", label: "B" },
+        ],
+        required: true,
+      },
+      { key: "why", type: "string", required: true, when: [{ key: "mode", op: "eq", value: "b" }] },
+      {
+        key: "skip",
+        type: "boolean",
+        when: [{ key: "mode", op: "neq", value: "a" }],
+        default: true,
+      },
+      { key: "trace", type: "string", hidden: true, default: "t1" },
+      { key: "tags", type: "multiselect", options: [{ value: "x", label: "X" }], custom: true },
+      { key: "count", type: "integer", minimum: 1, maximum: 3 },
+    ]),
+  );
+  if (detail.kind !== "question") throw new Error("expected a question");
+  const values = initialValues(detail.fields);
+  expect(formAnswer(detail.fields, values)).toEqual({ error: "mode needs an answer." });
+  expect(shownFields(detail.fields, { ...values, mode: "a" }).map((field) => field.key)).toEqual([
+    "mode",
+    "tags",
+    "count",
+  ]);
+  expect(formAnswer(detail.fields, { ...values, mode: "a", tags: ["x", "own"] })).toEqual({
+    answer: { mode: "a", trace: "t1", tags: ["x", "own"] },
+  });
+  expect(formAnswer(detail.fields, { ...values, mode: "b" })).toEqual({
+    error: "why needs an answer.",
+  });
+  expect(formAnswer(detail.fields, { ...values, mode: "b", why: "because" })).toEqual({
+    answer: { mode: "b", why: "because", skip: true, trace: "t1" },
+  });
+  expect(formAnswer(detail.fields, { ...values, mode: "c" })).toEqual({
+    error: "mode must be one of its options.",
+  });
+  expect(formAnswer(detail.fields, { ...values, mode: "a", count: 1.5 })).toEqual({
+    error: "count needs a whole number.",
+  });
+  expect(formAnswer(detail.fields, { ...values, mode: "a", count: 4 })).toEqual({
+    error: "count is out of range.",
+  });
+});
+
+test("a card read begun before a newer one landed is dropped", () => {
+  const fence = cardsFence();
+  const slow = fence.begin();
+  const fast = fence.begin();
+  expect(fence.land(fast)).toBe(true);
+  expect(fence.land(slow)).toBe(false);
+  expect(fence.land(fence.begin())).toBe(true);
 });

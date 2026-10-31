@@ -8,8 +8,10 @@ import type {
   MemoryResponsibility,
   NoteSourceRead,
   OwnerMemory,
+  OwnerAnswer,
   OwnerMutation,
   ReceiptStatus,
+  RequestCard,
   Reply,
   RequestAudit,
   RunView,
@@ -960,3 +962,322 @@ export const ownerActionWords: Record<OwnerMutation["action"], string> = {
   reject: "Rejecting a suggestion",
   delete: "Deleting a fact",
 };
+
+// Request cards: the daemon's pending requests, read as untrusted data. Anything the app can't
+// render exactly falls back to Open in terminal rather than a guessed answer.
+
+export interface FormOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+interface FieldBase {
+  key: string;
+  title?: string;
+  description?: string;
+  required: boolean;
+  hidden: boolean;
+  when: { key: string; op: "eq" | "neq"; value: string | number | boolean }[];
+}
+
+export type FormField = FieldBase &
+  (
+    | {
+        type: "string";
+        options?: FormOption[];
+        custom: boolean;
+        minLength?: number;
+        maxLength?: number;
+        placeholder?: string;
+        default?: string;
+      }
+    | { type: "number"; minimum?: number; maximum?: number; default?: number }
+    | { type: "integer"; minimum?: number; maximum?: number; default?: number }
+    | { type: "boolean"; default?: boolean }
+    | {
+        type: "multiselect";
+        options: FormOption[];
+        custom: boolean;
+        minItems?: number;
+        maxItems?: number;
+        default?: string[];
+      }
+  );
+
+export type CardDetail =
+  | {
+      kind: "permission";
+      action: string;
+      resources: string[];
+      message?: string;
+      save: string[];
+    }
+  | { kind: "question"; title: string; fields: FormField[] }
+  | { kind: "unsupported" };
+
+const record = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const strings = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === "string");
+const optionalString = (value: unknown) => value === undefined || typeof value === "string";
+const finite = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+const optionalNumber = (value: unknown) => value === undefined || finite(value);
+
+const options = (value: unknown): FormOption[] | undefined =>
+  Array.isArray(value) &&
+  value.every(
+    (item) =>
+      record(item) &&
+      typeof item.value === "string" &&
+      typeof item.label === "string" &&
+      optionalString(item.description),
+  )
+    ? value.map((item: Record<string, string>) => ({
+        value: item.value ?? "",
+        label: item.label ?? "",
+        ...(item.description === undefined ? {} : { description: item.description }),
+      }))
+    : undefined;
+
+const whenCondition = (item: unknown): FieldBase["when"][number] | undefined =>
+  record(item) &&
+  typeof item.key === "string" &&
+  (item.op === "eq" || item.op === "neq") &&
+  (typeof item.value === "string" || finite(item.value) || typeof item.value === "boolean")
+    ? { key: item.key, op: item.op, value: item.value }
+    : undefined;
+
+const field = (value: unknown): FormField | undefined => {
+  if (!record(value) || typeof value.key !== "string" || !value.key) return undefined;
+  if (!optionalString(value.title) || !optionalString(value.description)) return undefined;
+  const conditions: unknown = value.when ?? [];
+  if (!Array.isArray(conditions)) return undefined;
+  const parsed = conditions.map(whenCondition);
+  if (!parsed.every((item) => item !== undefined)) return undefined;
+  const base: FieldBase = {
+    key: value.key,
+    ...(typeof value.title === "string" ? { title: value.title } : {}),
+    ...(typeof value.description === "string" ? { description: value.description } : {}),
+    required: value.required === true,
+    hidden: value.hidden === true,
+    when: parsed,
+  };
+  if (value.type === "string") {
+    const listed = value.options === undefined ? undefined : options(value.options);
+    if (value.options !== undefined && !listed) return undefined;
+    if (
+      !optionalNumber(value.minLength) ||
+      !optionalNumber(value.maxLength) ||
+      !optionalString(value.placeholder) ||
+      !optionalString(value.default) ||
+      // A pattern or format the app can't check exactly goes to the terminal.
+      value.pattern !== undefined ||
+      value.format !== undefined
+    )
+      return undefined;
+    return {
+      ...base,
+      type: "string",
+      ...(listed ? { options: listed } : {}),
+      custom: value.custom === true,
+      ...(finite(value.minLength) ? { minLength: value.minLength } : {}),
+      ...(finite(value.maxLength) ? { maxLength: value.maxLength } : {}),
+      ...(typeof value.placeholder === "string" ? { placeholder: value.placeholder } : {}),
+      ...(typeof value.default === "string" ? { default: value.default } : {}),
+    };
+  }
+  if (value.type === "number" || value.type === "integer") {
+    if (
+      !optionalNumber(value.minimum) ||
+      !optionalNumber(value.maximum) ||
+      !optionalNumber(value.default)
+    )
+      return undefined;
+    const limits = {
+      ...(finite(value.minimum) ? { minimum: value.minimum } : {}),
+      ...(finite(value.maximum) ? { maximum: value.maximum } : {}),
+      ...(finite(value.default) ? { default: value.default } : {}),
+    };
+    return value.type === "number"
+      ? { ...base, type: "number", ...limits }
+      : { ...base, type: "integer", ...limits };
+  }
+  if (value.type === "boolean") {
+    if (value.default !== undefined && typeof value.default !== "boolean") return undefined;
+    return {
+      ...base,
+      type: "boolean",
+      ...(typeof value.default === "boolean" ? { default: value.default } : {}),
+    };
+  }
+  if (value.type === "multiselect") {
+    const listed = options(value.options);
+    if (
+      !listed ||
+      !optionalNumber(value.minItems) ||
+      !optionalNumber(value.maxItems) ||
+      (value.default !== undefined && !strings(value.default))
+    )
+      return undefined;
+    return {
+      ...base,
+      type: "multiselect",
+      options: listed,
+      custom: value.custom === true,
+      ...(finite(value.minItems) ? { minItems: value.minItems } : {}),
+      ...(finite(value.maxItems) ? { maxItems: value.maxItems } : {}),
+      ...(strings(value.default) ? { default: value.default } : {}),
+    };
+  }
+  return undefined;
+};
+
+/** What a card shows, checked field by field; anything else is unsupported. */
+export const cardDetail = (card: RequestCard): CardDetail => {
+  const detail: unknown = card.detail;
+  if (card.sensitive || !record(detail)) return { kind: "unsupported" };
+  if (card.kind === "permission" && detail.kind === "permission") {
+    if (
+      typeof detail.action !== "string" ||
+      !strings(detail.resources) ||
+      !optionalString(detail.message) ||
+      (detail.save !== undefined && !strings(detail.save))
+    )
+      return { kind: "unsupported" };
+    return {
+      kind: "permission",
+      action: detail.action,
+      resources: detail.resources,
+      ...(typeof detail.message === "string" ? { message: detail.message } : {}),
+      save: strings(detail.save) ? detail.save : [],
+    };
+  }
+  if (card.kind === "question" && detail.kind === "question") {
+    if (typeof detail.title !== "string" || !Array.isArray(detail.fields) || !detail.fields.length)
+      return { kind: "unsupported" };
+    const fields = detail.fields.map(field);
+    if (!fields.every((item) => item !== undefined)) return { kind: "unsupported" };
+    const keys = new Set(fields.map((item) => item.key));
+    if (keys.size !== fields.length) return { kind: "unsupported" };
+    return { kind: "question", title: detail.title, fields };
+  }
+  return { kind: "unsupported" };
+};
+
+export type FormValue = string | number | boolean | string[];
+export type FormValues = Record<string, FormValue | undefined>;
+
+/** The form's starting values: each field's default. */
+export const initialValues = (fields: readonly FormField[]): FormValues =>
+  Object.fromEntries(
+    fields.flatMap((item) => (item.default === undefined ? [] : [[item.key, item.default]])),
+  );
+
+/** A field applies while every `when` condition holds against the values now. */
+export const fieldActive = (item: FormField, values: FormValues) =>
+  item.when.every((condition) => {
+    const value = values[condition.key];
+    const equal = !Array.isArray(value) && value === condition.value;
+    return condition.op === "eq" ? equal : !equal;
+  });
+
+/** Fields the owner sees: active and not hidden. */
+export const shownFields = (fields: readonly FormField[], values: FormValues) =>
+  fields.filter((item) => !item.hidden && fieldActive(item, values));
+
+/**
+ * The whole form's answer, keyed by field: active fields' values, hidden ones by their default,
+ * blanks left out, or why it can't be sent yet.
+ */
+export const formAnswer = (
+  fields: readonly FormField[],
+  values: FormValues,
+): { answer: Record<string, FormValue> } | { error: string } => {
+  const answer: Record<string, FormValue> = {};
+  for (const item of fields) {
+    if (!fieldActive(item, values)) continue;
+    const value = item.hidden ? item.default : values[item.key];
+    const name = item.title ?? item.key;
+    const blank =
+      value === undefined || value === "" || (Array.isArray(value) && value.length === 0);
+    if (blank) {
+      if (item.required) return { error: `${name} needs an answer.` };
+      continue;
+    }
+    if (item.type === "string") {
+      if (typeof value !== "string") return { error: `${name} needs text.` };
+      if (item.options && !item.custom && !item.options.some((option) => option.value === value))
+        return { error: `${name} must be one of its options.` };
+      if (
+        (item.minLength !== undefined && value.length < item.minLength) ||
+        (item.maxLength !== undefined && value.length > item.maxLength)
+      )
+        return { error: `${name} has the wrong length.` };
+    } else if (item.type === "number" || item.type === "integer") {
+      if (typeof value !== "number" || !Number.isFinite(value))
+        return { error: `${name} needs a number.` };
+      if (item.type === "integer" && !Number.isInteger(value))
+        return { error: `${name} needs a whole number.` };
+      if (
+        (item.minimum !== undefined && value < item.minimum) ||
+        (item.maximum !== undefined && value > item.maximum)
+      )
+        return { error: `${name} is out of range.` };
+    } else if (item.type === "boolean") {
+      if (typeof value !== "boolean") return { error: `${name} needs yes or no.` };
+    } else if (item.type === "multiselect") {
+      if (!Array.isArray(value)) return { error: `${name} needs choices.` };
+      if (!item.custom && !value.every((choice) => item.options.some((o) => o.value === choice)))
+        return { error: `${name} must use its options.` };
+      if (
+        (item.minItems !== undefined && value.length < item.minItems) ||
+        (item.maxItems !== undefined && value.length > item.maxItems)
+      )
+        return { error: `${name} has the wrong number of choices.` };
+    } else return { error: `${name} can't be answered here.` };
+    answer[item.key] = value;
+  }
+  return { answer };
+};
+
+/** Where a request came from, in a few words. */
+export const cardOrigin = (card: RequestCard) =>
+  card.source === "dot"
+    ? `${card.dot} itself`
+    : card.source === "worker"
+      ? `${card.dot}'s worker #${card.worker ?? "?"}`
+      : `${card.dot}'s Threads worker`;
+
+/** What the card says about an answer already on its way or lost. */
+export const cardStatus = (card: RequestCard): string | null => {
+  if (card.sensitive)
+    return "It may ask for a secret, so open-dot kept none of its words. Answer it in its terminal.";
+  if (card.state === "unknown")
+    return "open-dot sent an answer but OpenCode didn't confirm it, so it won't be sent again. Check it in its terminal.";
+  if (card.state === "queued" || card.state === "answering") return "Sending your answer…";
+  if (card.attempt?.actor === "owner" && card.attempt.state === "refused" && card.reason)
+    return `Not sent: ${card.reason}`;
+  return null;
+};
+
+/**
+ * The cards to show from successive reads: a read started before a later one that already
+ * landed is dropped, so a slow poll never brings back a card a newer read removed.
+ */
+export const cardsFence = () => {
+  let started = 0;
+  let landed = 0;
+  return {
+    begin: () => ++started,
+    land: (generation: number) => {
+      if (generation <= landed) return false;
+      landed = generation;
+      return true;
+    },
+  };
+};
+
+/** The answer the owner chose on a card, as main posts it. */
+export type CardAnswer = { answer: OwnerAnswer; confirmedAlways: boolean };

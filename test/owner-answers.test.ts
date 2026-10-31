@@ -1,6 +1,9 @@
 import { beforeEach, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
+import type { RequestCard } from "../app/bridge";
+import { fits, shapes } from "../app/decode";
+import { cardDetail, formAnswer, initialValues } from "../app/surfaces";
 import { api } from "../src/api";
 import { answerAll, settleRequests, watchOwn } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
@@ -115,8 +118,17 @@ test("the dot's own permission request becomes the owner's card, counted once, a
   expect(dotsView.find((dot) => dot.name === "jojo")?.sessions).toMatchObject([
     { source: "dot", needs: ["permission"] },
   ]);
-  const [card] = (await pending()).requests;
-  expect(card).toMatchObject({ dot: "jojo", source: "dot", actionable: true, state: "escalated" });
+  // What the daemon answers fits what main lets through to the app.
+  const page = await pending();
+  expect(fits(page, shapes.pendingRequests)).toBe(true);
+  const [card] = page.requests;
+  expect(card).toMatchObject({
+    dot: "jojo",
+    source: "dot",
+    actionable: true,
+    state: "escalated",
+    boundSessionID: "ses_jojo",
+  });
   if (!card) throw new Error("no card");
   const attemptID = crypto.randomUUID();
   const body = {
@@ -127,6 +139,7 @@ test("the dot's own permission request becomes the owner's card, counted once, a
   };
   const first = await call(`/dots/jojo/requests/${card.id}/answer`, { method: "POST", body });
   expect(first.status).toBe(202);
+  expect(fits(await first.json(), shapes.answerRequest)).toBe(true);
   // A double click or a second window: the same attempt answers its receipt, another conflicts.
   const again = await call(`/dots/jojo/requests/${card.id}/answer`, { method: "POST", body });
   expect(again.status).toBe(202);
@@ -140,6 +153,7 @@ test("the dot's own permission request becomes the owner's card, counted once, a
   const receipt = (await (await call(`/dots/jojo/requests/${card.id}`)).json()) as {
     attempts: { id: string; actor: string; state: string; confirmedAt: number | null }[];
   };
+  expect(fits(receipt, shapes.requestReceipt)).toBe(true);
   expect(receipt.attempts).toMatchObject([{ id: attemptID, actor: "owner", state: "confirmed" }]);
   await own();
   expect((await pending()).requests).toEqual([]);
@@ -163,7 +177,19 @@ test("a question takes the owner's whole form: a choice, several choices and typ
   });
   expect(leaked.status).toBe(422);
   expect(await leaked.text()).not.toContain("ghp_");
-  const reply = { branch: "release/1.0", targets: ["mac", "linux"], note: "Ship it" };
+  // The app reads the real card's form and builds the whole answer from what the owner chose.
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the daemon's answer, as main passes it
+  const detail = cardDetail(first as unknown as RequestCard);
+  if (detail.kind !== "question") throw new Error("the app can't render the form");
+  const built = formAnswer(detail.fields, {
+    ...initialValues(detail.fields),
+    branch: "release/1.0",
+    targets: ["mac", "linux"],
+    note: "Ship it",
+  });
+  if (!("answer" in built)) throw new Error(built.error);
+  const reply = built.answer;
+  expect(reply).toEqual({ branch: "release/1.0", targets: ["mac", "linux"], note: "Ship it" });
   expect((await post(first, { answer: { decision: "reply", answer: reply } })).status).toBe(202);
   expect((await post(second, { answer: { decision: "cancel" } })).status).toBe(202);
   await answer();

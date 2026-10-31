@@ -239,6 +239,39 @@ const surfaces = () => ({
     },
   ],
   calls: [] as Call[],
+  // Request cards waiting for the owner, and the answers the app posted.
+  requests: [] as ReturnType<typeof requestCard>[],
+  answers: [] as { id: number; body: unknown }[],
+  opened: [] as number[],
+});
+
+const requestCard = (id: number, change: Record<string, unknown> = {}) => ({
+  id,
+  dot: "jojo",
+  boundSessionID: "ses_jojo",
+  source: "dot",
+  worker: null as number | null,
+  sessionID: "ses_jojo",
+  title: "jojo",
+  directory: "/dots/jojo",
+  kind: "permission",
+  requestID: `per_${id}`,
+  detail: {
+    kind: "permission",
+    action: "bash",
+    resources: ["<b>rm -rf build</b>"],
+    save: ["rm *"],
+  } as Record<string, unknown>,
+  sensitive: false,
+  state: "escalated",
+  reason: null,
+  needsYou: true,
+  revision: `rev_${id}`,
+  actionable: true,
+  attempt: null,
+  createdAt: now,
+  escalatedAt: now,
+  ...change,
 });
 
 const worker = (id: number, state: string, needs: string[] = []) => ({
@@ -680,6 +713,35 @@ class FakeDaemon {
         return json({ ok: true });
       }
       return json({ fact: saved });
+    }
+    if (path === "/requests/pending")
+      return json({
+        requests: d.requests.filter(
+          (card) => !url.searchParams.get("dot") || card.dot === url.searchParams.get("dot"),
+        ),
+        next: null,
+      });
+    const opening = /^\/requests\/(\d+)\/open$/.exec(path)?.[1];
+    if (opening && method === "POST") {
+      d.opened.push(Number(opening));
+      return json({ opened: true });
+    }
+    const answering = /^\/dots\/\w+\/requests\/(\d+)\/answer$/.exec(path)?.[1];
+    if (answering && method === "POST") {
+      // As the daemon does: the answer is queued, and the card leaves the owner's list.
+      const card = d.requests.find((item) => item.id === Number(answering));
+      if (!card) return json({ error: "There's no such request." }, 404);
+      d.answers.push({ id: card.id, body });
+      d.requests = d.requests.filter((item) => item !== card);
+      const attemptID = (body as { attemptID: string }).attemptID;
+      return json(
+        {
+          attemptID,
+          request: { ...card, state: "queued", actionable: false },
+          attempts: [{ id: attemptID, actor: "owner", state: "queued", queuedAt: now }],
+        },
+        202,
+      );
     }
     if (path === "/feed") return json({ items: d.feed, remaining: 0, handedOff: d.handedOff });
     if (path === "/feed/dismiss") {
@@ -3728,3 +3790,118 @@ test("About you: text typed for a fact rejected or deleted before or during its 
     },
   );
 }, 170_000);
+
+test("request cards: answered from the chat and Needs you, Always only after its confirmation, and a sensitive one only in its terminal", async () => {
+  await scenario(
+    "requests",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+      fake.data.requests = [
+        requestCard(1),
+        requestCard(2, {
+          source: "worker",
+          worker: 3,
+          sessionID: "ses_w3",
+          title: "Fix the build",
+          kind: "question",
+          requestID: "que_2",
+          detail: {
+            kind: "question",
+            title: "Which branch?",
+            fields: [
+              {
+                key: "branch",
+                type: "string",
+                required: true,
+                options: [
+                  { value: "main", label: "Main" },
+                  { value: "dev", label: "Dev" },
+                ],
+              },
+              { key: "note", type: "string" },
+            ],
+          },
+        }),
+        requestCard(3, {
+          kind: "question",
+          requestID: "que_3",
+          sensitive: true,
+          detail: { kind: "question", title: "", fields: [] },
+        }),
+        requestCard(4),
+      ];
+    },
+    async ({ fake, js, until, press }) => {
+      // The chat shows jojo's cards under its header, with untrusted text as text.
+      await until(`document.querySelectorAll("[data-request]").length === 4`, "four cards");
+      expect(await js(`!!document.querySelector('[data-request="1"] code b')`)).toBe(false);
+      expect(await js(`document.querySelector('[data-request="1"] code').textContent`)).toBe(
+        "<b>rm -rf build</b>",
+      );
+      expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
+        "Needs you (4)",
+      );
+      // A sensitive card offers only its terminal.
+      expect(
+        await js(
+          `[...document.querySelectorAll('[data-request="3"] button')].map((b) => b.textContent)`,
+        ),
+      ).toEqual(["Open in terminal"]);
+      await press('[data-request="3"]', "Open in terminal");
+      for (let tick = 0; tick < 50 && !fake.data.opened.length; tick++) await delay(100);
+      expect(fake.data.opened).toEqual([3]);
+      // Allow once sends one answer, even clicked twice.
+      await js(
+        `(() => { const b = t.button("Allow once", document.querySelector('[data-request="1"]')); b.click(); b.click(); return true; })()`,
+      );
+      await until(`!document.querySelector('[data-request="1"]')`, "the answered card to go");
+      expect(fake.data.answers).toHaveLength(1);
+      expect(fake.data.answers[0]).toMatchObject({
+        id: 1,
+        body: { boundSessionID: "ses_jojo", revision: "rev_1", answer: { decision: "once" } },
+      });
+      // Always asks first, with Cancel first: Cancel sends nothing, then Always allow sends.
+      await press('[data-request="4"]', "Always…");
+      await until(
+        `document.querySelector("[role=alertdialog]")?.innerText.includes("rm *")`,
+        "the Always confirmation",
+      );
+      expect(
+        await js(
+          `[...document.querySelectorAll("[role=alertdialog] button")].map((b) => b.textContent)`,
+        ),
+      ).toEqual(["Cancel", "Always allow"]);
+      await press("[role=alertdialog]", "Cancel");
+      await delay(300);
+      expect(fake.data.answers).toHaveLength(1);
+      await press('[data-request="4"]', "Always…");
+      await press("[role=alertdialog]", "Always allow");
+      await until(`!document.querySelector('[data-request="4"]')`, "the Always card to go");
+      expect(fake.data.answers[1]).toMatchObject({
+        id: 4,
+        body: { revision: "rev_4", answer: { decision: "always" }, confirmedAlways: true },
+      });
+      // Needs you lists the worker's question; Submit sends the whole form once it's complete.
+      await js(`document.querySelector("[data-open-needs]").click(), true`);
+      await until(`!!document.querySelector('[data-needs-pane] [data-request="2"]')`, "Needs you");
+      await press('[data-request="2"]', "Submit");
+      await until(
+        `document.querySelector('[data-request="2"] [role=alert]')?.textContent === "branch needs an answer."`,
+        "the required field's note",
+      );
+      expect(fake.data.answers).toHaveLength(2);
+      await js(
+        `[...document.querySelectorAll('[data-request="2"] label')].find((l) => l.textContent.trim() === "Dev").querySelector("input").click(), true`,
+      );
+      await press('[data-request="2"]', "Submit");
+      await until(`!document.querySelector('[data-request="2"]')`, "the answered question to go");
+      expect(fake.data.answers[2]).toMatchObject({
+        id: 2,
+        body: { answer: { decision: "reply", answer: { branch: "dev" } } },
+      });
+      // Escape goes back to the chat.
+      await js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })), true`);
+      await until(`!document.querySelector("[data-needs-pane]") && !!t.box()`, "the chat");
+    },
+  );
+});

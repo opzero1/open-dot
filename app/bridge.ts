@@ -679,6 +679,79 @@ export type OwnerAction = "create" | "approve" | "edit" | "reject" | "delete";
  * An owner fact change main saved before sending it: only IDs, the action and the version it was
  * made at, never the text. One still listed may or may not have landed.
  */
+/** A permission request or question waiting for the owner, as the app shows it as a card. */
+export interface RequestCard {
+  id: number;
+  dot: string;
+  boundSessionID: string | null;
+  source: "worker" | "threads" | "dot";
+  worker: number | null;
+  sessionID: string;
+  title: string;
+  directory: string;
+  kind: RequestKind;
+  requestID: string;
+  detail: RequestCardDetail;
+  sensitive: boolean;
+  state: string;
+  reason: string | null;
+  needsYou: boolean;
+  revision: string;
+  actionable: boolean;
+  attempt: { id: string; actor: "dot" | "owner"; state: string; error: string | null } | null;
+  createdAt: number;
+  escalatedAt: number | null;
+}
+
+export type RequestCardDetail =
+  | {
+      kind: "permission";
+      action: string;
+      resources: string[];
+      message?: string;
+      save?: string[];
+    }
+  | { kind: "question"; title: string; fields: Record<string, unknown>[] };
+
+export interface PendingPage {
+  requests: RequestCard[];
+  next: number | null;
+}
+
+export interface AttemptView {
+  id: string;
+  actor: "dot" | "owner";
+  state: string;
+  error: string | null;
+  queuedAt: number;
+  attemptedAt: number | null;
+  confirmedAt: number | null;
+}
+
+export interface RequestReceipt {
+  request: RequestCard;
+  attempts: AttemptView[];
+}
+
+/** The owner's answer, as the renderer asks main to send it once. */
+export type OwnerAnswer =
+  | { decision: "once" | "always" }
+  | { decision: "reject"; message?: string }
+  | { decision: "reply"; answer: Record<string, string | number | boolean | string[]> }
+  | { decision: "cancel" };
+
+/**
+ * An answer main saved before posting it: IDs only, never its words. One whose outcome was lost is
+ * read back by its receipt, never posted again.
+ */
+export interface AnswerRecord {
+  attemptID: string;
+  dot: string;
+  request: number;
+  sessionID: string;
+  createdAt: number;
+}
+
 export interface OwnerMutation {
   factID: string;
   mutationID: string;
@@ -716,6 +789,25 @@ export interface Operations {
   archiveStatus: [[dot: string], ArchiveStatus];
   runs: [[dot: string, responsibility: number, before: number | null], RunPage];
   requests: [[dot: string, before: number | null], RequestPage];
+  /** The requests waiting for the owner, one dot's or every dot's, a page after `after`. */
+  pendingRequests: [[dot: string | null, after: number | null], PendingPage];
+  requestReceipt: [[dot: string, id: number], RequestReceipt];
+  /** Main chooses the attempt ID and saves it first, then posts the answer once. */
+  answerRequest: [
+    [
+      dot: string,
+      id: number,
+      sessionID: string,
+      revision: string,
+      answer: OwnerAnswer,
+      confirmedAlways: boolean,
+    ],
+    RequestReceipt & { attemptID: string },
+  ];
+  /** Saved answers whose outcome main hasn't seen, outside any still being posted. */
+  answerRecords: [[], AnswerRecord[]];
+  /** Drops a saved answer once its receipt shows the outcome, or the owner stops tracking it. */
+  answerSettle: [[attemptID: string], true];
   addNote: [[dot: string, text: string], unknown];
   editNote: [[dot: string, id: number, version: number, text: string], unknown];
   deleteNote: [[dot: string, id: number, version: number], true];

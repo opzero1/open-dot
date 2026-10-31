@@ -39,6 +39,7 @@ import { request as httpRequest } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import {
+  type AnswerRecord,
   type AppEvent,
   type Attempt,
   type Bytes,
@@ -535,6 +536,110 @@ const changeOwnerFact = async (args: unknown[]): Promise<Reply<unknown>> => {
   }
 };
 
+// Owner answers to permission requests and questions: like a send, only the attempt, request, dot
+// and session IDs are saved before the POST, never the answer's words. One whose outcome is lost
+// stays saved until the renderer reads its receipt; it is never posted again.
+
+const answersFile = () => join(app.getPath("userData"), "answers.json");
+// Attempts whose POST is still out, which the renderer doesn't reconcile yet.
+const answerPosting = new Set<string>();
+// One answer at a time per request in this app, whatever the renderer asks.
+const answering = new Set<string>();
+
+const isAnswerRecord = (value: unknown): value is AnswerRecord =>
+  isRecord(value) &&
+  isUUID(value.attemptID) &&
+  isName(value.dot) &&
+  isID(value.request) &&
+  isName(value.sessionID) &&
+  typeof value.createdAt === "number";
+
+const readAnswerRecords = (): AnswerRecord[] => {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(answersFile(), "utf8"));
+    return Array.isArray(parsed) ? parsed.filter(isAnswerRecord) : [];
+  } catch {
+    return [];
+  }
+};
+
+/** Drops a saved answer; best effort, since a leftover one is only read back again. */
+const settleAnswer = (attemptID: string) => {
+  try {
+    const kept = readAnswerRecords();
+    if (kept.some((record) => record.attemptID === attemptID))
+      writeRecord(
+        answersFile(),
+        kept.filter((record) => record.attemptID !== attemptID),
+      );
+  } catch {}
+};
+
+const isAnswerShape = (value: unknown) => {
+  if (!isRecord(value) || Array.isArray(value)) return false;
+  const size = JSON.stringify(value).length;
+  return size <= 60_000 && typeof value.decision === "string";
+};
+
+/**
+ * The owner's answer, posted once: its attempt ID is chosen and saved first, so a lost answer is
+ * read back by it. A second answer to the same request while one is out is refused here; the
+ * daemon refuses one from another window.
+ */
+const answerRequest = async (args: unknown[]): Promise<Reply<unknown>> => {
+  const [dot, id, sessionID, revision, answer, confirmedAlways] = args;
+  if (
+    !isName(dot) ||
+    !isID(id) ||
+    !isName(sessionID) ||
+    !isText(revision, 64) ||
+    !isAnswerShape(answer) ||
+    typeof confirmedAlways !== "boolean"
+  )
+    return { ok: false, error: "That request isn't valid." };
+  const key = `${dot}/${id}`;
+  if (answering.has(key)) return { ok: false, error: "An answer to it is already on its way." };
+  if (readAnswerRecords().some((record) => record.dot === dot && record.request === id))
+    return { ok: false, error: "An earlier answer to it hasn't been confirmed yet." };
+  const record: AnswerRecord = {
+    attemptID: randomUUID(),
+    dot,
+    request: id,
+    sessionID,
+    createdAt: Date.now(),
+  };
+  answering.add(key);
+  try {
+    try {
+      writeRecord(answersFile(), [...readAnswerRecords(), record]);
+    } catch {
+      return { ok: false, error: "Couldn't save the answer's ID first, so nothing was sent." };
+    }
+    answerPosting.add(record.attemptID);
+    try {
+      const result = decoded(
+        "answerRequest",
+        "POST",
+        await reply("POST", `/dots/${segment(dot)}/requests/${id}/answer`, {
+          attemptID: record.attemptID,
+          boundSessionID: sessionID,
+          revision,
+          answer,
+          ...(confirmedAlways ? { confirmedAlways: true } : {}),
+        }),
+      );
+      // A refusal is definite; a lost answer or a server failure may have been saved.
+      if (result.ok || (!result.lost && (result.status ?? 500) < 500))
+        settleAnswer(record.attemptID);
+      return result;
+    } finally {
+      answerPosting.delete(record.attemptID);
+    }
+  } finally {
+    answering.delete(key);
+  }
+};
+
 const validImage = (image: unknown): image is DraftImage => {
   if (!isRecord(image)) return false;
   const { mime, name, data } = image;
@@ -1013,6 +1118,16 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
       return { method: "GET", path: "/owner/memory" };
     case "ownerFact":
       return isUUID(dot) ? { method: "GET", path: `/owner/facts/${dot}` } : undefined;
+    case "pendingRequests": {
+      const query = [
+        ...(isName(dot) ? [`dot=${segment(dot)}`] : dot === null ? [] : ["!"]),
+        ...(isID(a) ? [`after=${a}`] : a === null ? [] : ["!"]),
+        "limit=100",
+      ];
+      return query.includes("!")
+        ? undefined
+        : { method: "GET", path: `/requests/pending?${query.join("&")}` };
+    }
     case "slackLogin":
       return { method: "POST", path: "/slack/login", body: {}, timeout: 30_000 };
   }
@@ -1207,6 +1322,8 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
             path: `${base}/messages/${segment(a)}/tools/${segment(c)}?sessionID=${segment(b)}`,
           }
         : undefined;
+    case "requestReceipt":
+      return isID(a) ? { method: "GET", path: `${base}/requests/${a}` } : undefined;
     case "fresh":
       return typeof a === "boolean"
         ? {
@@ -1275,6 +1392,11 @@ const operationNames = new Set<string>([
   "activity",
   "work",
   "toolDetail",
+  "pendingRequests",
+  "requestReceipt",
+  "answerRequest",
+  "answerRecords",
+  "answerSettle",
 ] satisfies Operation[]);
 
 const isOperation = (value: unknown): value is Operation =>
@@ -1287,6 +1409,18 @@ const readFlights = new Map<string, Promise<Reply<unknown>>>();
 const operate = (op: unknown, ...args: unknown[]): Promise<Reply<unknown>> | Reply<unknown> => {
   if (!isOperation(op)) return { ok: false, error: "That isn't something the app does." };
   if (op === "ownerChange") return changeOwnerFact(args);
+  if (op === "answerRequest") return answerRequest(args);
+  if (op === "answerRecords")
+    return {
+      ok: true,
+      value: readAnswerRecords().filter((record) => !answerPosting.has(record.attemptID)),
+    };
+  if (op === "answerSettle") {
+    if (!isUUID(args[0]) || answerPosting.has(args[0]))
+      return { ok: false, error: "That request isn't valid." };
+    settleAnswer(args[0]);
+    return { ok: true, value: true };
+  }
   if (op === "ownerMutations")
     return {
       ok: true,

@@ -1348,3 +1348,95 @@ button:disabled {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/* Request cards: in a dot's chat and in Needs you. */
+.needs-pane {
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.request-list {
+  flex: none;
+  max-height: 45vh;
+  overflow-y: auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #8884);
+}
+
+.needs-pane .request-list {
+  max-height: none;
+  border-bottom: none;
+}
+
+.request-heading {
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+
+.request-card {
+  border: 1px solid var(--border, #8884);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.request-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.request-kind {
+  font-weight: 600;
+}
+
+.request-origin,
+.request-directory,
+.request-description,
+.request-more,
+.request-empty {
+  opacity: 0.75;
+  font-size: 12px;
+}
+
+.request-resources {
+  margin: 4px 0;
+  padding-left: 18px;
+}
+
+.request-resources code,
+.request-save code {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.request-form {
+  border: none;
+  padding: 0;
+  margin: 4px 0;
+}
+
+.request-field {
+  margin: 6px 0;
+}
+
+.request-field label {
+  display: block;
+}
+
+.request-label {
+  display: block;
+  font-weight: 500;
+}
+
+.request-status {
+  font-size: 12px;
+}
+
+.request-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}

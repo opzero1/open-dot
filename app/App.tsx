@@ -78,6 +78,7 @@ import {
   workSummary,
 } from "./chat";
 import { Feed } from "./Feed";
+import { RequestList, useRequests } from "./Requests";
 import { Instructions } from "./Instructions";
 import { DiffBlock, Markdown } from "./Markdown";
 import { Memory } from "./Memory";
@@ -267,6 +268,9 @@ const App = () => {
   const [composerErrors, setComposerErrors] = useState(new Map<string, string>());
   const [pane, setPane] = useState<Pane>("chat");
   const [feedOpen, setFeedOpen] = useState(false);
+  // The one Needs you list of every dot's request cards.
+  const [needsOpen, setNeedsOpen] = useState(false);
+  const requests = useRequests();
   const [ask, setAsk] = useState<Ask>();
   const [dotMenu, setDotMenu] = useState<{ dot: string; x: number; y: number }>();
   const [freshening, setFreshening] = useState(new Set<string>());
@@ -698,7 +702,7 @@ const App = () => {
   }, [dots, unread, unsaved]);
 
   // Looking at a chat marks it read; the Feed and a dot's other panes don't.
-  const looking = pane === "chat" && !feedOpen;
+  const looking = pane === "chat" && !feedOpen && !needsOpen;
   lookingRef.current = looking;
   useEffect(() => {
     const last = conversation?.latest.at(-1)?.id;
@@ -1047,6 +1051,7 @@ const App = () => {
     setSelected(name);
     setPane(next);
     setFeedOpen(false);
+    setNeedsOpen(false);
     setMenu(undefined);
     setDotMenu(undefined);
   };
@@ -1131,9 +1136,10 @@ const App = () => {
         return;
       }
       if (event.key !== "Escape" || modal) return;
-      if (feedOpen || pane !== "chat") {
+      if (feedOpen || needsOpen || pane !== "chat") {
         event.preventDefault();
         setFeedOpen(false);
+        setNeedsOpen(false);
         setPane("chat");
       }
     };
@@ -1161,10 +1167,24 @@ const App = () => {
           data-open-feed
           onClick={() => {
             setFeedOpen((open) => !open);
+            setNeedsOpen(false);
             setMenu(undefined);
           }}
         >
           Feed
+        </button>
+        <button
+          type="button"
+          className={`feed-button ${needsOpen ? "selected" : ""}`}
+          aria-pressed={needsOpen}
+          data-open-needs
+          onClick={() => {
+            setNeedsOpen((open) => !open);
+            setFeedOpen(false);
+            setMenu(undefined);
+          }}
+        >
+          Needs you{requests.cards.length ? ` (${requests.cards.length})` : ""}
         </button>
         <nav aria-label="Dots">
           {dots.map((item) => {
@@ -1177,11 +1197,14 @@ const App = () => {
                   type="button"
                   data-dot={item.name}
                   data-busy={item.busy ? "" : undefined}
-                  className={`dot ${item.name === selected && !feedOpen ? "selected" : ""}`}
-                  aria-current={item.name === selected && !feedOpen ? "page" : undefined}
+                  className={`dot ${item.name === selected && !feedOpen && !needsOpen ? "selected" : ""}`}
+                  aria-current={
+                    item.name === selected && !feedOpen && !needsOpen ? "page" : undefined
+                  }
                   onClick={() => {
                     setSelected(item.name);
                     setFeedOpen(false);
+                    setNeedsOpen(false);
                     setMenu(undefined);
                   }}
                   onContextMenu={(event) => {
@@ -1225,7 +1248,19 @@ const App = () => {
         </nav>
       </aside>
       <main className="chat">
-        {feedOpen ? (
+        {needsOpen ? (
+          <div className="needs-pane" data-needs-pane>
+            <RequestList
+              requests={requests}
+              cards={requests.cards}
+              ask={setAsk}
+              title="Needs you"
+            />
+            {requests.cards.length || requests.error ? null : (
+              <p className="request-empty">Nothing waits for you.</p>
+            )}
+          </div>
+        ) : feedOpen ? (
           <Feed
             dots={dots}
             selected={selected}
@@ -1279,6 +1314,14 @@ const App = () => {
                 </label>
               </div>
             </header>
+            {requests.cards.some((card) => card.dot === dot.name) ? (
+              <RequestList
+                requests={requests}
+                cards={requests.cards.filter((card) => card.dot === dot.name)}
+                ask={setAsk}
+                title="Waiting for you"
+              />
+            ) : null}
             <MessageList
               key={`${dot.name}:${conversation.sessionID}`}
               dot={dot.name}
