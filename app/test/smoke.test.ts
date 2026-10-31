@@ -714,13 +714,23 @@ class FakeDaemon {
       }
       return json({ fact: saved });
     }
-    if (path === "/requests/pending")
+    if (path === "/requests/pending") {
+      // Oldest first after `after`, `limit` a page, as the daemon pages them.
+      const after = Number(url.searchParams.get("after") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const rows = d.requests
+        .filter(
+          (card) =>
+            card.id > after &&
+            (!url.searchParams.get("dot") || card.dot === url.searchParams.get("dot")),
+        )
+        .toSorted((a, b) => a.id - b.id);
+      const page = rows.slice(0, limit);
       return json({
-        requests: d.requests.filter(
-          (card) => !url.searchParams.get("dot") || card.dot === url.searchParams.get("dot"),
-        ),
-        next: null,
+        requests: page,
+        next: rows.length > limit ? (page.at(-1)?.id ?? null) : null,
       });
+    }
     const opening = /^\/requests\/(\d+)\/open$/.exec(path)?.[1];
     if (opening && method === "POST") {
       d.opened.push(Number(opening));
@@ -3983,3 +3993,59 @@ test("request cards: answered from the chat and Needs you, Always only after its
     },
   );
 });
+
+test("request cards: Show more reaches every pending card, in a dot's chat and in Needs you, and later reads keep it", async () => {
+  await scenario(
+    "request-pages",
+    (fake) => {
+      fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
+      fake.others.set("kiki", { messages: [], hold: undefined, reads: 0 });
+      // A thousand of jojo's and dio's, then one of kiki's past the first thousand read.
+      fake.data.requests = Array.from({ length: 1001 }, (_, at) =>
+        at < 1000
+          ? requestCard(at + 1, at % 2 ? { dot: "dio", boundSessionID: "ses_dio" } : {})
+          : requestCard(at + 1, { dot: "kiki", boundSessionID: "ses_kiki", title: "kiki" }),
+      );
+    },
+    async ({ js, until, press, fake }) => {
+      await until(
+        `document.querySelector("[data-open-needs]")?.textContent === "Needs you (1000+)"`,
+        "the first thousand counted, with more to come",
+      );
+      await js(`document.querySelector("[data-open-needs]").click(), true`);
+      await until(
+        `document.querySelectorAll("[data-needs-pane] [data-request]").length === 1000`,
+        "a thousand cards in Needs you",
+      );
+      expect(await js(`!!document.querySelector('[data-request="1001"]')`)).toBe(false);
+      expect(await js(`!!document.querySelector("[data-needs-pane] [data-requests-more]")`)).toBe(
+        true,
+      );
+      // kiki's chat holds none of the cards read yet, but offers Show more, which reaches its own.
+      await js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })), true`);
+      await until(`!document.querySelector("[data-needs-pane]")`, "the chat");
+      await js(`document.querySelector('[data-dot="kiki"]').click(), true`);
+      await until(`!!document.querySelector("[data-requests] [data-requests-more]")`, "Show more");
+      expect(await js(`document.querySelectorAll("[data-request]").length`)).toBe(0);
+      await press("[data-requests]", "Show more requests");
+      await until(`!!document.querySelector('[data-request="1001"]')`, "kiki's card");
+      expect(await js(`document.querySelectorAll("[data-request]").length`)).toBe(1);
+      expect(await js(`!!document.querySelector("[data-requests-more]")`)).toBe(false);
+      // Later reads keep following the cursor that far, so the card stays.
+      await delay(4_500);
+      expect(await js(`!!document.querySelector('[data-request="1001"]')`)).toBe(true);
+      // Needs you shows every card, and answers the last one.
+      await js(`document.querySelector("[data-open-needs]").click(), true`);
+      await until(
+        `document.querySelectorAll("[data-needs-pane] [data-request]").length === 1001`,
+        "every card in Needs you",
+      );
+      expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
+        "Needs you (1001)",
+      );
+      await press('[data-needs-pane] [data-request="1001"]', "Allow once");
+      await until(`!document.querySelector('[data-request="1001"]')`, "the last card answered");
+      expect(fake.data.answers).toMatchObject([{ id: 1001 }]);
+    },
+  );
+}, 120_000);

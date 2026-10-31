@@ -34,7 +34,9 @@ interface Draft {
 export interface Requests {
   cards: RequestCard[];
   error: string | null;
+  // More cards wait past the last page read, which Show more reads too from then on.
   more: boolean;
+  showMore: () => void;
   // Requests with an answer whose outcome main hasn't seen yet: read-only until it has.
   checking: ReadonlySet<number>;
   sending: ReadonlySet<number>;
@@ -47,6 +49,7 @@ export interface Requests {
   refresh: () => void;
 }
 
+// Pages of 100 read at first, and added by each Show more.
 const pagesPerRead = 10;
 
 const freshDraft = (card: RequestCard): Draft => {
@@ -61,9 +64,11 @@ const freshDraft = (card: RequestCard): Draft => {
 };
 
 /**
- * The owner's cards, read every two seconds, every page of them up to a thousand, with drafts
- * and locks shared by every place a card shows. A read that started before a later one landed is
- * dropped, and a failed read keeps the last cards with a note that they may be out of date.
+ * The owner's cards, read every two seconds, a thousand at first and a thousand more for each
+ * Show more, with drafts and locks shared by every place a card shows. Every read follows the
+ * pending cursor from the start for as many pages as the owner asked for, so a card once reached
+ * stays reachable. A read that started before a later one landed is dropped, and a failed read
+ * keeps the last cards with a note that they may be out of date.
  */
 export const useRequests = (): Requests => {
   const [cards, setCards] = useState<RequestCard[]>([]);
@@ -77,6 +82,9 @@ export const useRequests = (): Requests => {
   const latest = useRef<RequestCard[]>([]);
   const locks = useRef(new Set<number>());
   const reading = useRef(false);
+  // A read asked for while one was running, done once that one ends.
+  const again = useRef(false);
+  const pages = useRef(pagesPerRead);
 
   const note = (id: number, text: string | null) =>
     setNotes((known) => {
@@ -109,14 +117,18 @@ export const useRequests = (): Requests => {
   }, []);
 
   const poll = useCallback(async () => {
-    if (reading.current) return;
+    if (reading.current) {
+      again.current = true;
+      return;
+    }
     reading.current = true;
     const generation = fence.current.begin();
     try {
       await reconcile();
       const read: RequestCard[] = [];
       let after: number | null = null;
-      let pages = 0;
+      let count = 0;
+      const wanted = pages.current;
       for (;;) {
         const page: Reply<PendingPage> = await bridge.call("pendingRequests", null, after);
         if (!page.ok) {
@@ -124,9 +136,9 @@ export const useRequests = (): Requests => {
           return;
         }
         read.push(...page.value.requests);
-        pages++;
+        count++;
         after = page.value.next ?? null;
-        if (after === null || pages >= pagesPerRead) break;
+        if (after === null || count >= wanted) break;
       }
       if (!fence.current.land(generation)) return;
       latest.current = read;
@@ -143,6 +155,10 @@ export const useRequests = (): Requests => {
       });
     } finally {
       reading.current = false;
+      if (again.current) {
+        again.current = false;
+        void poll();
+      }
     }
   }, [reconcile]);
 
@@ -200,6 +216,10 @@ export const useRequests = (): Requests => {
     cards,
     error,
     more,
+    showMore: () => {
+      pages.current += pagesPerRead;
+      void poll();
+    },
     checking,
     sending,
     notes,
@@ -229,7 +249,7 @@ export const RequestList = ({
   return (
     <section className="request-list" aria-label={title} data-requests>
       <h2 className="request-heading">
-        {title} {cards.length ? `(${cards.length})` : ""}
+        {title} {cards.length ? `(${cards.length}${requests.more ? "+" : ""})` : ""}
         {requests.error ? (
           <span className="stale" title={requests.error}>
             {" "}
@@ -241,7 +261,12 @@ export const RequestList = ({
         <RequestCardView key={card.id} card={card} requests={requests} ask={ask} />
       ))}
       {requests.more ? (
-        <p className="request-more">More requests wait than the app reads at once.</p>
+        <p className="request-more">
+          More requests wait than these.{" "}
+          <button type="button" data-requests-more onClick={requests.showMore}>
+            Show more requests
+          </button>
+        </p>
       ) : null}
     </section>
   );

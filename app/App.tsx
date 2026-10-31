@@ -1184,7 +1184,8 @@ const App = () => {
             setMenu(undefined);
           }}
         >
-          Needs you{requests.cards.length ? ` (${requests.cards.length})` : ""}
+          Needs you
+          {requests.cards.length ? ` (${requests.cards.length}${requests.more ? "+" : ""})` : ""}
         </button>
         <nav aria-label="Dots">
           {dots.map((item) => {
@@ -1314,7 +1315,8 @@ const App = () => {
                 </label>
               </div>
             </header>
-            {requests.cards.some((card) => card.dot === dot.name) ? (
+            {/* More may wait past the cards read, some of them this dot's, so Show more stays here. */}
+            {requests.more || requests.cards.some((card) => card.dot === dot.name) ? (
               <RequestList
                 requests={requests}
                 cards={requests.cards.filter((card) => card.dot === dot.name)}
