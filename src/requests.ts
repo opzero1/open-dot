@@ -253,7 +253,8 @@ export const invalidAnswer = (detail: RequestDetail, answer: unknown): string | 
   const known = new Set(detail.fields.map((field) => String(field.key)));
   for (const key of Object.keys(answer))
     if (!known.has(key)) return `The question has no field "${key}" to answer.`;
-  const answered: Record<string, unknown> = {};
+  // No prototype, so a field named `__proto__` is an entry like any other.
+  const answered: Record<string, unknown> = Object.create(null);
   const earlier = new Set<string>();
   for (const field of detail.fields) {
     const key = String(field.key);

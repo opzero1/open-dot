@@ -611,6 +611,64 @@ test("conditions follow OpenCode's form contract: a multiselect includes, and an
   ).toBe("unsupported");
 });
 
+test("fields named like Object's own members are only ever the form's own answers", () => {
+  const detail = cardDetail(
+    question([
+      {
+        key: "constructor",
+        type: "string",
+        required: true,
+        options: [{ value: "a", label: "A" }],
+        custom: true,
+      },
+      { key: "toString", type: "multiselect", options: [{ value: "x", label: "X" }], custom: true },
+      { key: "__proto__", type: "multiselect", options: [{ value: "y", label: "Y" }] },
+      { key: "valueOf", type: "string", when: [{ key: "toString", op: "neq", value: "x" }] },
+      {
+        key: "hasOwnProperty",
+        type: "string",
+        required: true,
+        when: [{ key: "__proto__", op: "eq", value: "y" }],
+      },
+    ]),
+  );
+  if (detail.kind !== "question") throw new Error("expected a question");
+  const empty = initialValues(detail.fields);
+  // Nothing inherited counts as an answer, so a neq on an unanswered field doesn't hold.
+  expect(normalizedValues(detail.fields, empty, {})).toEqual({});
+  expect(shownFields(detail.fields, empty).map((field) => field.key)).toEqual([
+    "constructor",
+    "toString",
+    "__proto__",
+  ]);
+  expect(formAnswer(detail.fields, empty)).toEqual({ error: "constructor needs an answer." });
+  const typed = normalizedValues(
+    detail.fields,
+    JSON.parse('{"constructor":"\\u0000other","__proto__":["y"]}'),
+    JSON.parse('{"constructor":" mine ","toString":" z "}'),
+  );
+  expect(shownFields(detail.fields, typed).map((field) => field.key)).toEqual([
+    "constructor",
+    "toString",
+    "__proto__",
+    "valueOf",
+    "hasOwnProperty",
+  ]);
+  expect(formAnswer(detail.fields, typed)).toEqual({ error: "hasOwnProperty needs an answer." });
+  const built = formAnswer(detail.fields, { ...typed, hasOwnProperty: "yes" });
+  if (!("answer" in built)) throw new Error(built.error);
+  // `__proto__` stays an entry, so the daemon reads the same keys back from the JSON.
+  expect(JSON.parse(JSON.stringify(built.answer))).toEqual(
+    JSON.parse('{"constructor":"mine","toString":["z"],"__proto__":["y"],"hasOwnProperty":"yes"}'),
+  );
+  expect(Object.keys(built.answer)).toEqual([
+    "constructor",
+    "toString",
+    "__proto__",
+    "hasOwnProperty",
+  ]);
+});
+
 test("a card read begun before a newer one landed is dropped", () => {
   const fence = cardsFence();
   const slow = fence.begin();

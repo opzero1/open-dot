@@ -1203,6 +1203,25 @@ export const initialValues = (fields: readonly FormField[]): FormValues =>
     fields.flatMap((item) => (item.default === undefined ? [] : [[item.key, item.default]])),
   );
 
+/**
+ * A field's entry in values keyed by field, read only from the values themselves: a field may be
+ * named `constructor`, `toString` or `__proto__`, which an ordinary lookup finds on every object.
+ */
+export const own = <T>(values: Readonly<Record<string, T>>, key: string): T | undefined =>
+  Object.hasOwn(values, key) ? values[key] : undefined;
+
+/** A copy of values keyed by field with one more entry, which stays an entry whatever its key. */
+export const withKey = <T>(
+  values: Readonly<Record<string, T>>,
+  key: string,
+  value: NoInfer<T>,
+): Record<string, T> => {
+  // No prototype, so assigning `__proto__` makes an entry rather than changing what it inherits.
+  const next: Record<string, T> = Object.assign(Object.create(null), values);
+  next[key] = value;
+  return next;
+};
+
 const blank = (value: FormValue) => value === "" || (Array.isArray(value) && value.length === 0);
 
 /**
@@ -1214,7 +1233,7 @@ export const conditionHolds = (
   condition: FieldBase["when"][number],
   answered: Readonly<Record<string, FormValue>>,
 ) => {
-  const value = answered[condition.key];
+  const value = own(answered, condition.key);
   if (value === undefined) return false;
   const match = Array.isArray(value)
     ? value.some((choice) => choice === condition.value)
@@ -1228,12 +1247,13 @@ export const conditionHolds = (
  * value, or a hidden one's default, is its answer unless it's blank.
  */
 const walk = (fields: readonly FormField[], values: FormValues) => {
-  const answered: Record<string, FormValue> = {};
+  // No prototype, so every field's key, `__proto__` too, is only ever an entry.
+  const answered: Record<string, FormValue> = Object.create(null);
   const active: FormField[] = [];
   for (const item of fields) {
     if (!item.when.every((condition) => conditionHolds(condition, answered))) continue;
     active.push(item);
-    const value = item.hidden ? item.default : values[item.key];
+    const value = item.hidden ? item.default : own(values, item.key);
     if (value !== undefined && !blank(value)) answered[item.key] = value;
   }
   return { active, answered };
@@ -1252,15 +1272,16 @@ export const normalizedValues = (
   values: FormValues,
   custom: Readonly<Record<string, string>>,
 ): FormValues => {
-  const normal = { ...values };
+  let normal: FormValues = { ...values };
   for (const item of fields) {
-    const typed = custom[item.key]?.trim() ?? "";
-    if (item.type === "string" && item.options && normal[item.key] === otherChoice)
-      normal[item.key] = typed;
+    const text = own(custom, item.key);
+    const typed = typeof text === "string" ? text.trim() : "";
+    if (item.type === "string" && item.options && own(normal, item.key) === otherChoice)
+      normal = withKey(normal, item.key, typed);
     if (item.type === "multiselect" && item.custom && typed) {
-      const chosen = normal[item.key];
+      const chosen = own(normal, item.key);
       const list = Array.isArray(chosen) ? chosen : [];
-      if (!list.includes(typed)) normal[item.key] = [...list, typed];
+      if (!list.includes(typed)) normal = withKey(normal, item.key, [...list, typed]);
     }
   }
   return normal;
@@ -1279,9 +1300,9 @@ export const formAnswer = (
   values: FormValues,
 ): { answer: Record<string, FormValue> } | { error: string } => {
   const { active, answered } = walk(fields, values);
-  const answer: Record<string, FormValue> = {};
+  const answer: [string, FormValue][] = [];
   for (const item of active) {
-    const value = answered[item.key];
+    const value = own(answered, item.key);
     const name = item.title ?? item.key;
     if (value === undefined) {
       if (item.required) return { error: `${name} needs an answer.` };
@@ -1318,9 +1339,10 @@ export const formAnswer = (
       )
         return { error: `${name} has the wrong number of choices.` };
     } else return { error: `${name} can't be answered here.` };
-    answer[item.key] = value;
+    answer.push([item.key, value]);
   }
-  return { answer };
+  // Entries make own keys, even `__proto__`, as the daemon's JSON reads them.
+  return { answer: Object.fromEntries(answer) };
 };
 
 /** Where a request came from, in a few words. */

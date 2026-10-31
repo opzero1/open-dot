@@ -3848,17 +3848,41 @@ test("request cards: answered from the chat and Needs you, Always only after its
             ],
           },
         }),
+        // Fields named like Object's own members, which OpenCode's form allows.
+        requestCard(6, {
+          kind: "question",
+          requestID: "que_6",
+          detail: {
+            kind: "question",
+            title: "Odd names",
+            fields: [
+              {
+                key: "constructor",
+                type: "string",
+                required: true,
+                options: [{ value: "a", label: "Ay" }],
+                custom: true,
+              },
+              { key: "toString", type: "multiselect", options: [{ value: "x", label: "Ex" }] },
+              {
+                key: "__proto__",
+                type: "string",
+                when: [{ key: "toString", op: "eq", value: "x" }],
+              },
+            ],
+          },
+        }),
       ];
     },
     async ({ fake, js, until, press }) => {
       // The chat shows jojo's cards under its header, with untrusted text as text.
-      await until(`document.querySelectorAll("[data-request]").length === 5`, "five cards");
+      await until(`document.querySelectorAll("[data-request]").length === 6`, "six cards");
       expect(await js(`!!document.querySelector('[data-request="1"] code b')`)).toBe(false);
       expect(await js(`document.querySelector('[data-request="1"] code').textContent`)).toBe(
         "<b>rm -rf build</b>",
       );
       expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
-        "Needs you (5)",
+        "Needs you (6)",
       );
       // A sensitive card offers only its terminal.
       expect(
@@ -3932,6 +3956,27 @@ test("request cards: answered from the chat and Needs you, Always only after its
         id: 2,
         body: { answer: { decision: "reply", answer: { branch: "dev" } } },
       });
+      // The card whose fields are named like Object's members renders, and answers as typed.
+      const fill = (selector: string, text: string) =>
+        js(
+          `(() => { const i = document.querySelector(${JSON.stringify(selector)}); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(i, ${JSON.stringify(text)}); i.dispatchEvent(new Event("input", { bubbles: true })); return true; })()`,
+        );
+      await choose(6, "Other");
+      const other = `[data-request="6"] input[aria-label="constructor: your answer"]`;
+      await until(`!!document.querySelector('${other}')`, "the Other field");
+      await fill(other, " mine ");
+      await choose(6, "Ex");
+      const deep = `[data-request="6"] .request-field:nth-of-type(3) input[type=text]`;
+      await until(
+        `!!document.querySelector('${deep}')`,
+        "the field that applies once Ex is chosen",
+      );
+      await fill(deep, "deep");
+      await press('[data-request="6"]', "Submit");
+      await until(`!document.querySelector('[data-request="6"]')`, "the odd-named question to go");
+      expect(JSON.stringify(fake.data.answers[3]?.body)).toContain(
+        '"answer":{"constructor":"mine","toString":["x"],"__proto__":"deep"}',
+      );
       // Escape goes back to the chat.
       await js(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })), true`);
       await until(`!document.querySelector("[data-needs-pane]") && !!t.box()`, "the chat");

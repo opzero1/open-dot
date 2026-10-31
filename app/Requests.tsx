@@ -16,7 +16,9 @@ import {
   initialValues,
   normalizedValues,
   otherChoice,
+  own,
   shownFields,
+  withKey,
 } from "./surfaces";
 import { type AskOwner, bridge } from "./ui";
 
@@ -457,8 +459,8 @@ const QuestionForm = ({
   onChange: (values: FormValues, custom: Record<string, string>) => void;
 }) => {
   const set = (key: string, value: FormValues[string]) =>
-    onChange({ ...values, [key]: value }, custom);
-  const type = (key: string, text: string) => onChange(values, { ...custom, [key]: text });
+    onChange(withKey(values, key, value), custom);
+  const type = (key: string, text: string) => onChange(values, withKey(custom, key, text));
   // Each rendering of a form names its radio groups apart from every other card's and place's.
   const scope = useId();
   return (
@@ -484,17 +486,17 @@ const QuestionForm = ({
                     <input
                       type="radio"
                       name={id}
-                      checked={values[item.key] === option.value}
+                      checked={own(values, item.key) === option.value}
                       onChange={() => set(item.key, option.value)}
                     />{" "}
                     {option.label}
                   </label>
                 ))}
-                {item.custom && values[item.key] === otherChoice ? (
+                {item.custom && own(values, item.key) === otherChoice ? (
                   <input
                     type="text"
                     aria-label={`${label}: your answer`}
-                    value={custom[item.key] ?? ""}
+                    value={own(custom, item.key) ?? ""}
                     onChange={(event) => type(item.key, event.target.value)}
                   />
                 ) : null}
@@ -508,7 +510,7 @@ const QuestionForm = ({
                 <input
                   type="text"
                   placeholder={item.placeholder}
-                  value={typed(values[item.key])}
+                  value={typed(own(values, item.key))}
                   onChange={(event) => set(item.key, event.target.value)}
                 />
               </label>
@@ -523,7 +525,9 @@ const QuestionForm = ({
                   step={item.type === "integer" ? 1 : "any"}
                   min={item.minimum}
                   max={item.maximum}
-                  value={typeof values[item.key] === "number" ? String(values[item.key]) : ""}
+                  value={
+                    typeof own(values, item.key) === "number" ? String(own(values, item.key)) : ""
+                  }
                   onChange={(event) =>
                     set(
                       item.key,
@@ -536,7 +540,7 @@ const QuestionForm = ({
               <label>
                 <input
                   type="checkbox"
-                  checked={values[item.key] === true}
+                  checked={own(values, item.key) === true}
                   onChange={(event) => set(item.key, event.target.checked)}
                 />{" "}
                 {label}
@@ -548,7 +552,7 @@ const QuestionForm = ({
                   {item.required ? " *" : ""}
                 </span>
                 {item.options.map((option) => {
-                  const chosen = list(values[item.key]);
+                  const chosen = list(own(values, item.key));
                   return (
                     <label key={option.value}>
                       <input
@@ -572,7 +576,7 @@ const QuestionForm = ({
                     type="text"
                     aria-label={`${label}: another choice`}
                     placeholder="Another choice"
-                    value={custom[item.key] ?? ""}
+                    value={own(custom, item.key) ?? ""}
                     onChange={(event) => type(item.key, event.target.value)}
                   />
                 ) : null}

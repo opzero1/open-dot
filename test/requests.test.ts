@@ -7,7 +7,7 @@ import { answerAll, enqueue, settleRequests, step, watchThreads } from "../src/d
 import { worktreeDirectory } from "../src/home";
 import { formWaiting, redactedQuestion } from "../src/opencode";
 import { type Db, openDatabase } from "../src/db";
-import { graceMs, prohibited, queueAnswer, unseenLimitMs } from "../src/requests";
+import { graceMs, invalidAnswer, prohibited, queueAnswer, unseenLimitMs } from "../src/requests";
 import { dots, grants, outbox, requests, type RequestAnswer, workers } from "../src/schema";
 import { saveBinding } from "../src/supervise";
 import { fakeOpenCode, type FakeWaiting } from "./fake-opencode";
@@ -855,4 +855,27 @@ test("the audit pages back by ID, so an old request and its complete answer stay
   expect((await call("/dots/jojo/requests?before=0")).status).toBe(400);
   expect((await call("/dots/jojo/requests?before=abc")).status).toBe(400);
   expect((await call("/dots/jojo/requests?limit=5")).status).toBe(400);
+});
+
+test("a field named __proto__ is checked as an answer like any other", () => {
+  const detail = {
+    kind: "question" as const,
+    title: "Pick",
+    fields: [
+      { key: "__proto__", type: "multiselect", options: [{ value: "y", label: "Y" }] },
+      {
+        key: "constructor",
+        type: "string",
+        required: true,
+        when: [{ key: "__proto__", op: "eq", value: "y" }],
+      },
+    ],
+  };
+  // As the local API reads the body: JSON makes `__proto__` an own key.
+  expect(invalidAnswer(detail, JSON.parse('{"__proto__":["y"],"constructor":"c"}'))).toBe(
+    undefined,
+  );
+  expect(invalidAnswer(detail, JSON.parse('{"__proto__":["y"]}'))).toBe(
+    '"constructor" is required.',
+  );
 });
