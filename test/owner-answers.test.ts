@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import type { RequestCard } from "../app/bridge";
 import { fits, shapes } from "../app/decode";
-import { cardDetail, formAnswer, initialValues } from "../app/surfaces";
+import { cardDetail, formAnswer, initialValues, normalizedValues } from "../app/surfaces";
 import { api } from "../src/api";
 import { answerAll, settleRequests, watchOwn } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
@@ -196,6 +196,68 @@ test("a question takes the owner's whole form: a choice, several choices and typ
   expect(fake.state.answers.map((item) => [item.requestID, item.answer])).toEqual([
     ["frm_1", { decision: "reply", answer: reply }],
     ["frm_2", { decision: "cancel" }],
+  ]);
+});
+
+test("a conditional question: the app and the daemon read its conditions alike, so only a fitting answer goes", async () => {
+  fake.state.waiting.set("ses_jojo", [
+    {
+      id: "frm_c",
+      kind: "question",
+      summary: "Release",
+      detail: {
+        kind: "question",
+        title: "Release",
+        fields: [
+          {
+            key: "targets",
+            type: "multiselect",
+            options: [
+              { value: "mac", label: "Mac" },
+              { value: "linux", label: "Linux" },
+            ],
+            custom: true,
+          },
+          {
+            key: "signing",
+            type: "string",
+            required: true,
+            when: [{ key: "targets", op: "eq", value: "mac" }],
+          },
+          { key: "distro", type: "string", when: [{ key: "targets", op: "neq", value: "mac" }] },
+        ],
+      },
+    },
+  ]);
+  await own();
+  const [card] = (await pending()).requests;
+  if (!card) throw new Error("no card");
+  const reply = (chosen: Record<string, unknown>) =>
+    post(card, { answer: { decision: "reply", answer: chosen } });
+  // Mac among the choices makes signing apply and required; distro applies only without Mac, and
+  // neither applies while targets has no answer.
+  expect((await reply({ targets: ["linux", "mac"] })).status).toBe(422);
+  expect((await reply({ targets: ["mac"], signing: "id", distro: "x" })).status).toBe(422);
+  expect((await reply({ signing: "id" })).status).toBe(422);
+  expect((await reply({ distro: "arch" })).status).toBe(422);
+  // The app builds the answer from the card, with Mac typed as the owner's own choice.
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the daemon's answer, as main passes it
+  const detail = cardDetail(card as unknown as RequestCard);
+  if (detail.kind !== "question") throw new Error("the app can't render the form");
+  const values = normalizedValues(
+    detail.fields,
+    { targets: ["linux"], signing: "id" },
+    {
+      targets: "mac",
+    },
+  );
+  const built = formAnswer(detail.fields, values);
+  if (!("answer" in built)) throw new Error(built.error);
+  expect(built.answer).toEqual({ targets: ["linux", "mac"], signing: "id" });
+  expect((await reply(built.answer)).status).toBe(202);
+  await answer();
+  expect(fake.state.answers.map((item) => item.answer)).toEqual([
+    { decision: "reply", answer: { targets: ["linux", "mac"], signing: "id" } },
   ]);
 });
 

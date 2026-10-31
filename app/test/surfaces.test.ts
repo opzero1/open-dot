@@ -12,6 +12,8 @@ import {
   formAnswer,
   initialValues,
   InstructionsState,
+  normalizedValues,
+  otherChoice,
   ownerOrphans,
   Searches,
   shownFields,
@@ -532,6 +534,81 @@ test("a form answers active fields only, hidden ones by default, and checks requ
   expect(formAnswer(detail.fields, { ...values, mode: "a", count: 4 })).toEqual({
     error: "count is out of range.",
   });
+});
+
+test("conditions follow OpenCode's form contract: a multiselect includes, and an unanswered field holds nothing", () => {
+  const detail = cardDetail(
+    question([
+      {
+        key: "targets",
+        type: "multiselect",
+        options: [
+          { value: "mac", label: "Mac" },
+          { value: "linux", label: "Linux" },
+        ],
+        custom: true,
+      },
+      {
+        key: "signing",
+        type: "string",
+        required: true,
+        when: [{ key: "targets", op: "eq", value: "mac" }],
+      },
+      { key: "distro", type: "string", when: [{ key: "targets", op: "neq", value: "mac" }] },
+      { key: "mode", type: "string", options: [{ value: "a", label: "A" }], custom: true },
+      { key: "why", type: "string", required: true, when: [{ key: "mode", op: "eq", value: "b" }] },
+      // Reads a field that is itself inactive, so it has no answer.
+      {
+        key: "deep",
+        type: "string",
+        required: true,
+        when: [{ key: "signing", op: "neq", value: "x" }],
+      },
+    ]),
+  );
+  if (detail.kind !== "question") throw new Error("expected a question");
+  const keys = (values: Record<string, unknown>) =>
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- test values
+    shownFields(detail.fields, values as never).map((field) => field.key);
+  // Nothing chosen: neither eq nor neq holds against an unanswered field.
+  expect(keys({})).toEqual(["targets", "mode"]);
+  expect(formAnswer(detail.fields, {})).toEqual({ answer: {} });
+  // Mac chosen among others: eq holds, neq doesn't, and the dependent required field is required.
+  expect(keys({ targets: ["linux", "mac"] })).toEqual(["targets", "signing", "mode"]);
+  expect(formAnswer(detail.fields, { targets: ["linux", "mac"] })).toEqual({
+    error: "signing needs an answer.",
+  });
+  // Once answered, the field after it that reads it applies, and is required in turn.
+  expect(keys({ targets: ["mac"], signing: "id" })).toEqual(["targets", "signing", "mode", "deep"]);
+  expect(formAnswer(detail.fields, { targets: ["mac"], signing: "id" })).toEqual({
+    error: "deep needs an answer.",
+  });
+  expect(formAnswer(detail.fields, { targets: ["mac"], signing: "id", deep: "d" })).toEqual({
+    answer: { targets: ["mac"], signing: "id", deep: "d" },
+  });
+  // Only Linux: neq holds; a value left behind on a field that no longer applies isn't sent.
+  expect(keys({ targets: ["linux"], signing: "id" })).toEqual(["targets", "distro", "mode"]);
+  expect(formAnswer(detail.fields, { targets: ["linux"], signing: "id", deep: "d" })).toEqual({
+    answer: { targets: ["linux"] },
+  });
+  // Typed custom text counts as the answer it will be, both for what shows and what's sent.
+  const typed = normalizedValues(
+    detail.fields,
+    { targets: ["linux"], mode: otherChoice },
+    { targets: "  mac ", mode: " b " },
+  );
+  expect(typed).toEqual({ targets: ["linux", "mac"], mode: "b" });
+  expect(keys(typed)).toEqual(["targets", "signing", "mode", "why"]);
+  expect(formAnswer(detail.fields, typed)).toEqual({ error: "signing needs an answer." });
+  // A condition on a field that isn't before it is not something the app can answer.
+  expect(
+    cardDetail(
+      question([
+        { key: "a", type: "string", when: [{ key: "b", op: "eq", value: "x" }] },
+        { key: "b", type: "string" },
+      ]),
+    ).kind,
+  ).toBe("unsupported");
 });
 
 test("a card read begun before a newer one landed is dropped", () => {

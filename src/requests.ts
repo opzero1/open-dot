@@ -228,14 +228,60 @@ const plain = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const num = (value: unknown) => (typeof value === "number" ? value : undefined);
 
-/** Why an answer doesn't fit the question's fields, checked before it's queued and again before it's sent. */
+/**
+ * Whether one `when` condition holds against the answers so far, as OpenCode's form contract has
+ * it: against a multiselect, `eq` means its choices include the value and `neq` that they don't,
+ * and a field with no answer makes either false.
+ */
+const holds = (condition: Record<string, unknown>, answered: Record<string, unknown>) => {
+  if (typeof condition.key !== "string" || !Object.hasOwn(answered, condition.key)) return false;
+  const value = answered[condition.key];
+  const match = Array.isArray(value) ? value.includes(condition.value) : value === condition.value;
+  return condition.op === "eq" ? match : !match;
+};
+
+/**
+ * Why an answer doesn't fit the question's fields, checked before it's queued and again before
+ * it's sent. Fields are read in order, as OpenCode reads them: a field is active while each of its
+ * `when` conditions holds against the answers of the active fields before it; an inactive field
+ * may not be answered, and an active required one must be, unless it's hidden with a default,
+ * which then counts as its answer.
+ */
 export const invalidAnswer = (detail: RequestDetail, answer: unknown): string | undefined => {
   if (detail.kind !== "question") return "That request is not a question.";
   if (!plain(answer)) return "The answer must be an object keyed by field.";
-  const fields = new Map(detail.fields.map((field) => [String(field.key), field]));
-  for (const [key, value] of Object.entries(answer)) {
-    const field = fields.get(key);
-    if (!field || field.type === "external") return `The question has no field "${key}" to answer.`;
+  const known = new Set(detail.fields.map((field) => String(field.key)));
+  for (const key of Object.keys(answer))
+    if (!known.has(key)) return `The question has no field "${key}" to answer.`;
+  const answered: Record<string, unknown> = {};
+  const earlier = new Set<string>();
+  for (const field of detail.fields) {
+    const key = String(field.key);
+    const listed: unknown = field.when ?? [];
+    const conditions = Array.isArray(listed) ? listed.filter(plain) : [];
+    if (
+      !Array.isArray(listed) ||
+      conditions.length !== listed.length ||
+      !conditions.every(
+        (condition) =>
+          typeof condition.key === "string" &&
+          earlier.has(condition.key) &&
+          (condition.op === "eq" || condition.op === "neq"),
+      )
+    )
+      return `"${key}" has a condition open-dot can't check.`;
+    earlier.add(key);
+    if (!conditions.every((condition) => holds(condition, answered))) {
+      if (Object.hasOwn(answer, key)) return `"${key}" doesn't apply to the answers before it.`;
+      continue;
+    }
+    if (!Object.hasOwn(answer, key)) {
+      if (field.hidden === true && field.default !== undefined) answered[key] = field.default;
+      else if (field.required === true) return `"${key}" is required.`;
+      continue;
+    }
+    const value = answer[key];
+    if (field.type === "external") return `The question has no field "${key}" to answer.`;
     const options = Array.isArray(field.options)
       ? field.options.map((option) => (plain(option) ? option.value : undefined))
       : undefined;
@@ -267,10 +313,8 @@ export const invalidAnswer = (detail: RequestDetail, answer: unknown): string | 
       if ((min !== undefined && value.length < min) || (max !== undefined && value.length > max))
         return `"${key}" has the wrong number of choices.`;
     } else return `"${key}" can't be answered here.`;
+    answered[key] = value;
   }
-  for (const [key, field] of fields)
-    if (field.required === true && field.when === undefined && !(key in answer))
-      return `"${key}" is required.`;
   return undefined;
 };
 

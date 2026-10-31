@@ -1182,8 +1182,13 @@ export const cardDetail = (card: RequestCard): CardDetail => {
       return { kind: "unsupported" };
     const fields = detail.fields.map(field);
     if (!fields.every((item) => item !== undefined)) return { kind: "unsupported" };
-    const keys = new Set(fields.map((item) => item.key));
-    if (keys.size !== fields.length) return { kind: "unsupported" };
+    // Keys are unique, and a condition reads only a field before its own, as OpenCode requires.
+    const earlier = new Set<string>();
+    for (const item of fields) {
+      if (earlier.has(item.key) || item.when.some((condition) => !earlier.has(condition.key)))
+        return { kind: "unsupported" };
+      earlier.add(item.key);
+    }
     return { kind: "question", title: detail.title, fields };
   }
   return { kind: "unsupported" };
@@ -1198,17 +1203,72 @@ export const initialValues = (fields: readonly FormField[]): FormValues =>
     fields.flatMap((item) => (item.default === undefined ? [] : [[item.key, item.default]])),
   );
 
-/** A field applies while every `when` condition holds against the values now. */
-export const fieldActive = (item: FormField, values: FormValues) =>
-  item.when.every((condition) => {
-    const value = values[condition.key];
-    const equal = !Array.isArray(value) && value === condition.value;
-    return condition.op === "eq" ? equal : !equal;
-  });
+const blank = (value: FormValue) => value === "" || (Array.isArray(value) && value.length === 0);
+
+/**
+ * Whether one `when` condition holds against the answers so far, as OpenCode's form contract has
+ * it: against a multiselect, `eq` means its choices include the value and `neq` that they don't,
+ * and a field with no answer makes either false.
+ */
+export const conditionHolds = (
+  condition: FieldBase["when"][number],
+  answered: Readonly<Record<string, FormValue>>,
+) => {
+  const value = answered[condition.key];
+  if (value === undefined) return false;
+  const match = Array.isArray(value)
+    ? value.some((choice) => choice === condition.value)
+    : value === condition.value;
+  return condition.op === "eq" ? match : !match;
+};
+
+/**
+ * The form in field order, as OpenCode reads it: a field is active while each of its `when`
+ * conditions holds against the answers of the active fields before it, and an active field's
+ * value, or a hidden one's default, is its answer unless it's blank.
+ */
+const walk = (fields: readonly FormField[], values: FormValues) => {
+  const answered: Record<string, FormValue> = {};
+  const active: FormField[] = [];
+  for (const item of fields) {
+    if (!item.when.every((condition) => conditionHolds(condition, answered))) continue;
+    active.push(item);
+    const value = item.hidden ? item.default : values[item.key];
+    if (value !== undefined && !blank(value)) answered[item.key] = value;
+  }
+  return { active, answered };
+};
+
+/** The choice that stands for the owner's own typed text on a single-choice field. */
+export const otherChoice = "\u0000other";
+
+/**
+ * The values as they'd be answered: a single-choice field's Other replaced by its typed text,
+ * and a multiple-choice field's typed text added to its choices once, both trimmed. What the form
+ * shows and what Submit sends are both read from these, so they never disagree.
+ */
+export const normalizedValues = (
+  fields: readonly FormField[],
+  values: FormValues,
+  custom: Readonly<Record<string, string>>,
+): FormValues => {
+  const normal = { ...values };
+  for (const item of fields) {
+    const typed = custom[item.key]?.trim() ?? "";
+    if (item.type === "string" && item.options && normal[item.key] === otherChoice)
+      normal[item.key] = typed;
+    if (item.type === "multiselect" && item.custom && typed) {
+      const chosen = normal[item.key];
+      const list = Array.isArray(chosen) ? chosen : [];
+      if (!list.includes(typed)) normal[item.key] = [...list, typed];
+    }
+  }
+  return normal;
+};
 
 /** Fields the owner sees: active and not hidden. */
 export const shownFields = (fields: readonly FormField[], values: FormValues) =>
-  fields.filter((item) => !item.hidden && fieldActive(item, values));
+  walk(fields, values).active.filter((item) => !item.hidden);
 
 /**
  * The whole form's answer, keyed by field: active fields' values, hidden ones by their default,
@@ -1218,14 +1278,12 @@ export const formAnswer = (
   fields: readonly FormField[],
   values: FormValues,
 ): { answer: Record<string, FormValue> } | { error: string } => {
+  const { active, answered } = walk(fields, values);
   const answer: Record<string, FormValue> = {};
-  for (const item of fields) {
-    if (!fieldActive(item, values)) continue;
-    const value = item.hidden ? item.default : values[item.key];
+  for (const item of active) {
+    const value = answered[item.key];
     const name = item.title ?? item.key;
-    const blank =
-      value === undefined || value === "" || (Array.isArray(value) && value.length === 0);
-    if (blank) {
+    if (value === undefined) {
       if (item.required) return { error: `${name} needs an answer.` };
       continue;
     }

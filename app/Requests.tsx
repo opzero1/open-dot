@@ -2,7 +2,7 @@
 // Request cards: each permission request or question waiting for the owner, from a dot's own
 // session or one its workers escalated, shown in that dot's chat and in one Needs you list. An
 // answer goes once, through main, to the daemon, which checks it again and alone sends it.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { PendingPage, Reply, RequestCard } from "./bridge";
 import {
   type CardAnswer,
@@ -14,6 +14,8 @@ import {
   type FormValues,
   formAnswer,
   initialValues,
+  normalizedValues,
+  otherChoice,
   shownFields,
 } from "./surfaces";
 import { type AskOwner, bridge } from "./ui";
@@ -405,7 +407,10 @@ const RequestCardView = ({
               type="button"
               data-answer="submit"
               onClick={() => {
-                const built = formAnswer(detail.fields, merged(detail.fields, draft));
+                const built = formAnswer(
+                  detail.fields,
+                  normalizedValues(detail.fields, draft.values, draft.custom),
+                );
                 if ("error" in built) setProblem(built.error);
                 else
                   send({
@@ -433,20 +438,6 @@ const RequestCardView = ({
   );
 };
 
-/** The values with each choice field's typed custom text in place of its "Other" choice. */
-const merged = (fields: readonly FormField[], draft: Draft): FormValues => {
-  const values = { ...draft.values };
-  for (const item of fields) {
-    const typed = draft.custom[item.key]?.trim();
-    if (item.type === "string" && item.options && values[item.key] === otherChoice)
-      values[item.key] = typed ?? "";
-    if (item.type === "multiselect" && typed) values[item.key] = [...list(values[item.key]), typed];
-  }
-  return values;
-};
-
-const otherChoice = "\u0000other";
-
 const list = (value: FormValues[string]) => (Array.isArray(value) ? value : []);
 const typed = (value: FormValues[string]) => (typeof value === "string" ? value : "");
 
@@ -468,12 +459,14 @@ const QuestionForm = ({
   const set = (key: string, value: FormValues[string]) =>
     onChange({ ...values, [key]: value }, custom);
   const type = (key: string, text: string) => onChange(values, { ...custom, [key]: text });
+  // Each rendering of a form names its radio groups apart from every other card's and place's.
+  const scope = useId();
   return (
     <fieldset className="request-form" disabled={disabled}>
       <legend>{title}</legend>
-      {shownFields(fields, values).map((item) => {
+      {shownFields(fields, normalizedValues(fields, values, custom)).map((item) => {
         const label = item.title ?? item.key;
-        const id = `field-${item.key}`;
+        const id = `${scope}-${item.key}`;
         return (
           <div key={item.key} className="request-field">
             {item.description ? <p className="request-description">{item.description}</p> : null}
