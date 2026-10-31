@@ -38,6 +38,8 @@ export interface Requests {
   draft: (card: RequestCard) => Draft;
   setDraft: (card: RequestCard, change: Partial<Draft>) => void;
   answer: (card: RequestCard, chosen: CardAnswer) => void;
+  // The card as the latest read shows it, for a check after a dialog closes.
+  current: (id: number) => RequestCard | undefined;
   refresh: () => void;
 }
 
@@ -68,6 +70,7 @@ export const useRequests = (): Requests => {
   const [notes, setNotes] = useState<ReadonlyMap<number, string>>(new Map());
   const [drafts, setDrafts] = useState<ReadonlyMap<number, Draft>>(new Map());
   const fence = useRef(cardsFence());
+  const latest = useRef<RequestCard[]>([]);
   const locks = useRef(new Set<number>());
   const reading = useRef(false);
 
@@ -122,6 +125,7 @@ export const useRequests = (): Requests => {
         if (after === null || pages >= pagesPerRead) break;
       }
       if (!fence.current.land(generation)) return;
+      latest.current = read;
       setCards(read);
       setMore(after !== null);
       setError(null);
@@ -198,6 +202,7 @@ export const useRequests = (): Requests => {
     draft,
     setDraft,
     answer,
+    current: (id) => latest.current.find((item) => item.id === id),
     refresh: () => void poll(),
   };
 };
@@ -275,7 +280,7 @@ const RequestCardView = ({
           danger: true,
           // The confirmation holds only for the request the owner read.
           run: () => {
-            const now = requests.cards.find((item) => item.id === card.id);
+            const now = requests.current(card.id);
             if (now?.revision !== revision || !now.actionable) {
               setProblem("The request changed, so nothing was sent.");
               return;
