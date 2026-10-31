@@ -449,9 +449,32 @@ export const requestTitle = (request: Pick<RequestAudit, "state" | "goneAt">) =>
 export const requestLine = (
   request: Pick<RequestAudit, "id" | "kind" | "source" | "worker" | "state" | "goneAt" | "summary">,
 ) => {
-  const from = request.source === "worker" ? `worker #${request.worker ?? 0}` : "Threads";
+  const from =
+    request.source === "worker"
+      ? `worker #${request.worker ?? 0}`
+      : request.source === "dot"
+        ? "the dot's own session"
+        : "Threads";
   return `#${request.id} ${request.kind} from ${from} · ${requestTitle(request)}${request.summary ? ` · ${request.summary}` : ""}`;
 };
+
+/**
+ * Each answer chosen for a request, oldest first, and who chose it: "By you · confirmed", or
+ * "By the dot · not sent (refused)". An answer whose outcome is unknown stays so.
+ */
+export const requestAttempts = (request: Pick<RequestAudit, "attempts">) =>
+  (request.attempts ?? []).map((attempt) => {
+    const state =
+      {
+        queued: "queued",
+        sending: "sending",
+        confirmed: "confirmed",
+        unknown: "outcome unknown",
+        refused: "not sent",
+        stale: "not sent",
+      }[attempt.state] ?? attempt.state;
+    return `${attempt.actor === "owner" ? "By you" : "By the dot"} · ${state}${attempt.error ? ` (${attempt.error})` : ""} · ${when(attempt.queuedAt)}`;
+  });
 
 /** What the worker asked, in its own words, which are the worker's data. */
 export const requestAsked = (request: Pick<RequestAudit, "detail">) => {

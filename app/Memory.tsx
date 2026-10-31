@@ -42,6 +42,7 @@ import {
   ownerOrphans,
   ownerOutcome,
   requestAsked,
+  requestAttempts,
   requestLine,
   requestTimes,
   runAttribution,
@@ -1587,7 +1588,7 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
           </ul>
         </Section>
 
-        <Section title="Worker requests and answers" id="requests">
+        <Section title="Requests and answers" id="requests">
           {requestsError ? <div className="item-error">{requestsError}</div> : null}
           {requests ? (
             <>
@@ -1612,8 +1613,15 @@ export const Memory = ({ dot, ask }: { dot: string; ask: AskOwner }) => {
                       <div className="mono">OpenCode request {request.requestID}</div>
                       <div className="note">What was asked, as the worker's data:</div>
                       <pre className="source">{request.detailText}</pre>
-                      <div className="note">The dot's complete answer:</div>
+                      <div className="note">The complete answer:</div>
                       <pre className="source">{request.answerText ?? "None"}</pre>
+                      {requestAttempts(request).length ? (
+                        <ul className="note" data-request-attempts>
+                          {requestAttempts(request).map((line, index) => (
+                            <li key={index}>{line}</li>
+                          ))}
+                        </ul>
+                      ) : null}
                     </details>
                   </li>
                 ))}

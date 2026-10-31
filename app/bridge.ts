@@ -532,6 +532,8 @@ export interface RequestAudit {
   } | null;
   /** The dot session that chose the answer. */
   actorSession?: string | null;
+  /** Every answer chosen for it, by the dot or the owner, oldest first. */
+  attempts?: AttemptView[];
   queuedAt?: number | null;
   attemptedAt?: number | null;
   confirmedAt?: number | null;
@@ -675,10 +677,6 @@ export interface OwnerMemory {
 
 export type OwnerAction = "create" | "approve" | "edit" | "reject" | "delete";
 
-/**
- * An owner fact change main saved before sending it: only IDs, the action and the version it was
- * made at, never the text. One still listed may or may not have landed.
- */
 /** A permission request or question waiting for the owner, as the app shows it as a card. */
 export interface RequestCard {
   id: number;
@@ -752,6 +750,10 @@ export interface AnswerRecord {
   createdAt: number;
 }
 
+/**
+ * An owner fact change main saved before sending it: only IDs, the action and the version it was
+ * made at, never the text. One still listed may or may not have landed.
+ */
 export interface OwnerMutation {
   factID: string;
   mutationID: string;

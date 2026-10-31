@@ -208,6 +208,7 @@ export const shapes: Record<Operation, Shape> = {
         state: "s",
         needsYou: "b",
         createdAt: "n",
+        "attempts?": [attemptView],
       },
     ],
     "next?": "n",

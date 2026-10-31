@@ -16,6 +16,7 @@ import {
   grantRemaining,
   nextRunLine,
   requestAsked,
+  requestAttempts,
   requestLine,
   requestTimes,
   requestTitle,
@@ -341,4 +342,43 @@ test("an app-level token must name the dot's own app, and a bot token waits for 
   expect(tokenMatches("linkApp", appToken, undefined)).toBe(true);
   expect(tokenMatches("app", ` ${appToken}`, "A0123456789")).toBe(false);
   expect(tokenMatches("bot", appToken, undefined)).toBe(false);
+});
+
+test("the audit names the dot's own session and who chose each answer", () => {
+  expect(
+    requestLine({
+      id: 5,
+      source: "dot",
+      worker: null,
+      kind: "permission",
+      state: "answered",
+      summary: "Approved always",
+    }),
+  ).toBe("#5 permission from the dot's own session · confirmed · Approved always");
+  const lines = requestAttempts({
+    attempts: [
+      {
+        id: "a",
+        actor: "dot",
+        state: "refused",
+        error: "refused",
+        queuedAt: 1000,
+        attemptedAt: null,
+        confirmedAt: null,
+      },
+      {
+        id: "b",
+        actor: "owner",
+        state: "confirmed",
+        error: null,
+        queuedAt: 2000,
+        attemptedAt: 2100,
+        confirmedAt: 2200,
+      },
+    ],
+  });
+  expect(lines).toHaveLength(2);
+  expect(lines[0]).toStartWith("By the dot · not sent (refused) · ");
+  expect(lines[1]).toStartWith("By you · confirmed · ");
+  expect(requestAttempts({})).toEqual([]);
 });
