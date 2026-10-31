@@ -786,6 +786,8 @@ export type RequestDetail =
       readonly action: string;
       readonly resources: readonly string[];
       readonly message?: string;
+      // The patterns OpenCode saves when the request is approved always.
+      readonly save?: readonly string[];
     }
   | {
       readonly kind: "question";
@@ -793,9 +795,12 @@ export type RequestDetail =
       readonly fields: readonly Record<string, unknown>[];
     };
 
-/** What the dot chose. Saved before the daemon makes the one call that sends it. */
+/**
+ * What the dot or the owner chose. Saved before the daemon makes the one call that sends it. Only
+ * the owner may choose always, or reject with a message.
+ */
 export type RequestAnswer =
-  | { readonly decision: "once" | "reject" }
+  | { readonly decision: "once" | "reject" | "always"; readonly message?: string }
   | {
       readonly decision: "reply";
       readonly answer: Record<string, string | number | boolean | readonly string[]>;
@@ -827,8 +832,9 @@ export const requests = sqliteTable(
     dot: text()
       .notNull()
       .references(() => dots.name),
-    // An open-dot worker, or a Threads worker whose coordinator is the dot's session.
-    source: text({ enum: ["worker", "threads"] }).notNull(),
+    // An open-dot worker, a Threads worker whose coordinator is the dot's session, or the dot's
+    // own bound session, whose requests only the owner answers.
+    source: text({ enum: ["worker", "threads", "dot"] }).notNull(),
     worker: integer(),
     sessionID: text("session_id").notNull(),
     title: text().notNull(),
@@ -856,11 +862,58 @@ export const requests = sqliteTable(
     attemptedAt: integer("attempted_at"),
     confirmedAt: integer("confirmed_at"),
     escalatedAt: integer("escalated_at"),
+    // The attempt in `request_answers` the answer columns above describe, or null for an older
+    // row; those columns mirror it, so they read as before.
+    currentAnswerID: text("current_answer_id"),
   },
   (table) => [unique().on(table.sessionID, table.kind, table.requestID)],
 );
 
 export type WorkerRequest = typeof requests.$inferSelect;
+
+export const answerStates = [
+  "queued",
+  "sending",
+  "confirmed",
+  "unknown",
+  "refused",
+  "stale",
+] as const;
+
+/**
+ * Every answer chosen for a request, by the dot or the owner, kept for the audit. Its request,
+ * actor, bound dot session and answer never change; only its outcome does, conditionally.
+ * "queued": saved, not sent. "sending": saved just before the one call. "confirmed": OpenCode
+ * confirmed it. "unknown": the call's outcome was lost, so it's never sent again. "refused" and
+ * "stale": provably never sent. At most one attempt per request is queued, sending or possibly
+ * sent, so another may follow only a provably unsent one.
+ */
+export const requestAnswers = sqliteTable(
+  "request_answers",
+  {
+    id: text().primaryKey(),
+    request: integer()
+      .notNull()
+      .references(() => requests.id),
+    actor: text({ enum: ["dot", "owner"] }).notNull(),
+    // The dot's bound session the answer was chosen under.
+    boundSession: text("bound_session").notNull(),
+    answer: text({ mode: "json" }).$type<RequestAnswer>().notNull(),
+    state: text({ enum: answerStates }).notNull(),
+    // A fixed code for why it wasn't confirmed, never a request's or an answer's words.
+    error: text(),
+    queuedAt: integer("queued_at").notNull(),
+    attemptedAt: integer("attempted_at"),
+    confirmedAt: integer("confirmed_at"),
+  },
+  (table) => [
+    uniqueIndex("request_answers_live")
+      .on(table.request)
+      .where(sql`${table.state} in ('queued', 'sending', 'confirmed', 'unknown')`),
+  ],
+);
+
+export type RequestAnswerAttempt = typeof requestAnswers.$inferSelect;
 
 export interface WorkerWaiting {
   readonly current: readonly string[];

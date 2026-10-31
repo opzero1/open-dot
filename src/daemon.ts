@@ -33,8 +33,11 @@ import {
   workers,
 } from "./schema";
 import {
+  actorOf,
   escalate,
   graceMs,
+  ownerAnswerProblem,
+  settleAttempt,
   unseenLimitMs,
   invalidAnswer,
   malformedAnswer,
@@ -700,6 +703,7 @@ const noteRequests = (
           .get();
         if (worker?.state !== "running" || worker.sessionID !== owner.sessionID) return;
       }
+      if (owner.source === "dot" && owner.sessionID !== dotSession) return;
       const now = Date.now();
       const saved = tx.select().from(requests).where(eq(requests.sessionID, owner.sessionID)).all();
       const listed = new Set(waiting.map(requestKey));
@@ -730,6 +734,21 @@ const noteRequests = (
           .get();
         if (told.has(requestKey(item))) {
           tx.update(requests).set({ noticedAt: now }).where(eq(requests.id, row.id)).run();
+          continue;
+        }
+        // The dot's own session waits on its owner, who sees it as a card in the app; the dot
+        // is never asked to approve its own request.
+        if (owner.source === "dot") {
+          tx.update(requests)
+            .set({
+              state: "escalated",
+              reason: item.sensitive
+                ? "It may ask for a secret, so answer it in its session in a terminal."
+                : "The dot's own session waits on you.",
+              escalatedAt: now,
+            })
+            .where(eq(requests.id, row.id))
+            .run();
           continue;
         }
         if (item.sensitive)
@@ -1029,29 +1048,52 @@ const answering = new Set<number>();
 const readRequest = (db: Db, id: number) =>
   db.select().from(requests).where(eq(requests.id, id)).get();
 
-const refuse = (db: Db, row: WorkerRequest, why: string) =>
+/**
+ * Gives a queued answer back unsent, with a fixed code on its attempt. The dot's goes to the
+ * owner with one message in the chat; the owner's goes back to waiting for the owner, who sees
+ * why on its card, and may answer again since this one provably never left.
+ */
+const refuse = (db: Db, row: WorkerRequest, why: string, code = "refused", now = Date.now()) =>
   db.transaction(
-    (tx) =>
-      escalate(
-        tx,
-        row,
-        {
-          from: "queued",
-          state: "escalated",
-          reason: why,
-          message: `open-dot didn't send the dot's answer: ${why}`,
-        },
-        Date.now(),
-      ),
+    (tx) => {
+      const owner = actorOf(tx, row) === "owner";
+      const done = owner
+        ? tx
+            .update(requests)
+            .set({ state: "escalated", reason: why })
+            .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
+            .returning({ id: requests.id })
+            .get() !== undefined
+        : escalate(
+            tx,
+            row,
+            {
+              from: "queued",
+              state: "escalated",
+              reason: why,
+              message: `open-dot didn't send the dot's answer: ${why}`,
+            },
+            now,
+          );
+      if (done) settleAttempt(tx, row, ["queued"], { state: "refused", error: code });
+      return done;
+    },
     { behavior: "immediate" },
   );
 
 const markStale = (db: Db, row: WorkerRequest, why: string) =>
-  db
-    .update(requests)
-    .set({ state: "stale", reason: why })
-    .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
-    .run();
+  db.transaction(
+    (tx) => {
+      const done = tx
+        .update(requests)
+        .set({ state: "stale", reason: why })
+        .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
+        .returning({ id: requests.id })
+        .get();
+      if (done) settleAttempt(tx, row, ["queued"], { state: "stale", error: "gone" });
+    },
+    { behavior: "immediate" },
+  );
 
 /** How long a read before an answer may take; past it the answer goes to the owner unsent. */
 const lookupTimeout = "10 seconds";
@@ -1072,10 +1114,19 @@ const whyNot = (
   fresh: Waiting | undefined,
   threads: ThreadsWorker | undefined,
 ): { readonly stale: string } | { readonly refuse: string } | undefined => {
-  const malformed = malformedAnswer(row.kind, answer);
+  const actor = actorOf(db, row);
+  // The owner's consent lifts only the limits on what a dot may decide; scope still applies.
+  const malformed =
+    actor === "owner"
+      ? ownerAnswerProblem(row, answer, answer.decision === "always")
+      : malformedAnswer(row.kind, answer);
   if (malformed) return { refuse: malformed };
-  const problem = ownershipProblem(db, row, actorSession);
-  if (problem === "The worker isn't running any more.") return { stale: problem };
+  const problem = ownershipProblem(db, row, actorSession, actor);
+  if (
+    problem === "The worker isn't running any more." ||
+    problem === "It was the dot's earlier conversation."
+  )
+    return { stale: problem };
   if (problem) return { refuse: problem };
   if (row.source === "threads") {
     if (threads?.workerID !== row.sessionID || threads.coordinatorID !== actorSession)
@@ -1087,7 +1138,8 @@ const whyNot = (
   if (fresh.sensitive) return { refuse: "It may ask for a secret." };
   if (JSON.stringify(fresh.detail) !== JSON.stringify(row.detail))
     return { refuse: "It changed after the dot answered." };
-  const guard = answer.decision === "once" ? requestReview(db, row).refuse : undefined;
+  const guard =
+    actor === "dot" && answer.decision === "once" ? requestReview(db, row).refuse : undefined;
   if (guard) return { refuse: `It ${guard}.` };
   const invalid =
     answer.decision === "reply" ? invalidAnswer(row.detail, answer.answer) : undefined;
@@ -1125,6 +1177,7 @@ const answerOne = (db: Db, queued: WorkerRequest) =>
           db,
           initial,
           `open-dot couldn't read what the worker waits on: ${reason(pending.failure)}.`,
+          "read-failed",
         );
         return;
       }
@@ -1140,7 +1193,7 @@ const answerOne = (db: Db, queued: WorkerRequest) =>
               .pipe(Effect.timeout(lookupTimeout), Effect.result)
           : undefined;
         if (!snapshot || Result.isFailure(snapshot)) {
-          refuse(db, initial, "Threads couldn't confirm it is the dot's worker.");
+          refuse(db, initial, "Threads couldn't confirm it is the dot's worker.", "read-failed");
           return;
         }
         threads = snapshot.success.find((worker) => worker.workerID === initial.sessionID);
@@ -1154,42 +1207,79 @@ const answerOne = (db: Db, queued: WorkerRequest) =>
         else refuse(db, row, blocked.refuse);
         return;
       }
-      const started = db
-        .update(requests)
-        .set({ state: "answering", attemptedAt: Date.now() })
-        .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
-        .returning()
-        .get();
+      // The attempt is saved before its one call, in the same write as the request's state.
+      const attemptedAt = Date.now();
+      const started = db.transaction(
+        (tx) => {
+          const saved = tx
+            .update(requests)
+            .set({ state: "answering", attemptedAt })
+            .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
+            .returning()
+            .get();
+          if (saved) settleAttempt(tx, saved, ["queued"], { state: "sending", attemptedAt });
+          return saved;
+        },
+        { behavior: "immediate" },
+      );
       if (!started) return;
       answering.add(row.id);
       const sent = yield* opencode
         .answer(row.sessionID, row.kind, row.requestID, row.answer)
         .pipe(Effect.timeout(answerTimeout), Effect.exit);
-      if (Exit.isSuccess(sent))
-        db.update(requests)
-          .set({ state: "answered", confirmedAt: Date.now() })
-          .where(and(eq(requests.id, row.id), eq(requests.state, "answering")))
-          .run();
-      else lost(db, started, "OpenCode didn't confirm it got the dot's answer.");
+      if (Exit.isSuccess(sent)) {
+        const confirmedAt = Date.now();
+        db.transaction(
+          (tx) => {
+            const done = tx
+              .update(requests)
+              .set({ state: "answered", confirmedAt })
+              .where(and(eq(requests.id, row.id), eq(requests.state, "answering")))
+              .returning({ id: requests.id })
+              .get();
+            if (done) settleAttempt(tx, started, ["sending"], { state: "confirmed", confirmedAt });
+          },
+          { behavior: "immediate" },
+        );
+      } else lost(db, started, "OpenCode didn't confirm it got the dot's answer.", "not-confirmed");
       // Only once the outcome is saved; an interrupted call stays answering until a restart.
       answering.delete(row.id);
     }),
   );
 
-const lost = (db: Db, row: WorkerRequest, why: string) =>
+/**
+ * An answer whose call's outcome was lost: unknown, never sent again. The dot's tells the owner
+ * once in the chat; the owner's shows on its card, read-only.
+ */
+const lost = (db: Db, row: WorkerRequest, why: string, code: string) =>
   db.transaction(
-    (tx) =>
-      escalate(
-        tx,
-        row,
-        {
-          from: "answering",
-          state: "unknown",
-          reason: why,
-          message: `${why} It may or may not have reached the worker, and open-dot won't send it again.`,
-        },
-        Date.now(),
-      ),
+    (tx) => {
+      const done =
+        actorOf(tx, row) === "owner"
+          ? tx
+              .update(requests)
+              .set({
+                state: "unknown",
+                reason: why.replace("the dot's answer", "your answer"),
+                escalatedAt: Date.now(),
+              })
+              .where(and(eq(requests.id, row.id), eq(requests.state, "answering")))
+              .returning({ id: requests.id })
+              .get() !== undefined
+          : escalate(
+              tx,
+              row,
+              {
+                from: "answering",
+                state: "unknown",
+                reason: why,
+                message: `${why} It may or may not have reached the session, and open-dot won't send it again.`,
+              },
+              Date.now(),
+            );
+      if (done) settleAttempt(tx, row, ["sending", "queued"], { state: "unknown", error: code });
+      return done;
+    },
     { behavior: "immediate" },
   );
 
@@ -1197,26 +1287,26 @@ const lost = (db: Db, row: WorkerRequest, why: string) =>
 export const queuedLimitMs = 60_000;
 
 const settle = (db: Db, row: WorkerRequest, from: "open" | "queued", why: string, now: number) =>
-  db.transaction(
-    (tx) =>
-      escalate(
-        tx,
-        row,
-        {
-          from,
-          state: "escalated",
-          reason: why,
-          message:
-            from === "open"
-              ? row.noticedAt === null
-                ? "Its notice couldn't reach the dot within fifteen minutes."
-                : "The dot didn't answer it within two minutes."
-              : `open-dot didn't send the dot's answer: ${why}`,
-        },
-        now,
-      ),
-    { behavior: "immediate" },
-  );
+  from === "queued"
+    ? refuse(db, row, why, "queued-timeout", now)
+    : db.transaction(
+        (tx) =>
+          escalate(
+            tx,
+            row,
+            {
+              from,
+              state: "escalated",
+              reason: why,
+              message:
+                row.noticedAt === null
+                  ? "Its notice couldn't reach the dot within fifteen minutes."
+                  : "The dot didn't answer it within two minutes.",
+            },
+            now,
+          ),
+        { behavior: "immediate" },
+      );
 
 /**
  * The local, database-only half of worker requests, with no OpenCode call, so it runs even while
@@ -1229,7 +1319,12 @@ const settle = (db: Db, row: WorkerRequest, from: "open" | "queued", why: string
 export const settleRequests = (db: Db, now: number) => {
   for (const row of db.select().from(requests).where(eq(requests.state, "answering")).all())
     if (!answering.has(row.id))
-      lost(db, row, "The daemon stopped before OpenCode confirmed the dot's answer.");
+      lost(
+        db,
+        row,
+        "The daemon stopped before OpenCode confirmed the dot's answer.",
+        "daemon-restart",
+      );
   db.update(requests)
     .set({ goneAt: now })
     .where(
@@ -1300,6 +1395,36 @@ export const answerAll = (db: Db) =>
       .orderBy(asc(requests.id))
       .all();
     return Effect.forEach(queued, (row) => answerOne(db, row), { discard: true });
+  });
+
+/**
+ * Finds the permission requests and questions each ready dot's own bound session waits on, each
+ * read bounded in time and apart from delivery, so the owner can answer them from the app. A
+ * failed read changes nothing; noteRequests checks the binding again after it.
+ */
+export const watchOwn = (db: Db) =>
+  Effect.gen(function* () {
+    const opencode = yield* OpenCode;
+    for (const dot of db.select().from(dots).where(eq(dots.sessionState, "ready")).all()) {
+      const waiting = yield* opencode.waiting(dot.sessionID).pipe(
+        Effect.timeout(lookupTimeout),
+        Effect.catch(() => Effect.succeed(undefined)),
+      );
+      if (!waiting) continue;
+      noteRequests(
+        db,
+        {
+          dot: dot.name,
+          source: "dot",
+          worker: null,
+          sessionID: dot.sessionID,
+          title: dot.name,
+          directory: dot.directory,
+        },
+        dot.sessionID,
+        waiting,
+      );
+    }
   });
 
 /**
@@ -1455,6 +1580,15 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
     Effect.provide(layer),
     Effect.catch(() => Effect.void),
   );
+  // Only reads: what each ready dot's own session waits on.
+  const own = Effect.suspend(() =>
+    readyDots(db).length
+      ? watchOwn(db).pipe(
+          Effect.provide(layer),
+          Effect.catch(() => Effect.void),
+        )
+      : Effect.void,
+  );
   // Only reads, and only while an admitted run's turn hasn't been seen to end or go missing.
   const runs = Effect.suspend(() =>
     hasOpenRuns(db)
@@ -1501,6 +1635,7 @@ export const daemonLoops = (db: Db, layer: Layer.Layer<OpenCode, OpenCodeError>)
       Effect.repeat(settling, Schedule.spaced("1 second")),
       Effect.repeat(answers, Schedule.spaced("1 second")),
       Effect.repeat(threads, Schedule.spaced("5 seconds")),
+      Effect.repeat(own, Schedule.spaced("2 seconds")),
       Effect.repeat(runs, Schedule.spaced("5 seconds")),
       Effect.repeat(archiving, Schedule.spaced("10 seconds")),
       Effect.repeat(observing, Schedule.spaced("10 seconds")),

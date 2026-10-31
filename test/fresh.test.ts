@@ -15,6 +15,7 @@ import {
   notes,
   outbox,
   reminders,
+  requests,
   responsibilities,
   type Route,
   slackThreads,
@@ -129,7 +130,26 @@ test("a fresh start rebinds the dot, moves what's pending and keeps its memory",
     .values({ key: "k", route: route(old), oldest: "1.1", newest: "1.1", activeAt: 1 })
     .run();
 
+  // The old session's own request waits for the owner; after the move it's no longer a card.
+  db.insert(requests)
+    .values({
+      dot: "jojo",
+      source: "dot",
+      sessionID: old,
+      title: "jojo",
+      directory: dot.directory,
+      kind: "permission",
+      requestID: "per_own",
+      detail: { kind: "permission", action: "bash", resources: ["ls"] },
+      state: "escalated",
+      createdAt: 1,
+    })
+    .run();
   const result = await run(startFresh(db, "jojo", false, Date.UTC(2026, 9, 29)));
+  expect(db.select().from(requests).get()).toMatchObject({
+    sessionID: old,
+    goneAt: Date.UTC(2026, 9, 29),
+  });
 
   expect(Result.isSuccess(result)).toBe(true);
   const fresh = findDot(db, "jojo");

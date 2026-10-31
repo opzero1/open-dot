@@ -95,7 +95,16 @@ import {
   saveReaction,
 } from "./reactions";
 import { quoted, quoteText, replyPrompt } from "./replies";
-import { answerSummary, needsYou, requestView } from "./requests";
+import {
+  answerSummary,
+  attemptsOf,
+  cardView,
+  needsYou,
+  pendingLimit,
+  pendingRequests,
+  queueOwnerAnswer,
+  requestView,
+} from "./requests";
 import { loadMedia, mediaLinks } from "./media";
 import { listRuns } from "./runs";
 import { isRecord, slackIDs } from "./slack";
@@ -150,6 +159,7 @@ import {
   slackApps,
   slackConfig,
   type Worker,
+  type RequestAnswer,
   type WorkerRequest,
   workers,
 } from "./schema";
@@ -256,7 +266,7 @@ const listAll = (db: Db) =>
       .from(requests)
       .where(
         or(
-          and(eq(requests.source, "threads"), isNull(requests.goneAt)),
+          and(inArray(requests.source, ["threads", "dot"]), isNull(requests.goneAt)),
           eq(requests.state, "unknown"),
         ),
       )
@@ -334,9 +344,136 @@ const requestAudit = (db: Db, request: Request, path: string[]) => {
     .limit(auditPage)
     .all();
   return Response.json({
-    requests: page.map((row) => requestView(row, now)),
+    requests: page.map((row) => ({ ...requestView(row, now), attempts: attemptsOf(db, row.id) })),
     next: page.length === auditPage ? (page.at(-1)?.id ?? null) : null,
   });
+};
+
+/** Only the shape; queueOwnerAnswer checks it against the request. */
+const isRequestAnswer = (value: unknown): value is RequestAnswer =>
+  isRecord(value) && !Array.isArray(value) && typeof value.decision === "string";
+
+const attemptIDPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const sessionPattern = /^ses_[A-Za-z0-9]{1,64}$/;
+const revisionPattern = /^[0-9a-f]{32}$/;
+const answerKeys = new Set([
+  "attemptID",
+  "boundSessionID",
+  "revision",
+  "answer",
+  "confirmedAlways",
+]);
+
+/**
+ * `GET /dots/<name>/requests/<id>`: one request as a card, with every answer chosen for it, for
+ * the app's receipts. `POST /dots/<name>/requests/<id>/answer`: the owner's answer, saved as one
+ * queued attempt for the daemon's answer loop to check again and send once. Only
+ * `{ attemptID, boundSessionID, revision, answer, confirmedAlways? }` in at most 64 KiB; the actor
+ * is always the owner, never the body's to say. 202 with the receipt, also for the same attempt
+ * again; 409 for a stale or competing one; 422 for an answer open-dot won't send from here.
+ */
+const ownerRequestRoute = async (db: Db, request: Request, path: string[]) => {
+  const [, rawName, , rawID, action, ...extra] = path;
+  if (
+    extra.length ||
+    rawID === undefined ||
+    !positive.test(rawID) ||
+    !Number.isSafeInteger(Number(rawID)) ||
+    !(
+      (action === undefined && request.method === "GET") ||
+      (action === "answer" && request.method === "POST")
+    )
+  )
+    return error(404, "Not found");
+  let name: string;
+  try {
+    name = decodeURIComponent(rawName ?? "");
+  } catch {
+    return error(400, "Bad dot name.");
+  }
+  const dot = findDot(db, name);
+  if (!dot) return error(404, `There's no dot named "${name}".`);
+  if (new URL(request.url).search) return error(400, "This route takes no parameters.");
+  const id = Number(rawID);
+  const receipt = () => {
+    const row = db.select().from(requests).where(eq(requests.id, id)).get();
+    return row?.dot === dot.name
+      ? { request: cardView(db, row, Date.now()), attempts: attemptsOf(db, row.id) }
+      : undefined;
+  };
+  if (action === undefined) {
+    const found = receipt();
+    return found ? Response.json(found) : error(404, "There's no such request.");
+  }
+  let body: unknown;
+  try {
+    body = await messageBody(request, 64 * 1024);
+  } catch {
+    return error(400, "The body must be JSON.");
+  }
+  if (body instanceof Response) return body;
+  if (!isRecord(body) || Array.isArray(body)) return error(400, "The body must be an object.");
+  const input = body;
+  if (Object.keys(input).some((key) => !answerKeys.has(key)))
+    return error(
+      400,
+      "The body may hold only attemptID, boundSessionID, revision, answer and confirmedAlways.",
+    );
+  if (typeof input.attemptID !== "string" || !attemptIDPattern.test(input.attemptID))
+    return error(400, "attemptID must be a lowercase UUID.");
+  if (typeof input.boundSessionID !== "string" || !sessionPattern.test(input.boundSessionID))
+    return error(400, "boundSessionID must be a session ID.");
+  if (typeof input.revision !== "string" || !revisionPattern.test(input.revision))
+    return error(400, "revision must be the request's revision.");
+  if (input.confirmedAlways !== undefined && typeof input.confirmedAlways !== "boolean")
+    return error(400, "confirmedAlways must be true or false.");
+  const answer = input.answer;
+  if (!isRequestAnswer(answer)) return error(400, "answer must be an object with a decision.");
+  const queued = queueOwnerAnswer(db, {
+    dot: dot.name,
+    id,
+    attemptID: input.attemptID,
+    boundSessionID: input.boundSessionID,
+    revision: input.revision,
+    answer,
+    confirmedAlways: input.confirmedAlways === true,
+  });
+  if (queued.status !== 202) return error(queued.status, queued.error);
+  return Response.json({ attemptID: queued.attempt, ...receipt() }, { status: 202 });
+};
+
+/**
+ * `GET /requests/pending[?dot=<name>][&after=<id>][&limit=<n>]`: the requests the owner sees as
+ * cards, oldest first, 1 to 100 a page, 50 by default, with `next` as the `after` of the next.
+ */
+const pendingRoute = (db: Db, request: Request) => {
+  const query = new URL(request.url).searchParams;
+  const keys = [...query.keys()];
+  if (
+    keys.some((key) => !["dot", "after", "limit"].includes(key)) ||
+    new Set(keys).size !== keys.length
+  )
+    return error(400, "Only dot, after and limit, each once.");
+  const rawAfter = query.get("after");
+  const rawLimit = query.get("limit");
+  if (rawAfter !== null && !positive.test(rawAfter))
+    return error(400, "after must be a request ID.");
+  const limit = rawLimit === null ? 50 : Number(rawLimit);
+  if (rawLimit !== null && (!positive.test(rawLimit) || limit > pendingLimit))
+    return error(400, "limit must be 1 to 100.");
+  const name = query.get("dot");
+  if (name !== null && !findDot(db, name)) return error(404, `There's no dot named "${name}".`);
+  return Response.json(
+    pendingRequests(
+      db,
+      {
+        ...(name === null ? {} : { dot: name }),
+        ...(rawAfter === null ? {} : { after: Number(rawAfter) }),
+        limit,
+      },
+      Date.now(),
+    ),
+  );
 };
 
 /**
@@ -3204,7 +3341,19 @@ export const api = (
         return error(500, "Couldn't read or save the owner's facts.");
       });
     if (path[0] === "workers") return workerRoute(db, request, path.slice(1), layer, run);
+    if (path[0] === "requests" && path[1] === "pending" && path.length === 2)
+      return Promise.resolve(
+        request.method === "GET" ? pendingRoute(db, request) : error(404, "Not found"),
+      );
     if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);
+    if (path[0] === "dots" && path[2] === "requests" && path.length > 3)
+      return ownerRequestRoute(db, request, path).catch((cause) => {
+        console.error(`Requests: ${cause instanceof Error ? cause.name : "failed"}`);
+        return error(
+          500,
+          "Couldn't read or save the answer. Check its receipt before answering again.",
+        );
+      });
     if (path[0] === "dots" && path[2] === "requests")
       return Promise.resolve(requestAudit(db, request, path));
     if (path[0] === "dots" && path[2] === "usage")

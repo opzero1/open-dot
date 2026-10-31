@@ -1,14 +1,19 @@
 import { SessionMessage } from "@opencode/client/effect";
-import { and, eq, ne } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Db } from "./db";
 import { activeGrants, covering, gatedOperation, grantScope, type Operation } from "./grants";
+import { looksSecret } from "./memory";
 import {
+  type answerStates,
   dots,
   type Grant,
   outbox,
   type RequestAnswer,
+  type RequestAnswerAttempt,
+  requestAnswers,
   type RequestDetail,
   requests,
   supervisions,
@@ -43,7 +48,9 @@ const kindName = (row: Pick<WorkerRequest, "kind">) =>
 const who = (row: Pick<WorkerRequest, "source" | "worker" | "sessionID">) =>
   row.source === "worker"
     ? `Worker #${row.worker} (session ${row.sessionID})`
-    : `Your Threads worker session ${row.sessionID}`;
+    : row.source === "dot"
+      ? `Your own session ${row.sessionID}`
+      : `Your Threads worker session ${row.sessionID}`;
 
 /**
  * True when the owner should look at it now: an answer whose outcome is unknown, which stays so
@@ -408,25 +415,34 @@ export const escalate = (
 };
 
 /**
- * Why the dot can't answer this request now, if it can't: it isn't this dot's, the dot's session
- * changed, the worker stopped, or the owner supervises the session. The daemon asks again just
- * before its call. Threads ownership is checked by the daemon against a fresh snapshot.
+ * Why the dot, or the owner, can't answer this request now, if they can't: it isn't this dot's,
+ * the dot's session changed, the worker stopped, or, for the dot only, the owner supervises the
+ * session. The daemon asks again just before its call. Threads ownership is checked by the daemon
+ * against a fresh snapshot. A dot's own session's request is only ever the owner's to answer,
+ * and only while it is still the dot's bound session.
  */
 export const ownershipProblem = (
   db: Db | Tx,
   row: WorkerRequest,
   actorSession: string,
+  actor: Actor = "dot",
 ): string | undefined => {
   const dot = db.select().from(dots).where(eq(dots.name, row.dot)).get();
   if (dot?.sessionState !== "ready" || dot.sessionID !== actorSession)
     return "The dot's conversation changed.";
+  if (row.source === "dot") {
+    if (actor === "dot") return "Only your owner answers your own session's requests.";
+    return row.sessionID === actorSession ? undefined : "It was the dot's earlier conversation.";
+  }
   if (db.select().from(dots).where(eq(dots.sessionID, row.sessionID)).get())
     return "That session is a dot's own conversation.";
-  const supervised = db
-    .select({ id: supervisions.id })
-    .from(supervisions)
-    .where(and(eq(supervisions.sessionID, row.sessionID), ne(supervisions.state, "ended")))
-    .get();
+  const supervised =
+    actor === "dot" &&
+    db
+      .select({ id: supervisions.id })
+      .from(supervisions)
+      .where(and(eq(supervisions.sessionID, row.sessionID), ne(supervisions.state, "ended")))
+      .get();
   if (supervised)
     return "Your owner supervises that session or was asked to, so only they answer it.";
   const native = db.select().from(workers).where(eq(workers.sessionID, row.sessionID)).get();
@@ -482,18 +498,348 @@ export const queueAnswer = (
         const invalid = invalidAnswer(row.detail, input.answer.answer);
         if (invalid) return invalid;
       }
-      const queued = tx
-        .update(requests)
-        .set({
-          state: "queued",
+      return (
+        saveAttempt(tx, row, {
+          id: crypto.randomUUID(),
+          actor: "dot",
+          boundSession: input.actorSession,
           answer: input.answer,
-          actorSession: input.actorSession,
-          queuedAt: Date.now(),
-        })
-        .where(and(eq(requests.id, row.id), eq(requests.state, "open")))
-        .returning()
-        .get();
-      return queued ?? "It changed meanwhile, so nothing was saved.";
+          from: "open",
+        }) ?? "It changed meanwhile, so nothing was saved."
+      );
     },
     { behavior: "immediate" },
   );
+
+export type Actor = RequestAnswerAttempt["actor"];
+type AnswerState = (typeof answerStates)[number];
+
+/**
+ * Saves a new attempt and queues the request with it, in the caller's transaction, only while the
+ * request is still in `from`. The request's answer columns mirror the attempt, so their readers
+ * work as before. Undefined when the request changed meanwhile.
+ */
+const saveAttempt = (
+  tx: Tx,
+  row: WorkerRequest,
+  input: {
+    readonly id: string;
+    readonly actor: Actor;
+    readonly boundSession: string;
+    readonly answer: RequestAnswer;
+    readonly from: "open" | "escalated";
+  },
+) => {
+  const now = Date.now();
+  const queued = tx
+    .update(requests)
+    .set({
+      state: "queued",
+      answer: input.answer,
+      actorSession: input.boundSession,
+      queuedAt: now,
+      attemptedAt: null,
+      confirmedAt: null,
+      currentAnswerID: input.id,
+    })
+    .where(and(eq(requests.id, row.id), eq(requests.state, input.from), isNull(requests.goneAt)))
+    .returning()
+    .get();
+  if (!queued) return undefined;
+  tx.insert(requestAnswers)
+    .values({
+      id: input.id,
+      request: row.id,
+      actor: input.actor,
+      boundSession: input.boundSession,
+      answer: input.answer,
+      state: "queued",
+      queuedAt: now,
+    })
+    .run();
+  return queued;
+};
+
+/** Who chose the request's current answer: the dot, unless its attempt says the owner. */
+export const actorOf = (db: Db | Tx, row: WorkerRequest): Actor =>
+  row.currentAnswerID === null
+    ? "dot"
+    : (db
+        .select({ actor: requestAnswers.actor })
+        .from(requestAnswers)
+        .where(eq(requestAnswers.id, row.currentAnswerID))
+        .get()?.actor ?? "dot");
+
+/**
+ * Moves the request's current attempt on, in the caller's transaction, only from the states
+ * given. A row from before attempts were kept has none, and changes nothing here.
+ */
+export const settleAttempt = (
+  tx: Db | Tx,
+  row: Pick<WorkerRequest, "currentAnswerID">,
+  from: readonly AnswerState[],
+  change: {
+    readonly state: AnswerState;
+    readonly error?: string;
+    readonly attemptedAt?: number;
+    readonly confirmedAt?: number;
+  },
+) => {
+  if (row.currentAnswerID === null) return;
+  tx.update(requestAnswers)
+    .set(change)
+    .where(
+      and(eq(requestAnswers.id, row.currentAnswerID), inArray(requestAnswers.state, [...from])),
+    )
+    .run();
+};
+
+/** Every answer chosen for a request, oldest first, for the audit and the app's receipts. */
+export const attemptsOf = (db: Db | Tx, request: number) =>
+  db
+    .select()
+    .from(requestAnswers)
+    .where(eq(requestAnswers.request, request))
+    .orderBy(asc(requestAnswers.queuedAt), asc(requestAnswers.id))
+    .all()
+    .map((attempt) => ({
+      id: attempt.id,
+      actor: attempt.actor,
+      boundSession: attempt.boundSession,
+      answer: attempt.answer,
+      state: attempt.state,
+      error: attempt.error,
+      queuedAt: attempt.queuedAt,
+      attemptedAt: attempt.attemptedAt,
+      confirmedAt: attempt.confirmedAt,
+    }));
+
+/** Binds what the owner reviewed: the request's session, kind, OpenCode ID and saved detail. */
+export const requestRevision = (
+  row: Pick<WorkerRequest, "sessionID" | "kind" | "requestID" | "detail">,
+) =>
+  createHash("sha256")
+    .update(JSON.stringify([row.sessionID, row.kind, row.requestID, row.detail]))
+    .digest("hex")
+    .slice(0, 32);
+
+/** True when the owner can answer it from the app now. */
+export const ownerAnswerable = (row: WorkerRequest) =>
+  row.state === "escalated" && row.goneAt === null && !row.sensitive;
+
+const controls = {
+  test: (text: string) =>
+    Array.from(text).some((character) => {
+      const code = character.charCodeAt(0);
+      return (code <= 31 && code !== 9 && code !== 10) || (code >= 127 && code <= 159);
+    }),
+};
+
+/**
+ * Why an owner's answer isn't one the app may send: a permission is once, always or reject, with
+ * an optional message only on reject; a question is a reply that fits its fields, or a cancel.
+ * Always needs the owner's confirmation. Typed words that look like a credential are refused
+ * before anything is saved or echoed, best effort; that is no secrecy guarantee.
+ */
+export const ownerAnswerProblem = (
+  row: WorkerRequest,
+  answer: unknown,
+  confirmedAlways: boolean,
+): string | undefined => {
+  if (!plain(answer)) return "An answer must be an object.";
+  const keys = Object.keys(answer).toSorted().join(",");
+  if (row.kind === "permission") {
+    const decision = answer.decision;
+    if (decision !== "once" && decision !== "always" && decision !== "reject")
+      return "A permission answer is once, always or reject.";
+    if (keys !== "decision" && !(decision === "reject" && keys === "decision,message"))
+      return "Only a rejection takes a message.";
+    if (decision === "always" && !confirmedAlways) return "Always needs your confirmation first.";
+    if (decision !== "always" && confirmedAlways) return "Only always takes a confirmation.";
+    if ("message" in answer) {
+      const message = answer.message;
+      if (typeof message !== "string" || !message.trim() || message.length > 2000)
+        return "A rejection message is 1 to 2,000 characters.";
+      if (controls.test(message)) return "A rejection message can't hold control characters.";
+      if (looksSecret(message))
+        return "That message looks like it holds a credential, so it wasn't saved or sent.";
+    }
+    return undefined;
+  }
+  if (confirmedAlways) return "Only always takes a confirmation.";
+  if (answer.decision === "cancel" && keys === "decision") return undefined;
+  if (answer.decision !== "reply" || keys !== "answer,decision" || !plain(answer.answer))
+    return "A question answer is a reply with an answer object, or a decline.";
+  const invalid = invalidAnswer(row.detail, answer.answer);
+  if (invalid) return invalid;
+  const typed = Object.values(answer.answer).flatMap((value) =>
+    typeof value === "string" ? [value] : Array.isArray(value) ? value : [],
+  );
+  if (
+    typed.some((value) => typeof value === "string" && (controls.test(value) || looksSecret(value)))
+  )
+    return "An answer looks like it holds a credential or control characters, so it wasn't saved or sent.";
+  return undefined;
+};
+
+/** What became of an owner's answer, as the app's receipt shows it. */
+export type OwnerQueued =
+  | { readonly status: 202; readonly request: WorkerRequest; readonly attempt: string }
+  | { readonly status: 404 | 409 | 422; readonly error: string };
+
+/**
+ * Saves the owner's answer as a new queued attempt, once, after checking the request still waits
+ * for the owner, is the one they reviewed, belongs to the dot's bound session or one of its
+ * workers, and that the answer fits it. The same attempt ID again answers with its receipt and
+ * saves nothing; another payload under it, or a second answer, is a conflict. The daemon alone
+ * sends it. The owner's consent lifts only the limits on what a dot may decide; it creates no
+ * grant.
+ */
+export const queueOwnerAnswer = (
+  db: Db,
+  input: {
+    readonly dot: string;
+    readonly id: number;
+    readonly attemptID: string;
+    readonly boundSessionID: string;
+    readonly revision: string;
+    readonly answer: RequestAnswer;
+    readonly confirmedAlways: boolean;
+  },
+): OwnerQueued =>
+  db.transaction(
+    (tx): OwnerQueued => {
+      const row = tx.select().from(requests).where(eq(requests.id, input.id)).get();
+      if (row?.dot !== input.dot) return { status: 404, error: "There's no such request." };
+      const prior = tx
+        .select()
+        .from(requestAnswers)
+        .where(eq(requestAnswers.id, input.attemptID))
+        .get();
+      if (prior)
+        return prior.request === row.id &&
+          prior.actor === "owner" &&
+          prior.boundSession === input.boundSessionID &&
+          JSON.stringify(prior.answer) === JSON.stringify(input.answer)
+          ? { status: 202, request: row, attempt: prior.id }
+          : { status: 409, error: "That answer ID was already used for another answer." };
+      if (input.revision !== requestRevision(row))
+        return { status: 409, error: "The request changed since you looked at it." };
+      if (row.sensitive)
+        return {
+          status: 422,
+          error: "It may ask for a secret, so answer it in its session in a terminal.",
+        };
+      if (row.goneAt !== null)
+        return { status: 409, error: "OpenCode no longer lists it as waiting." };
+      if (row.state !== "escalated")
+        return {
+          status: 409,
+          error:
+            row.state === "unknown"
+              ? "An earlier answer's outcome is unknown, so open-dot won't send another. Open it in a terminal."
+              : row.state === "queued" || row.state === "answering"
+                ? "An answer to it is already on its way."
+                : "It isn't waiting for you.",
+        };
+      const problem = ownerAnswerProblem(row, input.answer, input.confirmedAlways);
+      if (problem) return { status: 422, error: problem };
+      const scope = ownershipProblem(tx, row, input.boundSessionID, "owner");
+      if (scope) return { status: 409, error: scope };
+      const saved = saveAttempt(tx, row, {
+        id: input.attemptID,
+        actor: "owner",
+        boundSession: input.boundSessionID,
+        answer: input.answer,
+        from: "escalated",
+      });
+      return saved
+        ? { status: 202, request: saved, attempt: input.attemptID }
+        : { status: 409, error: "It changed meanwhile, so nothing was saved." };
+    },
+    { behavior: "immediate" },
+  );
+
+/**
+ * A request as a card in the app, with no words of a sensitive one. `actionable` when the owner
+ * can answer it now; otherwise it shows read-only, as with an answer on its way or one whose
+ * outcome is unknown.
+ */
+export const cardView = (db: Db | Tx, row: WorkerRequest, now: number) => {
+  const current =
+    row.currentAnswerID === null
+      ? undefined
+      : db.select().from(requestAnswers).where(eq(requestAnswers.id, row.currentAnswerID)).get();
+  const bound = db.select().from(dots).where(eq(dots.name, row.dot)).get();
+  return {
+    id: row.id,
+    dot: row.dot,
+    // The dot's bound session now, which an answer pins; null while it isn't ready.
+    boundSessionID: bound?.sessionState === "ready" ? bound.sessionID : null,
+    source: row.source,
+    worker: row.worker,
+    sessionID: row.sessionID,
+    title: row.title,
+    directory: row.directory,
+    kind: row.kind,
+    requestID: row.requestID,
+    detail: row.detail,
+    sensitive: row.sensitive,
+    state: row.state,
+    reason: row.reason,
+    needsYou: needsYou(row, now),
+    revision: requestRevision(row),
+    actionable: ownerAnswerable(row),
+    attempt: current
+      ? { id: current.id, actor: current.actor, state: current.state, error: current.error }
+      : null,
+    createdAt: row.createdAt,
+    escalatedAt: row.escalatedAt,
+  };
+};
+
+export const pendingLimit = 100;
+
+/**
+ * The requests the owner should see as cards, oldest first after `after`: each still waiting
+ * that is with the owner, has the owner's answer on its way, or has an answer whose outcome is
+ * unknown. Optionally one dot's. A request answered anywhere else drops out once OpenCode stops
+ * listing it.
+ */
+export const pendingRequests = (
+  db: Db,
+  query: { readonly dot?: string; readonly after?: number; readonly limit: number },
+  now: number,
+) => {
+  const rows = db
+    .select()
+    .from(requests)
+    .where(
+      and(
+        isNull(requests.goneAt),
+        query.dot === undefined ? undefined : eq(requests.dot, query.dot),
+        query.after === undefined ? undefined : gt(requests.id, query.after),
+        or(
+          inArray(requests.state, ["escalated", "unknown"]),
+          and(
+            inArray(requests.state, ["queued", "answering"]),
+            inArray(
+              requests.currentAnswerID,
+              db
+                .select({ id: requestAnswers.id })
+                .from(requestAnswers)
+                .where(eq(requestAnswers.actor, "owner")),
+            ),
+          ),
+        ),
+      ),
+    )
+    .orderBy(asc(requests.id))
+    .limit(query.limit + 1)
+    .all();
+  const page = rows.slice(0, query.limit);
+  return {
+    requests: page.map((row) => cardView(db, row, now)),
+    next: rows.length > query.limit ? (page.at(-1)?.id ?? null) : null,
+  };
+};

@@ -38,8 +38,10 @@ const permission = (id: string) => ({
   sessionID,
   action: "shell",
   resources: ["bun test", "bun run typecheck"],
+  save: ["bun *"],
   message: "Run the assigned checks",
 });
+const ownerBodies: unknown[] = [];
 let permissions = [permission("per_once"), permission("per_reject"), permission("per_lost")];
 const fields = [
   {
@@ -127,6 +129,10 @@ const server = Bun.serve({
     if (match) {
       const id = match[2];
       assert(id !== undefined);
+      if (id.startsWith("per_owner")) {
+        ownerBodies.push(body);
+        return new Response(null, { status: 204 });
+      }
       const saved = db.select().from(requests).where(eq(requests.requestID, id)).get();
       assert.equal(saved?.state, "answering");
       assert.equal(typeof saved?.attemptedAt, "number");
@@ -192,6 +198,7 @@ try {
     action: "shell",
     resources: permission("per_once").resources,
     message: permission("per_once").message,
+    save: ["bun *"],
   });
   assert.deepEqual(pending.find((item) => item.id === "frm_reply")?.detail, {
     kind: "question",
@@ -242,16 +249,23 @@ try {
     typeof queue("per_once", { decision: "always" } as unknown as RequestAnswer),
     "string",
   );
-  const before = wire.length;
-  const invalid = await run(
+  // Only the owner's checked answer reaches the adapter with always or a rejection message.
+  await run(
     Effect.flatMap(OpenCode, (client) =>
-      client.answer(sessionID, "permission", "per_once", {
-        decision: "always",
-      } as unknown as RequestAnswer),
-    ).pipe(Effect.exit),
+      client.answer(sessionID, "permission", "per_owner_always", { decision: "always" }).pipe(
+        Effect.andThen(
+          client.answer(sessionID, "permission", "per_owner_reject", {
+            decision: "reject",
+            message: "Not this one",
+          }),
+        ),
+      ),
+    ),
   );
-  assert(Exit.isFailure(invalid));
-  assert.equal(wire.length, before + 1); // discovery probe only; no answer request
+  assert.deepEqual(ownerBodies, [
+    { decision: "always", message: "" },
+    { decision: "reject", message: "Not this one" },
+  ]);
   for (const [id, answer] of [
     ["per_once", { decision: "once" }],
     ["per_reject", { decision: "reject" }],
@@ -273,7 +287,8 @@ try {
   assert.equal(row("per_lost").state, "unknown");
   assert.equal(row("per_lost").confirmedAt, null);
   checks.push(
-    "permission once/reject NEVER always",
+    "permission once/reject NEVER always from the dot",
+    "owner always and rejection message over the public client",
     "form answer map and DELETE cancel",
     "daemon attempts persisted before HTTP reply",
     "confirmed audit includes answering session and times",

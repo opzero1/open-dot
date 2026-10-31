@@ -337,15 +337,18 @@ const sensitiveForm = (form: {
   form.fields.some((field) => field.type === "external") ||
   secretWords.test(JSON.stringify([form.title, form.metadata ?? null, form.fields]));
 
-const permissionDetail = (request: {
+export const permissionDetail = (request: {
   readonly action: string;
   readonly resources: readonly string[];
   readonly message?: string | undefined;
+  readonly save?: readonly string[] | undefined;
 }): RequestDetail => ({
   kind: "permission",
   action: request.action,
   resources: [...request.resources],
   ...(request.message === undefined ? {} : { message: request.message }),
+  // What an always approval saves, which the owner confirms before choosing it.
+  ...(request.save?.length ? { save: [...request.save] } : {}),
 });
 
 /** What open-dot keeps of a question that may ask for a secret: none of its own words. */
@@ -1047,8 +1050,9 @@ export class OpenCode extends Context.Service<
     /** Every permission request and question the session waits on. */
     readonly waiting: (sessionID: string) => Effect.Effect<readonly Waiting[], OpenCodeError>;
     /**
-     * Sends one answer: a permission once or rejected, never always; a question's reply; or a
-     * question cancelled. A failure may still have reached OpenCode.
+     * Sends one answer: a permission once, rejected with an optional message, or always (only
+     * the owner's, after confirming); a question's reply; or a question cancelled. A failure may
+     * still have reached OpenCode.
      */
     readonly answer: (
       sessionID: string,
@@ -1605,13 +1609,15 @@ export class OpenCode extends Context.Service<
           ),
         answer: (sessionID, kind, requestID, answer) =>
           (kind === "permission"
-            ? answer.decision === "once" || answer.decision === "reject"
+            ? answer.decision === "once" ||
+              answer.decision === "reject" ||
+              answer.decision === "always"
               ? client.permission.reply({
                   sessionID: Session.ID.make(sessionID),
                   requestID: Permission.ID.make(requestID),
                   decision: answer.decision,
                   // The 2.1.1 Effect client encodes an omitted optional message as invalid null.
-                  message: "",
+                  message: "message" in answer ? (answer.message ?? "") : "",
                 })
               : Effect.fail(new OpenCodeError({ message: "Not a permission answer" }))
             : answer.decision === "reply"

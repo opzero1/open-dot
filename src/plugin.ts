@@ -315,11 +315,18 @@ function memory(
   const others = db.select().from(dots).where(ne(dots.name, dot)).orderBy(asc(dots.name)).all();
   const supervised = openSupervisions(db, dot);
   const now = Date.now();
-  // Waiting ones, and answers whose outcome is unknown, which stay so; the newest 20.
+  // Waiting ones, and answers whose outcome is unknown, which stay so; the newest 20. The dot's
+  // own session's requests are its owner's alone, so they aren't listed.
   const waiting = db
     .select()
     .from(requests)
-    .where(and(eq(requests.dot, dot), or(isNull(requests.goneAt), eq(requests.state, "unknown"))))
+    .where(
+      and(
+        eq(requests.dot, dot),
+        ne(requests.source, "dot"),
+        or(isNull(requests.goneAt), eq(requests.state, "unknown")),
+      ),
+    )
     .orderBy(desc(requests.id))
     .limit(20)
     .all()

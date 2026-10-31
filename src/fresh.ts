@@ -1,5 +1,5 @@
 import { Session } from "@opencode/client/effect";
-import { and, asc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { Data, Effect, Result } from "effect";
 import { settingsOf } from "./archive";
 import type { Db } from "./db";
@@ -204,6 +204,18 @@ const fresh = (db: Db, dot: typeof dots.$inferSelect, force: boolean, now: numbe
           tx.update(dots)
             .set({ sessionID, freshSessionID: null })
             .where(eq(dots.name, dot.name))
+            .run();
+          // The old session's own requests are no longer the owner's to answer from the app.
+          tx.update(requests)
+            .set({ goneAt: now })
+            .where(
+              and(
+                eq(requests.dot, dot.name),
+                eq(requests.source, "dot"),
+                eq(requests.sessionID, previous),
+                isNull(requests.goneAt),
+              ),
+            )
             .run();
           // Admitted ones already reached the old session; the daemon settles them there.
           if (admitted.size)

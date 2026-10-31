@@ -58,8 +58,8 @@ const withoutFresh = (tables: unknown[][]) =>
 const storedColumns = (columns: Map<string, unknown>, name: string) =>
   (columns.get(name) as { name: string }[]).map((column) => `"${column.name}"`).join(",");
 
-// What 0034 appends to requests and workers.
-const noticeColumns = ["notice_id", "noticed_at"];
+// What 0034, then 0041, append to requests, and 0034 to workers.
+const noticeColumns = ["notice_id", "noticed_at", "current_answer_id"];
 const pathColumns = ["paths"];
 
 // What 0033 appends to supervisions.
@@ -116,9 +116,9 @@ const grantTables = ["grants"];
 const forgetTables = ["forgotten_messages", "forgotten_observations"];
 // 0039 adds the dots' model step usage.
 const usageTables = ["usage_days", "usage_state"];
-// 0040 adds the owner facts shared with every dot.
-const ownerTables = ["owner_fact_keys", "owner_facts"];
-// 0026, 0027, 0028, 0030, 0032, 0035, 0037, 0038, 0039 and 0040 add these tables, so earlier migrations' tests leave them out.
+// 0040 adds the owner facts shared with every dot, and 0041 every answer attempt.
+const ownerTables = ["owner_fact_keys", "owner_facts", "request_answers"];
+// 0026, 0027, 0028, 0030, 0032, 0035, 0037, 0038, 0039, 0040 and 0041 add these tables, so earlier migrations' tests leave them out.
 const later = [
   "feed_triggers",
   "trigger_occurrences",
@@ -2102,6 +2102,82 @@ test("0037 and 0038 add only the forget tables to a 0036 database, and a forget 
     expect(
       db.$client.query<{ sources: string }, []>("select sources from forgotten_observations").all(),
     ).toEqual([{ sources: '["msg_1"]' }]);
+  } finally {
+    db.$client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("0041 keeps every answer the dot chose as an attempt with its own times, inventing no confirmation", () => {
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-answers-migration-"));
+  const migrations = join(directory, "drizzle");
+  cpSync(join(import.meta.dir, "..", "drizzle"), migrations, { recursive: true });
+  const journalPath = join(migrations, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((entry) => entry.tag < "0041");
+  writeFileSync(journalPath, JSON.stringify(journal));
+  const path = join(directory, "open-dot.db");
+  const old = new Database(path);
+  migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+  old.run(
+    "insert into dots (name,directory,session_id,session_state,created_at) values ('jojo','/dots/jojo','ses_jojo','ready',1)",
+  );
+  const row = (id: string, state: string, answer: string | null, times: string) =>
+    old.run(
+      `insert into requests (dot,source,session_id,title,directory,kind,request_id,detail,state,answer,actor_session,created_at,queued_at,attempted_at,confirmed_at) values ('jojo','threads','ses_t','T','/t','permission','${id}','{"kind":"permission","action":"bash","resources":["ls"]}','${state}',${answer === null ? "null" : `'${answer}'`},${answer === null ? "null" : "'ses_jojo'"},1,${times})`,
+    );
+  row("per_open", "open", null, "null,null,null");
+  row("per_done", "answered", '{"decision":"once"}', "2,3,4");
+  row("per_lost", "unknown", '{"decision":"reject"}', "5,6,null");
+  row("per_refused", "escalated", '{"decision":"once"}', "7,null,null");
+  old.close();
+  const db = openDatabase(path);
+  try {
+    const attempts = db.$client
+      .query<Record<string, unknown>, []>(
+        "select r.request_id, a.actor, a.bound_session, a.state, a.error, a.queued_at, a.attempted_at, a.confirmed_at, r.current_answer_id = a.id as linked from request_answers a join requests r on r.id = a.request order by r.id",
+      )
+      .all();
+    expect(attempts).toEqual([
+      {
+        request_id: "per_done",
+        actor: "dot",
+        bound_session: "ses_jojo",
+        state: "confirmed",
+        error: null,
+        queued_at: 2,
+        attempted_at: 3,
+        confirmed_at: 4,
+        linked: 1,
+      },
+      {
+        request_id: "per_lost",
+        actor: "dot",
+        bound_session: "ses_jojo",
+        state: "unknown",
+        error: "legacy-unknown",
+        queued_at: 5,
+        attempted_at: 6,
+        confirmed_at: null,
+        linked: 1,
+      },
+      {
+        request_id: "per_refused",
+        actor: "dot",
+        bound_session: "ses_jojo",
+        state: "refused",
+        error: "legacy-refused",
+        queued_at: 7,
+        attempted_at: null,
+        confirmed_at: null,
+        linked: 1,
+      },
+    ]);
+    expect(
+      db.$client
+        .query("select current_answer_id from requests where request_id = 'per_open'")
+        .get(),
+    ).toEqual({ current_answer_id: null });
   } finally {
     db.$client.close();
     rmSync(directory, { recursive: true, force: true });
