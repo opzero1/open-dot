@@ -293,11 +293,13 @@ export const answerSummary = (row: WorkerRequest): string | null => {
         )}`
       : answer.decision === "once"
         ? "Approved once"
-        : answer.decision === "reject"
-          ? row.kind === "question"
-            ? "Declined the question"
-            : "Rejected"
-          : "Declined the question";
+        : answer.decision === "always"
+          ? "Approved always"
+          : answer.decision === "reject"
+            ? row.kind === "question"
+              ? "Declined the question"
+              : "Rejected"
+            : "Declined the question";
   const status = {
     open: "",
     queued: " (queued)",

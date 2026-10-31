@@ -226,6 +226,13 @@ test("Always needs the owner's confirmation, and a rejection carries its message
     { decision: "always" },
     { decision: "reject", message: "Not in this repo" },
   ]);
+  // The audit names what the owner chose, and that the owner chose it.
+  const audit = (await (await call("/dots/jojo/requests")).json()) as {
+    requests: { id: number; summary: string; attempts: { actor: string; state: string }[] }[];
+  };
+  const always = audit.requests.find((row) => row.id === first.id);
+  expect(always?.summary).toBe("Approved always");
+  expect(always?.attempts).toMatchObject([{ actor: "owner", state: "confirmed" }]);
 });
 
 test("the owner answers an escalated worker request the dot couldn't, and the audit keeps both answers", async () => {
