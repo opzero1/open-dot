@@ -1,11 +1,18 @@
+import { Database } from "bun:sqlite";
 import { beforeEach, expect, test } from "bun:test";
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import type { RequestCard } from "../app/bridge";
 import { fits, shapes } from "../app/decode";
 import { cardDetail, formAnswer, initialValues, normalizedValues } from "../app/surfaces";
 import { api } from "../src/api";
-import { answerAll, queuedLimitMs, settleRequests, watchOwn } from "../src/daemon";
+import journal from "../drizzle/meta/_journal.json";
+import { advanceWorkers, answerAll, queuedLimitMs, settleRequests, watchOwn } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { formWaiting, OpenCode, OpenCodeError } from "../src/opencode";
 import { graceMs, queueAnswer } from "../src/requests";
@@ -546,4 +553,92 @@ test("pending cards page without dropping any", async () => {
   expect(rest).toMatchObject({ next: null });
   expect([...first.requests, ...rest.requests].map((card) => card.id)).toHaveLength(3);
   expect((await call("/requests/pending?limit=0")).status).toBe(400);
+});
+
+// A permission as the release before owner answers saved it, and as OpenCode lists it now.
+const legacy = (resources: string) =>
+  JSON.stringify({ kind: "permission", action: "bash", resources: [resources] });
+const listed = (id: string, resources: string) => ({
+  id,
+  kind: "permission" as const,
+  summary: `bash: ${resources}`,
+  detail: {
+    kind: "permission" as const,
+    action: "bash",
+    resources: [resources],
+    save: ["bun *"],
+  },
+});
+
+test("after the upgrade, pending requests read before it take OpenCode's listing now, and a dot's queued answer to the old one isn't sent", async () => {
+  // A database as the release before owner answers left it, with an escalated request and one
+  // the dot answered, both read before requests kept their save patterns.
+  const directory = mkdtempSync(join(tmpdir(), "open-dot-upgrade-"));
+  try {
+    const migrations = join(directory, "drizzle");
+    cpSync(resolve(import.meta.dir, "../drizzle"), migrations, { recursive: true });
+    writeFileSync(
+      join(migrations, "meta/_journal.json"),
+      JSON.stringify({
+        ...journal,
+        entries: journal.entries.filter((entry) => entry.tag < "0041_owner_answers"),
+      }),
+    );
+    const path = join(directory, "open-dot.db");
+    const old = new Database(path);
+    migrate(drizzle({ client: old }), { migrationsFolder: migrations });
+    const now = Date.now();
+    old.run(
+      "INSERT INTO dots (name, directory, session_id, session_state, created_at) VALUES ('jojo', '/dots/jojo', 'ses_jojo', 'ready', 0)",
+    );
+    old.run(
+      "INSERT INTO workers (id, dot, task, directory, session_id, state, created_at) VALUES (1, 'jojo', 'Task', '/work/1', 'ses_w1', 'running', 0)",
+    );
+    old.run(
+      "INSERT INTO requests (dot, source, worker, session_id, title, directory, kind, request_id, detail, state, reason, created_at, escalated_at) VALUES ('jojo', 'worker', 1, 'ses_w1', 'Task', '/work/1', 'permission', 'per_a', ?, 'escalated', 'The dot escalated it.', ?, ?)",
+      [legacy("bun test"), now, now],
+    );
+    old.run(
+      "INSERT INTO requests (dot, source, worker, session_id, title, directory, kind, request_id, detail, state, answer, actor_session, created_at, noticed_at, queued_at) VALUES ('jojo', 'worker', 1, 'ses_w1', 'Task', '/work/1', 'permission', 'per_b', ?, 'queued', ?, 'ses_jojo', ?, ?, ?)",
+      [legacy("bun run build"), JSON.stringify({ decision: "once" }), now, now, now],
+    );
+    old.close();
+    db = openDatabase(path);
+    fake.state.waiting.set("ses_w1", [
+      listed("per_a", "bun test"),
+      listed("per_b", "bun run build"),
+    ]);
+    const [before] = (await pending()).requests;
+    if (!before) throw new Error("no card");
+    // The next read refreshes what the card shows, and with it the revision an answer must bind.
+    await run(Effect.provide(advanceWorkers(db), fake.layer));
+    const [card] = (await pending()).requests;
+    if (!card) throw new Error("no card");
+    expect(card.revision).not.toBe(before.revision);
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the daemon's answer, as main passes it
+    expect(cardDetail(card as unknown as RequestCard)).toMatchObject({ save: ["bun *"] });
+    expect((await post(before, { answer: { decision: "once" } })).status).toBe(409);
+    // The dot chose its answer against the old detail, so it goes to the owner unsent, and the
+    // audit keeps what it was chosen against.
+    await answer();
+    expect(fake.state.answers).toEqual([]);
+    const dotAttempt = db.select().from(requestAnswers).get();
+    expect(dotAttempt).toMatchObject({ actor: "dot", state: "refused", error: "changed" });
+    expect(dotAttempt?.detail).toEqual(JSON.parse(legacy("bun run build")));
+    // Both now wait for the owner, whose answers go once each.
+    const cards = (await pending()).requests;
+    expect(cards.map((each) => each.actionable)).toEqual([true, true]);
+    for (const each of cards)
+      expect(
+        (await post(each, { answer: { decision: "always" }, confirmedAlways: true })).status,
+      ).toBe(202);
+    await answer();
+    expect(fake.state.answers.map((item) => [item.requestID, item.answer])).toEqual([
+      ["per_a", { decision: "always" }],
+      ["per_b", { decision: "always" }],
+    ]);
+    db.$client.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

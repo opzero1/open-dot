@@ -4,6 +4,7 @@ CREATE TABLE `request_answers` (
 	`actor` text NOT NULL,
 	`bound_session` text NOT NULL,
 	`answer` text NOT NULL,
+	`detail` text NOT NULL,
 	`state` text NOT NULL,
 	`error` text,
 	`queued_at` integer NOT NULL,
@@ -14,13 +15,14 @@ CREATE TABLE `request_answers` (
 --> statement-breakpoint
 CREATE UNIQUE INDEX `request_answers_live` ON `request_answers` (`request`) WHERE "request_answers"."state" in ('queued', 'sending', 'confirmed', 'unknown');--> statement-breakpoint
 ALTER TABLE `requests` ADD `current_answer_id` text;--> statement-breakpoint
-INSERT INTO `request_answers` (`id`, `request`, `actor`, `bound_session`, `answer`, `state`, `error`, `queued_at`, `attempted_at`, `confirmed_at`)
+INSERT INTO `request_answers` (`id`, `request`, `actor`, `bound_session`, `answer`, `detail`, `state`, `error`, `queued_at`, `attempted_at`, `confirmed_at`)
 SELECT
 	lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))), 2) || '-' || substr('89ab', 1 + (abs(random()) % 4), 1) || substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6))),
 	`id`,
 	'dot',
 	`actor_session`,
 	`answer`,
+	`detail`,
 	CASE `state` WHEN 'queued' THEN 'queued' WHEN 'answering' THEN 'sending' WHEN 'answered' THEN 'confirmed' WHEN 'unknown' THEN 'unknown' WHEN 'stale' THEN 'stale' ELSE 'refused' END,
 	CASE `state` WHEN 'stale' THEN 'legacy-stale' WHEN 'escalated' THEN 'legacy-refused' WHEN 'unknown' THEN 'legacy-unknown' ELSE NULL END,
 	coalesce(`queued_at`, `created_at`),

@@ -620,6 +620,7 @@ const saveAttempt = (
       actor: input.actor,
       boundSession: input.boundSession,
       answer: input.answer,
+      detail: row.detail,
       state: "queued",
       queuedAt: now,
     })
@@ -660,6 +661,19 @@ export const settleAttempt = (
     )
     .run();
 };
+
+/**
+ * The request as its current answer was chosen against, which is what the daemon may send it
+ * for; the request's own detail when it has no answer kept.
+ */
+export const reviewedDetail = (db: Db | Tx, row: WorkerRequest): RequestDetail =>
+  (row.currentAnswerID === null
+    ? undefined
+    : db
+        .select({ detail: requestAnswers.detail })
+        .from(requestAnswers)
+        .where(eq(requestAnswers.id, row.currentAnswerID))
+        .get()?.detail) ?? row.detail;
 
 /** Every answer chosen for a request, oldest first, for the audit and the app's receipts. */
 export const attemptsOf = (db: Db | Tx, request: number) =>

@@ -779,7 +779,7 @@ export const artifacts = sqliteTable(
 
 export type Artifact = typeof artifacts.$inferSelect;
 
-/** What a worker's permission request or question showed when open-dot first read it. */
+/** What a permission request or question shows, as OpenCode last listed it. */
 export type RequestDetail =
   | {
       readonly kind: "permission";
@@ -899,6 +899,9 @@ export const requestAnswers = sqliteTable(
     // The dot's bound session the answer was chosen under.
     boundSession: text("bound_session").notNull(),
     answer: text({ mode: "json" }).$type<RequestAnswer>().notNull(),
+    // The request as it was when this answer was chosen: the daemon sends it only while OpenCode
+    // still lists exactly this, and it stays here when a later read refreshes the request.
+    detail: text({ mode: "json" }).$type<RequestDetail>().notNull(),
     state: text({ enum: answerStates }).notNull(),
     // A fixed code for why it wasn't confirmed, never a request's or an answer's words.
     error: text(),

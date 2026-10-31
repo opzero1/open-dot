@@ -44,6 +44,7 @@ import {
   ownershipProblem,
   requestNotice,
   requestReview,
+  reviewedDetail,
   sameAttempt,
 } from "./requests";
 import {
@@ -707,12 +708,23 @@ const noteRequests = (
       if (owner.source === "dot" && owner.sessionID !== dotSession) return;
       const now = Date.now();
       const saved = tx.select().from(requests).where(eq(requests.sessionID, owner.sessionID)).all();
-      const listed = new Set(waiting.map(requestKey));
+      const listed = new Map(waiting.map((item) => [requestKey(item), item]));
       for (const row of saved) {
-        const here = listed.has(requestKey({ kind: row.kind, id: row.requestID }));
-        if (here === (row.goneAt === null)) continue;
+        const item = listed.get(requestKey({ kind: row.kind, id: row.requestID }));
+        const gone = item === undefined ? (row.goneAt ?? now) : null;
+        // What OpenCode lists now is what the owner reviews, so its revision changes with it; an
+        // answer already chosen keeps the detail it was chosen against, and the daemon refuses
+        // to send it for anything else. A request once thought to ask for a secret stays so.
+        const refreshed =
+          item !== undefined &&
+          !row.sensitive &&
+          (item.sensitive || JSON.stringify(item.detail) !== JSON.stringify(row.detail));
+        if (gone === row.goneAt && !refreshed) continue;
         tx.update(requests)
-          .set({ goneAt: here ? null : now })
+          .set({
+            goneAt: gone,
+            ...(refreshed ? { detail: item.detail, sensitive: item.sensitive } : {}),
+          })
           .where(eq(requests.id, row.id))
           .run();
       }
@@ -1126,12 +1138,14 @@ const whyNot = (
   actorSession: string,
   fresh: Waiting | undefined,
   threads: ThreadsWorker | undefined,
-): { readonly stale: string } | { readonly refuse: string } | undefined => {
+): { readonly stale: string } | { readonly refuse: string; readonly code?: string } | undefined => {
   const actor = actorOf(db, row);
+  // The request as it was when the answer was chosen; a later read may have refreshed the row.
+  const reviewed = { ...row, detail: reviewedDetail(db, row) };
   // The owner's consent lifts only the limits on what a dot may decide; scope still applies.
   const malformed =
     actor === "owner"
-      ? ownerAnswerProblem(row, answer, answer.decision === "always")
+      ? ownerAnswerProblem(reviewed, answer, answer.decision === "always")
       : malformedAnswer(row.kind, answer);
   if (malformed) return { refuse: malformed };
   const problem = ownershipProblem(db, row, actorSession, actor);
@@ -1149,13 +1163,19 @@ const whyNot = (
   }
   if (!fresh) return { stale: "OpenCode no longer lists it as waiting." };
   if (fresh.sensitive) return { refuse: "It may ask for a secret." };
-  if (JSON.stringify(fresh.detail) !== JSON.stringify(row.detail))
-    return { refuse: "It changed after the dot answered." };
+  if (row.sensitive || JSON.stringify(fresh.detail) !== JSON.stringify(reviewed.detail))
+    return {
+      refuse:
+        actor === "owner"
+          ? "It changed after you chose your answer."
+          : "It changed after the dot answered.",
+      code: "changed",
+    };
   const guard =
-    actor === "dot" && answer.decision === "once" ? requestReview(db, row).refuse : undefined;
+    actor === "dot" && answer.decision === "once" ? requestReview(db, reviewed).refuse : undefined;
   if (guard) return { refuse: `It ${guard}.` };
   const invalid =
-    answer.decision === "reply" ? invalidAnswer(row.detail, answer.answer) : undefined;
+    answer.decision === "reply" ? invalidAnswer(reviewed.detail, answer.answer) : undefined;
   return invalid ? { refuse: invalid } : undefined;
 };
 
@@ -1224,7 +1244,7 @@ const answerOne = (db: Db, queued: WorkerRequest) =>
       const blocked = whyNot(db, row, row.answer, actorSession, fresh, threads);
       if (blocked) {
         if ("stale" in blocked) markStale(db, row, blocked.stale);
-        else refuse(db, row, blocked.refuse);
+        else refuse(db, row, blocked.refuse, blocked.code);
         return;
       }
       // The attempt is saved before its one call, in the same write as the request's state.
