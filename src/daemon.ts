@@ -44,6 +44,7 @@ import {
   ownershipProblem,
   requestNotice,
   requestReview,
+  sameAttempt,
 } from "./requests";
 import {
   canSend,
@@ -1061,7 +1062,13 @@ const refuse = (db: Db, row: WorkerRequest, why: string, code = "refused", now =
         ? tx
             .update(requests)
             .set({ state: "escalated", reason: why })
-            .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
+            .where(
+              and(
+                eq(requests.id, row.id),
+                eq(requests.state, "queued"),
+                sameAttempt(row.currentAnswerID),
+              ),
+            )
             .returning({ id: requests.id })
             .get() !== undefined
         : escalate(
@@ -1087,7 +1094,13 @@ const markStale = (db: Db, row: WorkerRequest, why: string) =>
       const done = tx
         .update(requests)
         .set({ state: "stale", reason: why })
-        .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
+        .where(
+          and(
+            eq(requests.id, row.id),
+            eq(requests.state, "queued"),
+            sameAttempt(row.currentAnswerID),
+          ),
+        )
         .returning({ id: requests.id })
         .get();
       if (done) settleAttempt(tx, row, ["queued"], { state: "stale", error: "gone" });
@@ -1199,8 +1212,15 @@ const answerOne = (db: Db, queued: WorkerRequest) =>
         threads = snapshot.success.find((worker) => worker.workerID === initial.sessionID);
       }
       // Everything below is synchronous until the call, so nothing changes in between.
+      // Only the attempt these reads were for; a newer one waits for its own pass.
       const row = readRequest(db, queued.id);
-      if (row?.state !== "queued" || !row.answer || row.actorSession !== actorSession) return;
+      if (
+        row?.state !== "queued" ||
+        !row.answer ||
+        row.actorSession !== actorSession ||
+        row.currentAnswerID !== initial.currentAnswerID
+      )
+        return;
       const blocked = whyNot(db, row, row.answer, actorSession, fresh, threads);
       if (blocked) {
         if ("stale" in blocked) markStale(db, row, blocked.stale);
@@ -1214,7 +1234,13 @@ const answerOne = (db: Db, queued: WorkerRequest) =>
           const saved = tx
             .update(requests)
             .set({ state: "answering", attemptedAt })
-            .where(and(eq(requests.id, row.id), eq(requests.state, "queued")))
+            .where(
+              and(
+                eq(requests.id, row.id),
+                eq(requests.state, "queued"),
+                sameAttempt(row.currentAnswerID),
+              ),
+            )
             .returning()
             .get();
           if (saved) settleAttempt(tx, saved, ["queued"], { state: "sending", attemptedAt });
@@ -1234,7 +1260,13 @@ const answerOne = (db: Db, queued: WorkerRequest) =>
             const done = tx
               .update(requests)
               .set({ state: "answered", confirmedAt })
-              .where(and(eq(requests.id, row.id), eq(requests.state, "answering")))
+              .where(
+                and(
+                  eq(requests.id, row.id),
+                  eq(requests.state, "answering"),
+                  sameAttempt(row.currentAnswerID),
+                ),
+              )
               .returning({ id: requests.id })
               .get();
             if (done) settleAttempt(tx, started, ["sending"], { state: "confirmed", confirmedAt });
@@ -1263,7 +1295,13 @@ const lost = (db: Db, row: WorkerRequest, why: string, code: string) =>
                 reason: why.replace("the dot's answer", "your answer"),
                 escalatedAt: Date.now(),
               })
-              .where(and(eq(requests.id, row.id), eq(requests.state, "answering")))
+              .where(
+                and(
+                  eq(requests.id, row.id),
+                  eq(requests.state, "answering"),
+                  sameAttempt(row.currentAnswerID),
+                ),
+              )
               .returning({ id: requests.id })
               .get() !== undefined
           : escalate(

@@ -5,9 +5,9 @@ import type { RequestCard } from "../app/bridge";
 import { fits, shapes } from "../app/decode";
 import { cardDetail, formAnswer, initialValues, normalizedValues } from "../app/surfaces";
 import { api } from "../src/api";
-import { answerAll, settleRequests, watchOwn } from "../src/daemon";
+import { answerAll, queuedLimitMs, settleRequests, watchOwn } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
-import { formWaiting } from "../src/opencode";
+import { formWaiting, OpenCode, OpenCodeError } from "../src/opencode";
 import { graceMs, queueAnswer } from "../src/requests";
 import { dots, outbox, requestAnswers, requests, workers } from "../src/schema";
 import { fakeOpenCode } from "./fake-opencode";
@@ -430,6 +430,66 @@ test("a lost answer stays unknown and read-only, and is never sent again, even a
   expect(fake.state.answers).toHaveLength(1);
   // The owner's own answer tells nobody else in the chat.
   expect(db.select().from(outbox).all()).toEqual([]);
+});
+
+test("an earlier answer's read that fails late leaves the owner's newer answer queued, then sent once", async () => {
+  fake.state.waiting.set("ses_jojo", [{ id: "per_1", kind: "permission", summary: "shell: ls" }]);
+  await own();
+  const [card] = (await pending()).requests;
+  if (!card) throw new Error("no card");
+  const first = crypto.randomUUID();
+  expect((await post(card, { attemptID: first, answer: { decision: "once" } })).status).toBe(202);
+  // The pass for the first answer starts its read of what the session waits on, which hangs.
+  const reading = Promise.withResolvers<void>();
+  const held = Promise.withResolvers<void>();
+  const pass = Effect.runPromise(
+    Effect.gen(function* () {
+      const service = yield* OpenCode;
+      yield* answerAll(db).pipe(
+        Effect.provideService(OpenCode, {
+          ...service,
+          waiting: () =>
+            Effect.sync(() => reading.resolve()).pipe(
+              Effect.andThen(Effect.promise(() => held.promise)),
+              Effect.andThen(Effect.fail(new OpenCodeError({ message: "read failed" }))),
+            ),
+        }),
+      );
+    }).pipe(Effect.provide(fake.layer)),
+  );
+  await reading.promise;
+  // Meanwhile it waits too long and goes back to the owner, who answers again.
+  settleRequests(db, Date.now() + queuedLimitMs + 1);
+  expect(db.select().from(requests).get()?.state).toBe("escalated");
+  const second = crypto.randomUUID();
+  expect((await post(card, { attemptID: second, answer: { decision: "reject" } })).status).toBe(
+    202,
+  );
+  // The first answer's read fails only now: it settles nothing of the second's.
+  held.resolve();
+  await pass;
+  expect(db.select().from(requests).get()).toMatchObject({
+    state: "queued",
+    currentAnswerID: second,
+  });
+  const ledger = () =>
+    db
+      .select()
+      .from(requestAnswers)
+      .all()
+      .map((attempt) => [attempt.id, attempt.state, attempt.error]);
+  expect(ledger()).toEqual([
+    [first, "refused", "queued-timeout"],
+    [second, "queued", null],
+  ]);
+  await answer();
+  await answer();
+  expect(fake.state.answers.map((item) => item.answer)).toEqual([{ decision: "reject" }]);
+  expect(ledger()).toEqual([
+    [first, "refused", "queued-timeout"],
+    [second, "confirmed", null],
+  ]);
+  expect(db.select().from(requests).get()?.state).toBe("answered");
 });
 
 test("an owner's answer a stopped daemon was sending becomes unknown, never sent again", async () => {
