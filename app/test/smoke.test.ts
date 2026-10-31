@@ -3829,17 +3829,36 @@ test("request cards: answered from the chat and Needs you, Always only after its
           detail: { kind: "question", title: "", fields: [] },
         }),
         requestCard(4),
+        // Another question with a field of the same key, whose choices stay its own.
+        requestCard(5, {
+          kind: "question",
+          requestID: "que_5",
+          detail: {
+            kind: "question",
+            title: "Which branch to tag?",
+            fields: [
+              {
+                key: "branch",
+                type: "string",
+                options: [
+                  { value: "main", label: "Main" },
+                  { value: "dev", label: "Dev" },
+                ],
+              },
+            ],
+          },
+        }),
       ];
     },
     async ({ fake, js, until, press }) => {
       // The chat shows jojo's cards under its header, with untrusted text as text.
-      await until(`document.querySelectorAll("[data-request]").length === 4`, "four cards");
+      await until(`document.querySelectorAll("[data-request]").length === 5`, "five cards");
       expect(await js(`!!document.querySelector('[data-request="1"] code b')`)).toBe(false);
       expect(await js(`document.querySelector('[data-request="1"] code').textContent`)).toBe(
         "<b>rm -rf build</b>",
       );
       expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
-        "Needs you (4)",
+        "Needs you (5)",
       );
       // A sensitive card offers only its terminal.
       expect(
@@ -3890,9 +3909,23 @@ test("request cards: answered from the chat and Needs you, Always only after its
         "the required field's note",
       );
       expect(fake.data.answers).toHaveLength(2);
-      await js(
-        `[...document.querySelectorAll('[data-request="2"] label')].find((l) => l.textContent.trim() === "Dev").querySelector("input").click(), true`,
+      const choose = (card: number, label: string) =>
+        js(
+          `[...document.querySelectorAll('[data-request="${card}"] label')].find((l) => l.textContent.trim() === "${label}").querySelector("input").click(), true`,
+        );
+      const chosen = (card: number) =>
+        js(
+          `[...document.querySelectorAll('[data-request="${card}"] label')].filter((l) => l.querySelector("input")?.checked).map((l) => l.textContent.trim())`,
+        );
+      await choose(2, "Dev");
+      await choose(5, "Main");
+      // Choosing on one card leaves the other card's choice as it was.
+      await until(
+        `[...document.querySelectorAll('[data-request="5"] input[type=radio]')].some((i) => i.checked)`,
+        "the second card's choice",
       );
+      expect(await chosen(2)).toEqual(["Dev"]);
+      expect(await chosen(5)).toEqual(["Main"]);
       await press('[data-request="2"]', "Submit");
       await until(`!document.querySelector('[data-request="2"]')`, "the answered question to go");
       expect(fake.data.answers[2]).toMatchObject({
