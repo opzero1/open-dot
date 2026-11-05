@@ -680,6 +680,17 @@ export interface SlackTicket {
   expiresAt: number;
 }
 
+/**
+ * A dot session's stop, as Escape in OpenCode's terminal: "stop-requested" when OpenCode
+ * interrupted running work, "not-interrupted" when it had none (already finishing or stopping),
+ * "not-running" when the fresh check found it idle and nothing was called. `running` is a read
+ * afterwards, null when unread.
+ */
+export interface StopResult {
+  result: "stop-requested" | "not-interrupted" | "not-running";
+  running: boolean | null;
+}
+
 export interface FreshResult {
   name: string;
   sessionID: string;
@@ -891,6 +902,7 @@ export interface Operations {
   slackLogin: [[], SlackTicket];
   fresh: [[dot: string, force: boolean], FreshResult];
   activity: [[dot: string, sessionID: string], ActivityView];
+  stopDot: [[dot: string, sessionID: string, since: number | null], StopResult];
   work: [[dot: string, sessionID: string, cursor: string], WorkPage];
   toolDetail: [[dot: string, id: string, sessionID: string, callID: string], ToolDetailView];
 }

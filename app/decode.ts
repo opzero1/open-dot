@@ -287,6 +287,7 @@ export const shapes: Record<Operation, Shape> = {
     "since?": "n",
     observedAt: "n",
   },
+  stopDot: { result: "s", "running?": "b" },
   workerConversation,
   requestConversation: workerConversation,
   threadConversation: workerConversation,
@@ -303,7 +304,16 @@ export const shapes: Record<Operation, Shape> = {
 
 /** An answer that doesn't fit its operation: a read failed, a change's outcome is unknown. */
 export const decoded = (op: Operation, method: string, result: Reply<unknown>): Reply<unknown> => {
-  if (!result.ok || fits(result.value, shapes[op])) return result;
+  if (!result.ok) return result;
+  const value = result.value;
+  const stopValid =
+    op !== "stopDot" ||
+    (isRecord(value) &&
+      (value.result === "stop-requested" ||
+        value.result === "not-interrupted" ||
+        value.result === "not-running") &&
+      (typeof value.running === "boolean" || value.running === null));
+  if (stopValid && fits(value, shapes[op])) return result;
   return method === "GET"
     ? { ok: false, error: "The daemon's answer wasn't understood." }
     : {

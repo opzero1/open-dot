@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Effect, Layer } from "effect";
 import { api } from "../src/api";
-import { step } from "../src/daemon";
+import { gated, step } from "../src/daemon";
 import { type Db, openDatabase } from "../src/db";
 import { type Attachment, OpenCode, OpenCodeError } from "../src/opencode";
 import {
@@ -98,6 +98,154 @@ type ConversationPage = {
   next: string | null;
 };
 const readPage = async (response: Response) => (await response.json()) as ConversationPage;
+
+const stopDot = (body: unknown = { sessionID: "ses_jojo", since: 7 }) =>
+  call("/dots/jojo/stop", { method: "POST", body: JSON.stringify(body) });
+
+test("basic Stop guards exact payload, ready binding, fresh marker and unread activity before any call", async () => {
+  fake.state.activity.set("ses_jojo", { active: true, running: [], since: 7 });
+  for (const body of [
+    { sessionID: "ses_jojo" },
+    { sessionID: "ses_jojo", since: 7, extra: true },
+    { sessionID: "ses_jojo", since: -1 },
+    { sessionID: "ses_jojo", since: 1.5 },
+    { sessionID: "ses_jojo", since: "7" },
+    [],
+  ])
+    expect((await stopDot(body)).status).toBe(400);
+  expect((await stopDot({ sessionID: "ses_old", since: 7 })).status).toBe(409);
+  db.update(dots).set({ sessionState: "creating" }).where(eq(dots.name, "jojo")).run();
+  expect((await stopDot()).status).toBe(409);
+  db.update(dots).set({ sessionState: "ready" }).where(eq(dots.name, "jojo")).run();
+  expect((await stopDot({ sessionID: "ses_jojo", since: 8 })).status).toBe(409);
+  fake.state.readFailure = true;
+  expect((await stopDot()).status).toBe(503);
+  fake.state.readFailure = false;
+  fake.state.activity.set("ses_jojo", { active: false, running: [], since: null });
+  const idle = await stopDot();
+  expect(idle.status).toBe(200);
+  expect(await idle.json()).toEqual({ result: "not-running", running: false });
+  expect(fake.state.stops).toEqual([]);
+  expect(fake.state.interrupted).toEqual([]);
+});
+
+test("basic Stop waits for admission, preserves pending order, and refuses a rebind during fresh activity", async () => {
+  fake.state.activity.set("ses_jojo", { active: true, running: [], since: 7 });
+  db.insert(outbox)
+    .values([
+      { sessionID: "ses_jojo", messageID: "msg_q1", text: "first", state: "pending", createdAt: 1 },
+      {
+        sessionID: "ses_jojo",
+        messageID: "msg_q2",
+        text: "second",
+        state: "pending",
+        createdAt: 2,
+      },
+    ])
+    .run();
+  const before = db.select().from(outbox).all();
+  fake.state.inbox = [
+    { sessionID: "ses_jojo", id: "msg_q1", delivery: "queue" },
+    { sessionID: "ses_jojo", id: "msg_q2", delivery: "queue" },
+  ];
+  const inbox = structuredClone(fake.state.inbox);
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  const holder = Effect.runPromise(
+    gated("ses_jojo")(
+      Effect.promise(async () => {
+        entered.resolve();
+        await release.promise;
+      }),
+    ),
+  );
+  await entered.promise;
+  const stopped = stopDot();
+  try {
+    await Bun.sleep(30);
+    expect(fake.state.activityReads).toBe(0);
+    expect(fake.state.stops).toEqual([]);
+  } finally {
+    release.resolve();
+    await holder;
+  }
+  expect(await (await stopped).json()).toEqual({ result: "stop-requested", running: false });
+  expect(db.select().from(outbox).all()).toEqual(before);
+  expect(fake.state.inbox).toEqual(inbox);
+  expect(fake.state.stops).toEqual([{ sessionID: "ses_jojo", resume: true }]);
+  const reading = Promise.withResolvers<void>(),
+    read = Promise.withResolvers<void>();
+  fake.state.activity.set("ses_jojo", { active: true, running: [], since: 7 });
+  fake.state.onActivity = async () => {
+    reading.resolve();
+    await read.promise;
+  };
+  const rebound = stopDot();
+  await reading.promise;
+  db.update(dots).set({ sessionID: "ses_new" }).where(eq(dots.name, "jojo")).run();
+  read.resolve();
+  expect((await rebound).status).toBe(409);
+  expect(fake.state.stops).toHaveLength(1);
+  expect(db.select().from(outbox).all()).toEqual(before);
+  expect(fake.state.inbox).toEqual(inbox);
+});
+
+test("basic Stop reports acceptance separately from running, false and lost outcomes and never retries", async () => {
+  const run = async (mode: "ok" | "false" | "fail" | "lost", keep = false) => {
+    fake.state.stop = mode;
+    fake.state.stopKeepsRunning = keep;
+    fake.state.activity.set("ses_jojo", { active: true, running: [], since: 7 });
+    const reads = fake.state.activityReads;
+    if (mode === "false")
+      fake.state.onActivity = () => {
+        if (fake.state.activityReads > reads + 1)
+          fake.state.activity.set("ses_jojo", { active: false, running: [], since: null });
+      };
+    const before = fake.state.stops.length;
+    const response = await stopDot();
+    expect(fake.state.stops).toHaveLength(before + 1);
+    fake.state.onActivity = () => {};
+    return response;
+  };
+  expect(await (await run("ok")).json()).toEqual({ result: "stop-requested", running: false });
+  expect(await (await run("ok", true)).json()).toEqual({ result: "stop-requested", running: true });
+  expect(await (await run("false")).json()).toEqual({ result: "not-interrupted", running: false });
+  for (const mode of ["fail", "lost"] as const) {
+    const r = await run(mode);
+    expect(r.status).toBe(502);
+    expect(await r.json()).toMatchObject({ result: "unknown" });
+  }
+  fake.state.stop = "ok";
+  fake.state.activity.set("ses_jojo", { active: true, running: [], since: 7 });
+  const reads = fake.state.activityReads;
+  fake.state.onActivity = () => {
+    if (fake.state.activityReads > reads + 1) fake.state.readFailure = true;
+  };
+  expect(await (await stopDot()).json()).toEqual({ result: "stop-requested", running: null });
+  expect(fake.state.stops).toHaveLength(6);
+  expect(fake.state.interrupted).toEqual([]);
+});
+
+test("basic Stop times out a held outcome once and releases admission for the next request", async () => {
+  fake.state.activity.set("ses_jojo", { active: true, running: [], since: 7 });
+  const release = Promise.withResolvers<void>();
+  fake.state.stopHold = release.promise;
+  const started = Date.now();
+  let response: Response;
+  try {
+    response = await stopDot();
+  } finally {
+    release.resolve();
+    fake.state.stopHold = undefined;
+  }
+  expect(response.status).toBe(502);
+  expect(await response.json()).toMatchObject({ result: "unknown" });
+  expect(Date.now() - started).toBeLessThan(12_000);
+  expect(fake.state.stops).toHaveLength(1);
+  fake.state.activity.set("ses_jojo", { active: false, running: [], since: null });
+  expect(await (await stopDot()).json()).toEqual({ result: "not-running", running: false });
+  expect(fake.state.stops).toHaveLength(1);
+}, 15_000);
 
 test("latest cache shares slow reads and serves the last page without waiting for refresh", async () => {
   let now = 0;

@@ -81,6 +81,10 @@ export function fakeOpenCode() {
     interrupted: [] as string[],
     interrupt: "ok" as "ok" | "fail" | "lost",
     onInterrupt: (_sessionID: string) => {},
+    stops: [] as { sessionID: string; resume: true }[],
+    stop: "ok" as "ok" | "false" | "fail" | "lost",
+    stopHold: undefined as Promise<void> | undefined,
+    stopKeepsRunning: false,
     // Supervised sessions: each one's directory, turn ends and what it waits on.
     directories: new Map<string, string>(),
     // Each session's chosen model; absent, it uses OpenCode's default.
@@ -107,6 +111,7 @@ export function fakeOpenCode() {
     details: new Map<string, ToolDetail>(),
     activity: new Map<string, Activity>(),
     activityReads: 0,
+    onActivity: (_sessionID: string): void | Promise<void> => {},
     pageReads: [] as (string | undefined)[],
     // Each session's full history as the archive pages it, in processing order.
     items: new Map<string, HistoryItem[]>(),
@@ -240,6 +245,19 @@ export function fakeOpenCode() {
         yield* Effect.addFinalizer(() => Effect.sync(() => (subscriber.open = false)));
       }),
     ),
+    stop: (sessionID) =>
+      Effect.gen(function* () {
+        state.stops.push({ sessionID, resume: true });
+        if (state.stopHold) yield* Effect.promise(() => state.stopHold ?? Promise.resolve());
+        if (state.stop === "fail") return yield* broken("stop connection refused");
+        if (state.stop === "false") return false;
+        if (!state.stopKeepsRunning) {
+          state.active.delete(sessionID);
+          state.activity.set(sessionID, { active: false, running: [], since: null });
+        }
+        if (state.stop === "lost") return yield* broken("stop response lost");
+        return true;
+      }),
     interrupt: (sessionID) =>
       Effect.suspend(() => {
         if (state.interrupt === "fail") return broken("connection refused");
@@ -302,12 +320,13 @@ export function fakeOpenCode() {
           : Effect.succeed(state.details.get(`${messageID}/${callID}`)),
       ),
     activity: (sessionID) =>
-      Effect.suspend(() => {
-        if (state.readFailure) return broken("history unavailable");
+      Effect.gen(function* () {
         state.activityReads++;
-        return Effect.succeed(
-          state.activity.get(sessionID) ?? { active: false, running: [], since: null },
-        );
+        yield* Effect.promise(async () => {
+          await state.onActivity(sessionID);
+        });
+        if (state.readFailure) return yield* broken("history unavailable");
+        return state.activity.get(sessionID) ?? { active: false, running: [], since: null };
       }),
     message: ({ sessionID, messageID }) =>
       Effect.suspend(() =>

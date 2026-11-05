@@ -133,6 +133,28 @@ test("the daemon's memory, search, recall, audit, feed and instructions answers 
   expect(search.value).toMatchObject({ results: [{ id: 1, version: 1 }] });
 });
 
+test.each([
+  ["missing running", { result: "stop-requested" }],
+  ["unknown result", { result: "unrecognised-stop-outcome", running: false }],
+])("basic Stop malformed success is unknown, not confirmation: %s", (_name, value) => {
+  expect(decoded("stopDot", "POST", { ok: true, value })).toMatchObject({
+    ok: false,
+    lost: true,
+  });
+});
+
+test("basic Stop decoder keeps known outcomes with required boolean or null activity", () => {
+  for (const value of [
+    { result: "stop-requested", running: true },
+    { result: "not-interrupted", running: false },
+    { result: "stop-requested", running: null },
+    { result: "not-running", running: false },
+  ]) {
+    const reply = { ok: true as const, value };
+    expect(decoded("stopDot", "POST", reply)).toBe(reply);
+  }
+});
+
 test("an answer that doesn't fit is an error for a read and an unknown outcome for a change", () => {
   expect(decoded("saveInstructions", "PUT", { ok: true, value: {} })).toMatchObject({
     ok: false,

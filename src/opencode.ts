@@ -964,6 +964,13 @@ export class OpenCode extends Context.Service<
      * session doesn't exist.
      */
     readonly interrupt: (sessionID: string) => Effect.Effect<boolean, OpenCodeError>;
+    /**
+     * Stops the session's current work as Escape in OpenCode's terminal does: `resume: true`, so
+     * steered input and next-in-line control items go on while queued prompts stay parked. It names
+     * only the session, never a turn. True when OpenCode interrupted a running execution; false for
+     * an idle session, one already stopping or finishing, or one that doesn't exist.
+     */
+    readonly stop: (sessionID: string) => Effect.Effect<boolean, OpenCodeError>;
     /** User and assistant messages among the session's last `limit` history items, oldest first. */
     readonly recentMessages: (
       sessionID: string,
@@ -1358,6 +1365,12 @@ export class OpenCode extends Context.Service<
             Effect.map((result) => result.interrupted),
             Effect.catchTag("SessionNotFoundError", () => Effect.succeed(false)),
             Effect.mapError(failed(`Could not interrupt session ${sessionID}`)),
+          ),
+        stop: (sessionID) =>
+          client.session.interrupt({ sessionID: Session.ID.make(sessionID), resume: true }).pipe(
+            Effect.map((result) => result.interrupted),
+            Effect.catchTag("SessionNotFoundError", () => Effect.succeed(false)),
+            Effect.mapError(failed(`Could not stop session ${sessionID}`)),
           ),
         recentMessages: (sessionID, limit) =>
           client.message.list({ sessionID: Session.ID.make(sessionID), order: "desc", limit }).pipe(

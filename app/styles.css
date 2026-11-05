@@ -131,8 +131,17 @@ button:disabled {
   min-width: 0;
 }
 
-.typing > .execution-details > .icon-button {
+.typing > .execution-details > .icon-button,
+.typing > .stop-session {
   margin-left: 6px;
+}
+
+.typing > .stop-session {
+  vertical-align: middle;
+}
+
+.typing > .stop-note {
+  margin-left: 8px;
 }
 
 .execution-content {

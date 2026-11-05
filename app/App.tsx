@@ -29,8 +29,10 @@ import type {
   PageView,
   PendingView,
   ReceiptStatus,
+  Reply,
   Result,
   SendResult,
+  StopResult,
   ToolCallView,
   ToolDetailView,
   WorkLogView,
@@ -2175,6 +2177,34 @@ const MessageList = ({
   // row between them stays rendered, and history trimming keeps their messages.
   const selection = useRef<[string, string] | undefined>(undefined);
   const [replySelection, setReplySelection] = useState<SelectedReply>();
+  // One stop at a time per dot and session; its note belongs to that dot and session only.
+  const stopScope = `${dot}\0${conversation.sessionID}`;
+  const [stop, setStop] = useState<{ scope: string; pending: boolean; note?: string }>();
+  const stopping = useRef(new Set<string>());
+  const stopHere = stop?.scope === stopScope ? stop : undefined;
+  const requestStop = async (since: number | null) => {
+    const scope = stopScope;
+    if (stopping.current.has(scope)) return;
+    stopping.current.add(scope);
+    setStop({ scope, pending: true });
+    let note: string;
+    try {
+      note = stopNote(await bridge.call("stopDot", dot, conversation.sessionID, since));
+    } catch {
+      note = stopNote({ ok: false, error: "", lost: true });
+    } finally {
+      stopping.current.delete(scope);
+    }
+    setStop((current) => (current?.scope === scope ? { scope, pending: false, note } : current));
+  };
+  useEffect(() => {
+    if (!stop || stop.pending) return undefined;
+    const timer = setTimeout(
+      () => setStop((current) => (current === stop ? undefined : current)),
+      15_000,
+    );
+    return () => clearTimeout(timer);
+  }, [stop]);
 
   const rangeExtractor = useCallback((range: VirtualRange) => {
     const indexes = new Set(defaultRangeExtractor(range));
@@ -2437,7 +2467,20 @@ const MessageList = ({
           <WorkLog dot={dot} sessionID={conversation.sessionID} log={work.open} running />
         </ExecutionDetails>
       ) : null}
-      {busy ? <Activity dot={dot} sessionID={conversation.sessionID} /> : null}
+      {busy ? (
+        <Activity
+          key={stopScope}
+          dot={dot}
+          sessionID={conversation.sessionID}
+          stopping={stopHere?.pending ?? false}
+          stopNote={stopHere?.note}
+          onStop={(since) => void requestStop(since)}
+        />
+      ) : stopHere?.note ? (
+        <div className="typing" role="status">
+          <span className="stop-note">{stopHere.note}</span>
+        </div>
+      ) : null}
       {latest ? (
         <IconButton
           icon="down"
@@ -2756,8 +2799,43 @@ const WorkLog = ({
   );
 };
 
-/** What a busy dot is doing now, read once a second. */
-const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
+const stopTitle =
+  "Stop the session's current work, like Escape in OpenCode's terminal. OpenCode stops whatever this session is running when the stop arrives, which may be newer than what's shown here. Queued messages stay queued, and a later message can start work again. Work already done isn't undone.";
+
+/** What the owner sees after asking to stop: only what the daemon could confirm. */
+const stopNote = (reply: Reply<StopResult>) => {
+  if (!reply.ok) {
+    if (reply.lost || reply.status === 502)
+      return "Not confirmed: open-dot couldn't tell whether OpenCode stopped the session. It won't try again on its own.";
+    return reply.error || "Nothing was stopped.";
+  }
+  const after =
+    reply.value.running === null
+      ? " open-dot couldn't read whether it's still running."
+      : reply.value.running
+        ? " It's still running: it may be finishing up, or newer work started."
+        : " It isn't running now.";
+  if (reply.value.result === "not-running")
+    return "Nothing to stop: the session isn't running now.";
+  if (reply.value.result === "not-interrupted")
+    return `OpenCode had nothing to interrupt, so the work was already finishing or stopping.${after}`;
+  return `OpenCode accepted the stop.${after}`;
+};
+
+/** What a busy dot is doing now, read once a second, with Stop for the session's current work. */
+const Activity = ({
+  dot,
+  sessionID,
+  stopping,
+  stopNote: note,
+  onStop,
+}: {
+  dot: string;
+  sessionID: string;
+  stopping: boolean;
+  stopNote: string | undefined;
+  onStop: (since: number | null) => void;
+}) => {
   const [seen, setSeen] = useState<{ view: ActivityView; at: number; first: number }>();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -2816,6 +2894,19 @@ const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
           </span>
         ) : null}
       </ExecutionDetails>
+      {seen && seen.view.sessionID === sessionID && seen.view.state !== "idle" ? (
+        <IconButton
+          icon="stop"
+          label={
+            stopping ? "Stopping the session's current work" : "Stop the session's current work"
+          }
+          title={stopTitle}
+          className="stop-session"
+          disabled={stopping}
+          onClick={() => onStop(seen.view.since)}
+        />
+      ) : null}
+      {note ? <span className="stop-note">{note}</span> : null}
     </div>
   );
 };
