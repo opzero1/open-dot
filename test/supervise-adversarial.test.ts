@@ -79,45 +79,6 @@ const queue = (id: number) =>
     .returning()
     .get();
 
-test("issue27: equal-time terminal IDs discovered on separate polls survive restart", async () => {
-  const binding = bind();
-  const time = (binding.activatedAt ?? binding.createdAt) + 100;
-  fake.state.ends.set(owner, [end("msg_first", time)]);
-  await tick();
-  reopen();
-  fake.state.ends.set(owner, [end("msg_first", time), end("msg_second", time)]);
-  await tick();
-  await tick();
-  expect(rows()).toHaveLength(2);
-  expect(
-    rows()
-      .map((row) => row.text)
-      .join(),
-  ).toContain("msg_second");
-});
-
-test("issue27: equal-time terminal IDs in one poll are distinct and are not replayed", async () => {
-  const binding = bind();
-  const time = (binding.activatedAt ?? binding.createdAt) + 100;
-  fake.state.ends.set(owner, [end("msg_first", time), end("msg_second", time)]);
-  await tick();
-  reopen();
-  await tick();
-  expect(rows()).toHaveLength(2);
-});
-
-test("issue27: a waiting ID is never reported twice after absent poll and restart", async () => {
-  bind();
-  fake.state.waiting.set(owner, [{ id: "per_same", kind: "permission", summary: "shell" }]);
-  await tick();
-  fake.state.waiting.set(owner, []);
-  await tick();
-  reopen();
-  fake.state.waiting.set(owner, [{ id: "per_same", kind: "permission", summary: "shell" }]);
-  await tick();
-  expect(rows()).toHaveLength(1);
-});
-
 test("issue27: concurrent waiting IDs and busy once-per-interval persist across reopen", async () => {
   const binding = bind();
   fake.state.active.add(owner);

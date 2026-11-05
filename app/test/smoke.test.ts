@@ -1111,7 +1111,9 @@ const launch = async (
   const app = Bun.spawn(
     [
       electron as unknown as string,
-      ...(process.env.OPEN_DOT_SMOKE_EVIDENCE || name === "selection-click-regression"
+      ...(process.env.OPEN_DOT_SMOKE_EVIDENCE ||
+      name === "selection-click-regression" ||
+      name === "composer-followup"
         ? ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1", "--force-dark-mode"]
         : []),
       join(root, "build"),

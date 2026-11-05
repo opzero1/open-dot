@@ -1,4 +1,15 @@
-# Outbox admission model
+# Protocol models
+
+Run `bun run model:check` for every checked-in TLA model and
+`bun run model:negative` for the twelve required failing controls. The latter
+writes only ignored `.research/model-negative/` copies and logs. These commands
+invoke the pinned real checker; neither executes a hand-written state simulator.
+
+See [SUITE.md](SUITE.md) for the whole-suite before/after audit, [UI.md](UI.md)
+for Feed and Avatar, and [BACKEND.md](BACKEND.md) for Supervision and Observer.
+The original Outbox contract and its separate first-pass audit follow below.
+
+## Outbox admission model
 
 Run from the repository root:
 
@@ -88,7 +99,7 @@ violated `NoDuplicateAdmission` after two accepted calls with lost responses.
   Their runtime regression tests remain. A model pass proves neither those
   features nor the production TypeScript implementation.
 
-## Test-signal audit
+## Earlier outbox-only audit
 
 The audit inventoried the existing test titles and searched source-reading
 assertions, then compared delivery and supervision candidates with their actual

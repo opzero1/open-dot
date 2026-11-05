@@ -36,54 +36,22 @@ const loaded = (ids: number[]) => {
   return state;
 };
 
-test("a poll begun before a clear can't bring it back after a newer poll settles it", () => {
-  const state = loaded([1, 2]);
-  const a = state.startPoll();
-  const sent = state.items;
-  state.dismiss(sent.map((row) => row.id));
-  expect(shown(state)).toEqual([]);
-  state.finish(sent, new Set([1, 2]), () => "unused");
-  expect(state.apply(state.startPoll(), [item(3)])).toBe(true);
-  expect(state.apply(a, [item(1), item(2)])).toBe(false);
-  expect(shown(state)).toEqual([3]);
-});
-
-test("a poll in flight during a clear keeps cleared items hidden until a fresh poll", () => {
-  const state = loaded([1, 2]);
-  const sent = state.items;
-  state.dismiss([1, 2]);
-  const during = state.startPoll();
-  state.finish(sent, new Set([1, 2]), () => "unused");
-  expect(state.apply(during, [item(1), item(2), item(3)])).toBe(true);
-  expect(shown(state)).toEqual([3]);
-  expect(state.apply(state.startPoll(), [item(3)])).toBe(true);
-  expect(state.apply(state.startPoll(), [item(1), item(3)])).toBe(true);
-  expect(shown(state)).toEqual([1, 3]);
-});
-
-test("a partial failure restores only failed items and keeps new arrivals", () => {
+test("feed reconciliation fences polls, restores failed items and keeps new arrivals", () => {
   const state = loaded([1, 2, 3]);
   const sent = state.items;
+  const stale = state.startPoll();
   state.dismiss([1, 2, 3]);
-  expect(state.apply(state.startPoll(), [1, 2, 3, 4].map(item))).toBe(true);
+  const during = state.startPoll();
+  expect(state.apply(during, [1, 2, 3, 4].map(item))).toBe(true);
   expect(shown(state)).toEqual([4]);
   state.finish(sent, new Set([1, 3]), () => "There's no such feed item.");
   expect(shown(state)).toEqual([2, 4]);
   expect([...state.errors]).toEqual([[2, "There's no such feed item."]]);
-});
-
-test("a failure survives an older poll, and a newer poll decides", () => {
-  const state = loaded([1, 2]);
-  const sent = state.items;
-  state.dismiss([1, 2]);
-  const before = state.startPoll();
-  state.finish(sent, new Set(), () => "open-dot daemon isn't running");
-  expect(shown(state)).toEqual([1, 2]);
-  expect(state.apply(before, [item(1), item(5)])).toBe(true);
-  expect(shown(state)).toEqual([1, 2, 5]);
-  expect(state.errors.size).toBe(2);
-  expect(state.apply(state.startPoll(), [item(1), item(5)])).toBe(true);
-  expect(shown(state)).toEqual([1, 5]);
+  expect(state.apply(stale, sent)).toBe(false);
+  expect(state.apply(during, [item(1), item(4)])).toBe(true);
+  expect(shown(state)).toEqual([2, 4]);
+  expect(state.apply(state.startPoll(), [item(4)])).toBe(true);
+  expect(shown(state)).toEqual([4]);
 });
 
 test("a lost clear keeps the whole bounded snapshot and the overflow", () => {

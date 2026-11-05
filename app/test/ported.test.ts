@@ -35,48 +35,7 @@ const listed = (revisions: Record<string, string | null>) =>
     avatar: revision === null ? null : { revision },
   }));
 
-test("each avatar revision loads once, and a dot without one shows none", () => {
-  const state = new AvatarState<string>();
-  expect(state.update(listed({ jotaro: "a", jolyne: null }))).toEqual([
-    { name: "jotaro", revision: "a" },
-  ]);
-  expect(state.update(listed({ jotaro: "a", jolyne: null }))).toEqual([]);
-  expect(state.finish("jotaro", "a", "image-a")).toBe(true);
-  expect(state.images.get("jotaro")).toBe("image-a");
-  expect(state.images.has("jolyne")).toBe(false);
-  expect(state.update(listed({ jotaro: "a" }))).toEqual([]);
-});
-
-test("a replaced avatar keeps the old image until the new one loads, and a stale load is dropped", () => {
-  const state = new AvatarState<string>();
-  state.update(listed({ jotaro: "a" }));
-  state.finish("jotaro", "a", "old");
-  state.update(listed({ jotaro: "b" }));
-  expect(state.images.get("jotaro")).toBe("old");
-  state.update(listed({ jotaro: "c" }));
-  expect(state.finish("jotaro", "b", "stale")).toBe(false);
-  expect(state.images.get("jotaro")).toBe("old");
-  expect(state.finish("jotaro", "c", "new")).toBe(true);
-  expect(state.images.get("jotaro")).toBe("new");
-});
-
-test("a deleted avatar clears at once, and a late load can't bring it back", () => {
-  const state = new AvatarState<string>();
-  state.update(listed({ jotaro: "a" }));
-  state.finish("jotaro", "a", "image");
-  state.update(listed({ jotaro: "b" }));
-  state.update(listed({ jotaro: null }));
-  expect(state.images.has("jotaro")).toBe(false);
-  expect(state.finish("jotaro", "b", "late")).toBe(false);
-  expect(state.images.has("jotaro")).toBe(false);
-  expect(state.update(listed({ jotaro: "a" }))).toEqual([{ name: "jotaro", revision: "a" }]);
-  // A dot gone from the list loses its image too.
-  state.finish("jotaro", "a", "back");
-  state.update([]);
-  expect(state.images.size).toBe(0);
-});
-
-test("bytes that don't decode wait for a new revision, while a failed request is asked for again", () => {
+test("avatar revision guards distinguish failed requests, undecodable bytes and stale completions", () => {
   const state = new AvatarState<string>();
   state.update(listed({ jotaro: "a" }));
   expect(state.finish("jotaro", "a", undefined)).toBe(true);
@@ -87,6 +46,16 @@ test("bytes that don't decode wait for a new revision, while a failed request is
   expect(state.update(listed({ jotaro: "b" }))).toEqual([{ name: "jotaro", revision: "b" }]);
   expect(state.finish("jotaro", "b", "image")).toBe(true);
   expect(state.images.get("jotaro")).toBe("image");
+  expect(state.update(listed({ jotaro: "b", jolyne: null }))).toEqual([]);
+  state.update(listed({ jotaro: "c", jolyne: "a" }));
+  expect(state.images.get("jotaro")).toBe("image");
+  expect(state.finish("jotaro", "b", "stale")).toBe(false);
+  state.update(listed({ jotaro: null, jolyne: "a" }));
+  expect(state.finish("jotaro", "c", "late")).toBe(false);
+  expect(state.finish("jolyne", "a", "other dot")).toBe(true);
+  expect([...state.images]).toEqual([["jolyne", "other dot"]]);
+  state.update([]);
+  expect(state.images.size).toBe(0);
 });
 
 const run = (state: string, extra: Partial<RunView> = {}): RunView => ({

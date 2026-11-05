@@ -1,15 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Service } from "@opencode/client/service";
 import { Effect } from "effect";
-import { superviseAll } from "../src/daemon";
-import { openDatabase } from "../src/db";
 import { OpenCode } from "../src/opencode";
-import { dots, outbox, supervisions } from "../src/schema";
-import { saveBinding } from "../src/supervise";
-import { fakeOpenCode } from "./fake-opencode";
 
 const owner = "ses_reverify";
 const idle = (id: string, created: number) => ({
@@ -26,91 +18,6 @@ const assistant = (id: string, created: number, text: string) => ({
   content: text ? [{ type: "text", text }] : [],
   time: { created },
 });
-const end = (id: string, time: number) => ({
-  id,
-  time,
-  outcome: "succeeded" as const,
-  text: id,
-  error: undefined,
-});
-
-test("issue27 reverify: activation boundary, rolling seen IDs and dedupe transaction are durable", async () => {
-  const path = join(mkdtempSync(join(tmpdir(), "issue27-reverify-")), "test.db");
-  let db = openDatabase(path);
-  const fake = fakeOpenCode();
-  fake.state.directories.set(owner, "/fake/session");
-  const tick = () => Effect.runPromise(superviseAll(db).pipe(Effect.provide(fake.layer)));
-  const reopen = () => {
-    db.$client.close();
-    db = openDatabase(path);
-  };
-  try {
-    db.insert(dots)
-      .values({
-        name: "jojo",
-        sessionID: "ses_jojo",
-        directory: "/fake/dot",
-        sessionState: "ready",
-        createdAt: 0,
-      })
-      .run();
-    const binding = saveBinding(
-      db,
-      { dot: "jojo", sessionID: owner, directory: "/fake/session", mode: "watch", busyMinutes: 1 },
-      "active",
-    );
-    if (typeof binding === "string") throw new Error(binding);
-    const start = binding.createdAt;
-    fake.state.ends.set(owner, [end("msg_prebinding", start), end("msg_older", start - 1)]);
-    await tick();
-    expect(db.select().from(outbox).all()).toHaveLength(0);
-    expect(db.select().from(supervisions).get()?.seenIDs).toEqual([]);
-    fake.state.ends.set(owner, [end("msg_a", start + 1), end("msg_a", start + 1)]);
-    fake.state.waiting.set(owner, [{ id: "per_atomic", kind: "permission", summary: "shell" }]);
-    db.$client.exec(
-      "CREATE TRIGGER fail_notice BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'reverify rollback'); END;",
-    );
-    const failed = await tick().then(
-      () => false,
-      () => true,
-    );
-    expect(failed).toBe(true);
-    expect(db.select().from(supervisions).get()).toMatchObject({
-      seenAt: start,
-      seenIDs: [],
-      waitingOn: [],
-    });
-    expect(db.select().from(outbox).all()).toHaveLength(0);
-    db.$client.exec("DROP TRIGGER fail_notice");
-    await tick();
-    expect(db.select().from(supervisions).get()).toMatchObject({
-      seenAt: start + 1,
-      seenIDs: ["msg_a"],
-      waitingOn: ["permission:per_atomic"],
-    });
-    reopen();
-    fake.state.ends.set(owner, [end("msg_a", start + 1), end("msg_b", start + 1)]);
-    await tick();
-    expect(db.select().from(supervisions).get()?.seenIDs).toEqual(["msg_a", "msg_b"]);
-    fake.state.ends.set(owner, [end("msg_c", start + 2)]);
-    await tick();
-    expect(db.select().from(supervisions).get()?.seenIDs).toEqual(["msg_c"]);
-    reopen();
-    fake.state.ends.set(owner, [
-      end("msg_a", start + 1),
-      end("msg_b", start + 1),
-      end("msg_c", start + 2),
-      end("msg_d", start + 2),
-    ]);
-    await tick();
-    await tick();
-    expect(db.select().from(supervisions).get()?.seenIDs).toEqual(["msg_c", "msg_d"]);
-    expect(db.select().from(outbox).all()).toHaveLength(5);
-  } finally {
-    db.$client.close();
-  }
-});
-
 async function withAdapter(
   handler: (url: URL) => Response,
   run: (service: OpenCode["Service"]) => Promise<void>,

@@ -118,6 +118,8 @@ test("the dot hears once about each request its worker waits on, and handles it 
   expect(await listed()).toEqual([
     {
       id: 1,
+      sessionID: session,
+      directory: "/work/jojo",
       state: "running",
       outcome: null,
       task: "Task 1.",
@@ -201,6 +203,8 @@ test("stopping interrupts the run without resuming, tells the dot once, and is i
   expect(await first.json()).toEqual({
     worker: {
       id: 1,
+      sessionID: session,
+      directory: "/work/jojo",
       state: "done",
       outcome: "stopped",
       task: "Task 1.",
@@ -267,6 +271,8 @@ test("a stop whose interrupt isn't confirmed stays held and is retried only by t
   expect(await listed()).toEqual([
     {
       id: 1,
+      sessionID: session,
+      directory: "/work/jojo",
       state: "stopping",
       outcome: null,
       task: "Task 1.",
