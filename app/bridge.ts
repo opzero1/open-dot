@@ -10,6 +10,9 @@ export type RequestKind = "permission" | "question";
 
 export interface WorkerView {
   id: number;
+  /** The confirmed session; null while creating, absent from older daemons. */
+  sessionID?: string | null;
+  directory?: string;
   state: string;
   outcome: string | null;
   task: string;
@@ -50,6 +53,8 @@ export interface SessionView {
 export interface DotView {
   name: string;
   purpose: string | null;
+  /** The ready bound session this listing read; null when not ready, absent from older daemons. */
+  sessionID?: string | null;
   busy: boolean;
   avatar: Avatar | null;
   workers: WorkerView[];
@@ -261,7 +266,7 @@ export interface Bytes {
 export interface TrayState {
   busy: boolean;
   unread: number;
-  // Dots with unsaved instructions: quitting asks before it discards them.
+  // Unsaved instruction edits and unsent message drafts: quitting asks before it discards them.
   unsaved?: number;
 }
 

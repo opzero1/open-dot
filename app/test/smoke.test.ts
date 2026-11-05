@@ -449,6 +449,7 @@ class FakeDaemon {
         {
           name: "jojo",
           purpose: "Second brain.",
+          sessionID: this.sessionID,
           busy: this.busy,
           avatar: this.avatar ? { revision: this.avatar.revision } : null,
           workers: this.workers,
@@ -459,6 +460,7 @@ class FakeDaemon {
         ...[...this.others.keys()].map((name) => ({
           name,
           purpose: "Another dot.",
+          sessionID: `ses_${name}`,
           busy: false,
           avatar: null,
           workers: [],
@@ -1079,6 +1081,7 @@ interface Recorded {
   emojiPanel: number;
   openExternal: string[];
   clipboard: { text?: string; images?: number }[];
+  quitPrompts: number;
   shares: { texts: number; files: number; directory: string }[];
 }
 
@@ -1108,7 +1111,7 @@ const launch = async (
   const app = Bun.spawn(
     [
       electron as unknown as string,
-      ...(process.env.OPEN_DOT_SMOKE_EVIDENCE
+      ...(process.env.OPEN_DOT_SMOKE_EVIDENCE || name === "selection-click-regression"
         ? ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1", "--force-dark-mode"]
         : []),
       join(root, "build"),
@@ -3867,10 +3870,34 @@ test("Instructions: the draft survives panes and Escape, a conflict keeps it, an
       fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
     },
     async (app) => {
-      const { fake, js, until, press } = app;
+      const { fake, js, until, press, temporary } = app;
       await until(`!!t.box()`, "the chat");
       await js(`t.box().focus(), t.cmd("3"), true`);
       await until(`!!document.querySelector(".instructions-editor")`, "the editor");
+      const toolbar = () =>
+        js(
+          `['Revert','Cancel'].map(label=>{const button=document.querySelector('.instructions .pane-head [aria-label="'+label+'"]');const r=button.getBoundingClientRect();return {label:button.getAttribute('aria-label'),title:button.title,disabled:button.disabled,icon:!!button.querySelector('svg'),width:r.width,height:r.height,text:button.textContent};})`,
+        );
+      expect(await toolbar()).toEqual([
+        {
+          label: "Revert",
+          title: "Put back the version before the last save",
+          disabled: true,
+          icon: true,
+          width: 30,
+          height: 30,
+          text: "Revert",
+        },
+        {
+          label: "Cancel",
+          title: "Cancel unsaved changes",
+          disabled: true,
+          icon: true,
+          width: 30,
+          height: 30,
+          text: "Cancel",
+        },
+      ]);
       await js(`t.fill(".instructions-editor", "# jojo\\nBe brief.\\n")`);
       await until(`!!document.querySelector("[data-unsaved]")`, "Unsaved changes");
       await js(`document.querySelector(".instructions-editor").focus(), t.key("Escape"), true`);
@@ -3906,6 +3933,48 @@ test("Instructions: the draft survives panes and Escape, a conflict keeps it, an
         "# jojo\nBe briefer.\n",
       );
       expect(await js(`!!document.querySelector("[data-unsaved]")`)).toBe(true);
+      const icons = await toolbar();
+      expect(icons).toMatchObject([
+        { label: "Revert", disabled: false, icon: true },
+        { label: "Cancel", disabled: false, icon: true },
+      ]);
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        const page = await smokePage(temporary);
+        try {
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("Missing instruction toolbar capture");
+          writeFileSync(
+            join(evidence, "instructions-icons-dark.png"),
+            Buffer.from(shot.data, "base64"),
+          );
+          writeFileSync(
+            join(evidence, "instructions-icons-readback.json"),
+            JSON.stringify(icons, null, 2),
+          );
+        } finally {
+          page.close();
+        }
+      }
+      await press(".instructions .pane-head", "Revert");
+      await until(
+        `document.querySelector('[role="alertdialog"]')?.textContent.includes('previous version')`,
+        "Revert confirmation still gates action",
+      );
+      await press('[role="alertdialog"]', "Cancel");
+      await press(".instructions .pane-head", "Cancel");
+      await until(
+        `document.querySelector('[role="alertdialog"]')?.textContent.includes('Discard your changes')`,
+        "Cancel confirmation",
+      );
+      await press('[role="alertdialog"]', "Keep Editing");
+      expect(await js(`document.querySelector('.instructions-editor').value`)).toBe(
+        "# jojo\nBe briefer.\n",
+      );
     },
   );
 }, 170_000);
@@ -4719,6 +4788,451 @@ test("code Copy uses an accessible icon and exact bytes, with success only after
   );
 }, 30_000);
 
+test("composer follow-up: worker refs and original image preview preserve drafts and send only exact captured identities", async () => {
+  await scenario(
+    "composer-followup",
+    (fake) => {
+      fake.messages = [{ id: "quoted", kind: "dot", text: "The quoted source" }];
+      fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+      fake.workers = [
+        {
+          ...worker(7, "running"),
+          sessionID: "ses_native",
+          directory: "/work/native",
+          task: "Alice asked me to review changes",
+        },
+        { ...worker(8, "running"), sessionID: "ses_later", directory: "/work/later" },
+      ];
+      fake.threads = [
+        {
+          sessionID: "ses_managed",
+          title: "Managed review",
+          state: "working",
+          needs: [],
+          waiting: [],
+          answered: null,
+        },
+      ];
+    },
+    async ({ fake, js, until, press, state, temporary, menu }) => {
+      await until(
+        `!!t.box() && !!t.msg('quoted') && !!document.querySelector('[data-thread="ses_managed"] button')`,
+        "chat and both worker sources",
+      );
+      const page = await smokePage(temporary);
+      const shot = async (name: string) => {
+        const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+        if (!evidence) return;
+        const capture = await page.send("Page.captureScreenshot", {
+          format: "png",
+          fromSurface: true,
+          captureBeyondViewport: false,
+        });
+        if (!capture.data) throw new Error("Missing composer capture");
+        writeFileSync(join(evidence, name), Buffer.from(capture.data, "base64"));
+      };
+      const add = async (selector: string, gesture: "rightclick" | "ContextMenu" | "F10") => {
+        await js(
+          `(() => {const button=document.querySelector(${JSON.stringify(selector)});button.focus();button.dispatchEvent(${gesture === "rightclick" ? `new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:800,clientY:150})` : `new KeyboardEvent('keydown',{key:${JSON.stringify(gesture)},shiftKey:${gesture === "F10"},bubbles:true,cancelable:true})`});return true;})()`,
+        );
+        await until(
+          `!!document.querySelector('[role="menu"] [role="menuitem"]:not(:disabled)')`,
+          "observed Add to chat menu",
+        );
+        await press('[role="menu"]', "Add to chat");
+      };
+      try {
+        await js(`t.box().focus(),t.type('Keep my draft'),true`);
+        await menu("quoted", "Reply");
+        await js(
+          `(() => {const c=document.createElement('canvas');c.width=1200;c.height=800;const x=c.getContext('2d');x.fillStyle='#17487a';x.fillRect(0,0,1200,800);x.fillStyle='#ffcc44';x.fillRect(600,0,600,800);x.fillStyle='#ffffff';x.font='64px sans-serif';x.fillText('ORIGINAL 1200 x 800',60,400);const bytes=Uint8Array.from(atob(c.toDataURL('image/png').split(',')[1]),c=>c.charCodeAt(0));const data=new DataTransfer();data.items.add(new File([bytes],'large.png',{type:'image/png'}));t.box().dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true}));window.revoked=[];const revoke=URL.revokeObjectURL.bind(URL);URL.revokeObjectURL=url=>{window.revoked.push(url);revoke(url);};return true;})()`,
+        );
+        await until(
+          `!!document.querySelector('.draft-thumb .thumb-open') && !!document.querySelector('.quote-bar')`,
+          "image and quote",
+        );
+        await add('[data-worker="7"] .worker-select', "rightclick");
+        await add('[data-thread="ses_managed"] button', "ContextMenu");
+        await until(
+          `document.querySelectorAll('.composer .ref-chip').length===2 || document.querySelectorAll('.ref-chip[data-ref]').length===2`,
+          "two compact reference chips",
+        );
+        expect(
+          await js(
+            `({text:t.box().value,images:document.querySelectorAll('.draft-thumb').length,quote:document.querySelector('.quote-bar .quote-text').textContent,focus:document.activeElement===t.box(),end:t.box().selectionEnd})`,
+          ),
+        ).toEqual({
+          text: "Keep my draft",
+          images: 1,
+          quote: "The quoted source",
+          focus: true,
+          end: 13,
+        });
+        expect(fake.log.posts).toEqual([]);
+        await js(`document.querySelector('[data-ref="ses_managed"] button').click(),true`);
+        await add('[data-thread="ses_managed"] button', "F10");
+        await shot("refs-draft-dark.png");
+        await js(`document.querySelector('.thumb-open').click(),true`);
+        await until(
+          `document.querySelector('[data-draft-preview] img')?.naturalWidth===1200`,
+          "full original preview image",
+        );
+        const preview = await js(
+          `(() => {const dialog=document.querySelector('[data-draft-preview]');const image=dialog.querySelector('img');const r=image.getBoundingClientRect();window.previewURL=image.src;return {role:dialog.getAttribute('role'),label:dialog.getAttribute('aria-label'),width:image.naturalWidth,height:image.naturalHeight,fits:r.width<=innerWidth&&r.height<=innerHeight,large:r.width>document.querySelector('.thumb-open').getBoundingClientRect().width,closeFocused:document.activeElement?.getAttribute('aria-label')==='Close preview',nestedRemove:!!document.querySelector('.thumb-open button'),siblings:document.querySelector('.thumb-open').parentElement.querySelectorAll(':scope > button').length};})()`,
+        );
+        expect(preview).toEqual({
+          role: "dialog",
+          label: "Preview of large.png",
+          width: 1200,
+          height: 800,
+          fits: true,
+          large: true,
+          closeFocused: true,
+          nestedRemove: false,
+          siblings: 2,
+        });
+        await shot("draft-preview-dark.png");
+        await js(`t.key('Escape'),true`);
+        await until(
+          `!document.querySelector('[data-draft-preview]')&&document.activeElement===document.querySelector('.thumb-open')`,
+          "Escape restores preview opener",
+        );
+        expect(await js(`window.revoked.includes(window.previewURL)`)).toBe(true);
+        await page.send("Emulation.setFocusEmulationEnabled", { enabled: true });
+        await page.send("Input.dispatchKeyEvent", {
+          type: "keyDown",
+          key: "Enter",
+          code: "Enter",
+          windowsVirtualKeyCode: 13,
+          text: "\r",
+          unmodifiedText: "\r",
+        });
+        await page.send("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "Enter",
+          code: "Enter",
+          windowsVirtualKeyCode: 13,
+        });
+        await until(
+          `!!document.querySelector('[data-draft-preview] img')`,
+          "native Enter activates semantic preview button",
+        );
+        await press("[data-draft-preview]", "Close preview");
+        await until(
+          `!document.querySelector('[data-draft-preview]')&&document.activeElement===document.querySelector('.thumb-open')`,
+          "Close restores opener",
+        );
+        await js(`document.querySelector('.thumb-open').click(),true`);
+        await until(
+          `!!document.querySelector('[data-draft-preview] img')`,
+          "preview before navigation cleanup",
+        );
+        await js(
+          `window.previewURL=document.querySelector('[data-draft-preview] img').src;document.querySelector('[data-dot="dio"]').click();true`,
+        );
+        await until(
+          `t.box()?.placeholder==='Message dio'&&!document.querySelector('[data-draft-preview]')`,
+          "navigation clears preview",
+        );
+        expect(
+          await js(
+            `({refs:document.querySelectorAll('[data-ref]').length,revoked:window.revoked.includes(window.previewURL)})`,
+          ),
+        ).toEqual({ refs: 0, revoked: true });
+        await js(`document.querySelector('[data-dot="jojo"]').click(),true`);
+        await until(
+          `t.box()?.value==='Keep my draft'&&document.querySelectorAll('[data-ref]').length===2&&!!document.querySelector('.quote-bar')`,
+          "per-dot refs, text and quote restored",
+        );
+        await js(
+          `document.querySelector('.draft-thumb [aria-label="Remove large.png"]').click(),true`,
+        );
+        await until(
+          `!document.querySelector('.draft-thumb')&&!document.querySelector('[data-draft-preview]')`,
+          "remove sibling removes without preview",
+        );
+        await js(`t.box().focus(),t.paste('removal.png'),true`);
+        await until(`!!document.querySelector('.thumb-open')`, "second draft thumbnail");
+        await js(`document.querySelector('.thumb-open').click(),true`);
+        await until(
+          `!!document.querySelector('[data-draft-preview] img')`,
+          "preview before image removal cleanup",
+        );
+        await js(
+          `window.previewURL=document.querySelector('[data-draft-preview] img').src;document.querySelector('.draft-thumb [aria-label="Remove removal.png"]').click();true`,
+        );
+        await until(
+          `!document.querySelector('[data-draft-preview]')&&!document.querySelector('.draft-thumb')`,
+          "removal ends preview",
+        );
+        expect(await js(`window.revoked.includes(window.previewURL)`)).toBe(true);
+        expect(fake.log.posts).toEqual([]);
+        fake.workers = [
+          {
+            ...worker(7, "done"),
+            sessionID: "ses_native",
+            directory: "/work/native",
+            task: "Changed completed title",
+          },
+          { ...worker(8, "running"), sessionID: "ses_later", directory: "/work/later" },
+        ];
+        await until(
+          `document.querySelector('[data-worker="7"]')?.textContent.includes('Changed completed title')`,
+          "native completion poll",
+        );
+        expect(await js(`document.querySelector('[data-ref="ses_native"]').title`)).toContain(
+          "Session ses_native\nCoordinator ses_jojo",
+        );
+        fake.onPost = () => json({ error: "Refused fixture send" }, 409);
+        await js(`t.box().focus(),t.key('Enter'),true`);
+        await until(
+          `document.body.innerText.includes('Refused fixture send')`,
+          "refused send visible",
+        );
+        expect(
+          await js(
+            `({refs:document.querySelectorAll('[data-ref]').length,text:t.box().value,quote:!!document.querySelector('.quote-bar')})`,
+          ),
+        ).toEqual({ refs: 2, text: "Keep my draft", quote: true });
+        let release: (() => void) | undefined;
+        fake.onPost = (post) =>
+          new Promise<Response>((resolve) => {
+            release = () => resolve(json({ id: post.messageID }, 202));
+          });
+        await js(`t.box().focus(),t.key('Enter'),true`);
+        await until(
+          `!!document.querySelector('[aria-label="Sending…"]')`,
+          "captured send in flight",
+        );
+        await add('[data-worker="8"] .worker-select', "F10");
+        release?.();
+        await until(
+          `t.box().value===''&&document.querySelectorAll('[data-ref]').length===1&&!document.querySelector('.quote-bar')`,
+          "only captured refs cleared, later addition remains",
+        );
+        expect(fake.log.posts).toHaveLength(2);
+        const sent = fake.log.posts[1];
+        if (!sent) throw new Error("Missing captured send");
+        expect(sent).toMatchObject({ replyTo: "quoted", files: 0 });
+        expect(sent.text).toStartWith("Keep my draft\n\n<worker-references>");
+        expect(JSON.parse(sent.text.split("\n").at(-2) ?? "")).toEqual([
+          {
+            kind: "open-dot worker",
+            workerID: 7,
+            sessionID: "ses_native",
+            dot: "jojo",
+            coordinatorID: "ses_jojo",
+          },
+          {
+            kind: "Threads worker",
+            sessionID: "ses_managed",
+            dot: "jojo",
+            coordinatorID: "ses_jojo",
+          },
+        ]);
+        expect(sent.text).not.toContain("Changed completed title");
+        expect(sent.text).not.toContain("Alice");
+        fake.sessionID = "ses_rebound";
+        await until(
+          `!!document.querySelector('[data-ref="ses_later"][data-stale]')`,
+          "stale ref visibly blocked",
+        );
+        await js(`t.box().focus(),t.type('New question'),t.key('Enter'),true`);
+        await until(
+          `document.body.innerText.includes('Not sent. A worker reference')`,
+          "stale send refusal",
+        );
+        expect(fake.log.posts).toHaveLength(2);
+        fake.sessionID = "ses_jojo";
+        await until(
+          `!!document.querySelector('[data-ref="ses_later"]:not([data-stale])')`,
+          "original binding restored",
+        );
+        fake.onPost = () => json({}, 202);
+        fake.failReceipts = true;
+        await js(`t.box().focus(),t.key('Enter'),true`);
+        await until(
+          `!!document.querySelector('[data-attempt-unknown]')`,
+          "unknown outcome preserves ref",
+        );
+        expect(await js(`!!document.querySelector('[data-ref="ses_later"]')`)).toBe(true);
+        expect(fake.log.posts).toHaveLength(3);
+        expect(fake.log.opens).toEqual([]);
+        expect((await state()).recorded.openExternal).toEqual([]);
+      } finally {
+        page.close();
+      }
+    },
+  );
+}, 60_000);
+
+test("sent owner quotes are safe compact inset paragraphs with an outside reply and literal comparison/code", async () => {
+  const text =
+    "> \n> First quoted line\n> continued line\n>\n> Second quoted paragraph\n> \n> \n\nMy reply: 5 > 3 and `literal > marker`.\n\n```text\n> literal fenced code\n```\n\n<script>window.ownerQuoteUnsafe=true</script>";
+  await scenario(
+    "owner-quote-followup",
+    (fake) => {
+      fake.messages = [{ id: "ownerquote", kind: "owner", text }];
+    },
+    async ({ fake, js, until, temporary }) => {
+      await until(`!!t.msg('ownerquote')?.querySelector('blockquote')`, "rendered owner quote");
+      const readback = await js(
+        `(()=>{const body=t.msg('ownerquote').querySelector('.markdown');const quote=body.querySelector('blockquote');const style=getComputedStyle(quote);return {paragraphs:[...quote.querySelectorAll('p')].map(p=>p.textContent),outside:[...body.querySelectorAll(':scope > p')].map(p=>p.textContent),code:body.querySelector('pre code').textContent,quotes:body.querySelectorAll('blockquote').length,unsafe:!!body.querySelector('script,iframe')||window.ownerQuoteUnsafe===true,border:parseFloat(style.borderLeftWidth),padding:parseFloat(style.paddingLeft),background:style.backgroundColor,firstMargin:getComputedStyle(quote.firstElementChild).marginTop,lastMargin:getComputedStyle(quote.lastElementChild).marginBottom};})()`,
+      );
+      expect(readback).toMatchObject({
+        paragraphs: ["First quoted line\ncontinued line", "Second quoted paragraph"],
+        outside: ["My reply: 5 > 3 and literal > marker."],
+        code: "> literal fenced code\n",
+        quotes: 1,
+        unsafe: false,
+        border: 3,
+        padding: 10,
+        firstMargin: "0px",
+        lastMargin: "0px",
+      });
+      expect(fake.messages[0]?.text).toBe(text);
+      expect(fake.log.posts).toEqual([]);
+      expect(
+        await js(
+          `(()=>{const mark=t.msg('ownerquote').querySelector('.delivered');return {role:mark.getAttribute('role'),label:mark.getAttribute('aria-label'),title:mark.title,text:mark.textContent,checks:mark.querySelectorAll('svg').length};})()`,
+        ),
+      ).toEqual({
+        role: "img",
+        label: "Delivered to conversation; read status unavailable",
+        title:
+          "Delivered to the conversation history. This does not confirm the agent has read or consumed it.",
+        text: "",
+        checks: 1,
+      });
+      fake.pending = [{ id: "ownerquote", status: "sending", delivery: null }];
+      await until(
+        `!t.msg('ownerquote').querySelector('.delivered')`,
+        "pending history message is not marked delivered",
+      );
+      fake.pending = [];
+      await until(
+        `!!t.msg('ownerquote').querySelector('.delivered')`,
+        "history-only check restored",
+      );
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        const page = await smokePage(temporary);
+        try {
+          await delay(100);
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("Missing owner quote capture");
+          writeFileSync(join(evidence, "owner-quote-dark.png"), Buffer.from(shot.data, "base64"));
+          writeFileSync(
+            join(evidence, "owner-quote-readback.json"),
+            JSON.stringify(readback, null, 2),
+          );
+        } finally {
+          page.close();
+        }
+      }
+    },
+  );
+}, 30_000);
+
+test("selection gestures keep Reply and Copy for a double-click word and triple-click final paragraph", async () => {
+  const paragraph = "Tripleclick paragraph selection stays available.";
+  const selected = `${paragraph}\n\n`;
+  await scenario(
+    "selection-click-regression",
+    (fake) => {
+      fake.messages = [
+        { id: "gesture", kind: "dot", text: `An earlier paragraph.\n\n${paragraph}` },
+      ];
+    },
+    async ({ fake, js, until, press, state, temporary }) => {
+      await until(
+        `t.msg('gesture')?.querySelectorAll('[data-reply-content] p').length === 2`,
+        "the real final Markdown paragraph",
+      );
+      const point = await js(
+        `(() => { const p = t.msg('gesture').querySelector('[data-reply-content] p:last-child'); const text=p.firstChild; const from=text.textContent.indexOf('paragraph'); const range=document.createRange(); range.setStart(text,from); range.setEnd(text,from+9); const r=range.getBoundingClientRect(); window.gestureEvents=[]; for(const type of ['mousedown','mouseup']) document.addEventListener(type,event=>window.gestureEvents.push({type,detail:event.detail,trusted:event.isTrusted}),true); return {x:r.left+r.width/2,y:r.top+r.height/2}; })()`,
+      );
+      if (!point || typeof point !== "object" || !("x" in point) || !("y" in point))
+        throw new Error("No gesture point");
+      const read = () =>
+        js(
+          `(() => { const s=document.getSelection(); const r=s?.rangeCount?s.getRangeAt(0):undefined; const describe=node=>node?{name:node.nodeName,parent:node.parentElement?.tagName,content:!!(node instanceof Element?node:node.parentElement)?.closest('[data-reply-content]')}:null; return {text:s?.toString(),toolbar:!!document.querySelector('[data-selection-reply]'),start:describe(r?.startContainer),startOffset:r?.startOffset,end:describe(r?.endContainer),endOffset:r?.endOffset,events:window.gestureEvents}; })()`,
+        );
+      const page = await smokePage(temporary);
+      try {
+        await page.send("Emulation.setFocusEmulationEnabled", { enabled: true });
+        for (const clickCount of [1, 2])
+          for (const type of ["mousePressed", "mouseReleased"]) {
+            await page.send("Input.dispatchMouseEvent", {
+              type,
+              x: point.x,
+              y: point.y,
+              button: "left",
+              clickCount,
+            });
+          }
+        await until(
+          `document.getSelection()?.toString() === 'paragraph' && !!document.querySelector('[data-selection-reply]')`,
+          "double-click word selection and toolbar",
+          3,
+        );
+        const double = await read();
+        for (const type of ["mousePressed", "mouseReleased"]) {
+          await page.send("Input.dispatchMouseEvent", {
+            type,
+            x: point.x,
+            y: point.y,
+            button: "left",
+            clickCount: 3,
+          });
+        }
+        await until(
+          `document.getSelection()?.toString().includes('Tripleclick paragraph') === true`,
+          "actual triple-click paragraph selection",
+          3,
+        );
+        await delay(100);
+        const triple = await read();
+        const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+        console.log("SELECTION_GESTURE_READBACK", JSON.stringify({ double, triple }));
+        if (evidence) {
+          writeFileSync(
+            join(evidence, "selection-gesture-readback.json"),
+            JSON.stringify({ double, triple }, null, 2),
+          );
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("No gesture screenshot data");
+          writeFileSync(
+            join(evidence, "selection-triple-before.png"),
+            Buffer.from(shot.data, "base64"),
+          );
+        }
+        expect(triple).toMatchObject({ text: selected, end: { content: false }, endOffset: 0 });
+        expect(triple).toMatchObject({ toolbar: true });
+        await press("[data-selection-reply]", "Copy");
+        expect((await state()).recorded.clipboard).toContainEqual({ text: selected });
+        await press("[data-selection-reply]", "Reply");
+        await until(
+          `t.box().value === ${JSON.stringify(`> ${paragraph}\n> \n> \n\n`)}`,
+          "the exact triple-selected paragraph in Reply",
+          3,
+        );
+        expect(fake.log.posts).toEqual([]);
+      } finally {
+        page.close();
+      }
+    },
+  );
+}, 30_000);
+
 test("selection Reply appends exact multiline text, preserves draft and image, and clears across scope changes without sending", async () => {
   const selected = "First selected line\nSecond selected line";
   const draft = "Keep my original draft";
@@ -4728,7 +5242,11 @@ test("selection Reply appends exact multiline text, preserves draft and image, a
     (fake) => {
       fake.messages = [
         { id: "sel", kind: "owner", text: `Before\n${selected}\nAfter` },
-        { id: "other", kind: "dot", text: "Another message" },
+        {
+          id: "other",
+          kind: "dot",
+          text: "Another message\n\n```text\ninteractive Copy guard\n```",
+        },
       ];
       fake.others.set("dio", {
         messages: [{ id: "dio1", kind: "dot", text: "Different dot message" }],
@@ -4748,7 +5266,7 @@ test("selection Reply appends exact multiline text, preserves draft and image, a
       );
       const select = async () => {
         await js(
-          `(() => { document.activeElement?.blur(); const text = t.msg('sel').querySelector('[data-reply-content]').firstChild; const from = text.textContent.indexOf('First selected line'); const range = document.createRange(); range.setStart(text, from); range.setEnd(text, from + ${selected.length}); const selection = document.getSelection(); selection.removeAllRanges(); selection.addRange(range); document.dispatchEvent(new Event('selectionchange')); return true; })()`,
+          `(() => { document.activeElement?.blur(); const content = t.msg('sel').querySelector('[data-reply-content] p'); const from = content.textContent.indexOf('First selected line'); const point = offset => { const walk=document.createTreeWalker(content,NodeFilter.SHOW_TEXT);let node;while(node=walk.nextNode()){if(offset<=node.length)return [node,offset];offset-=node.length;}throw new Error('Missing selection boundary');};const range = document.createRange(); range.setStart(...point(from)); range.setEnd(...point(from + ${selected.length})); const selection = document.getSelection(); selection.removeAllRanges(); selection.addRange(range); document.dispatchEvent(new Event('selectionchange')); return true; })()`,
         );
         await until(`!!document.querySelector('[data-selection-reply]')`, "the selection toolbar");
         expect(await js(`document.getSelection().toString()`)).toBe(selected);
@@ -4826,6 +5344,13 @@ test("selection Reply appends exact multiline text, preserves draft and image, a
       await until(
         `!document.querySelector('[data-selection-reply]')`,
         "cross-message selection rejection",
+      );
+      await js(
+        `(()=>{const range=document.createRange();range.selectNodeContents(t.msg('other').querySelector('[data-reply-content]'));const selection=document.getSelection();selection.removeAllRanges();selection.addRange(range);document.dispatchEvent(new Event('selectionchange'));return true;})()`,
+      );
+      await until(
+        `!document.querySelector('[data-selection-reply]')`,
+        "selection containing a real code Copy button is rejected",
       );
       await select();
       await openInboxPane({ js, until }, "needs");

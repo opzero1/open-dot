@@ -118,15 +118,17 @@ export const bytes = (size: number) =>
       ? `${(size / 1024).toFixed(1)} KB`
       : `${(size / 1024 / 1024).toFixed(1)} MB`;
 
-/** A local image's preview, released when it leaves the screen. */
+/** A local image's preview, released when it leaves the screen; with `onOpen`, a button. */
 export const LocalThumb = ({
   image,
   className,
   onRemove,
+  onOpen,
 }: {
   image: DraftImage;
   className: string;
   onRemove?: () => void;
+  onOpen?: (opener: HTMLButtonElement) => void;
 }) => {
   const url = useMemo(
     () => URL.createObjectURL(new Blob([new Uint8Array(image.data)], { type: image.mime })),
@@ -135,7 +137,19 @@ export const LocalThumb = ({
   useEffect(() => () => URL.revokeObjectURL(url), [url]);
   return (
     <span className={className}>
-      <img src={url} alt={image.name} title={image.name} />
+      {onOpen ? (
+        <button
+          type="button"
+          className="thumb-open"
+          aria-label={`Preview ${image.name}`}
+          title={`Preview ${image.name}`}
+          onClick={(event) => onOpen(event.currentTarget)}
+        >
+          <img src={url} alt="" />
+        </button>
+      ) : (
+        <img src={url} alt={image.name} title={image.name} />
+      )}
       {onRemove ? (
         <IconButton icon="close" label={`Remove ${image.name}`} onClick={onRemove} />
       ) : null}

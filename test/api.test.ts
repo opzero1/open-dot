@@ -916,6 +916,7 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
     {
       name: "jojo",
       purpose: "Second brain.",
+      sessionID: "ses_jojo",
       busy: true,
       avatar: null,
       threads: [],
@@ -923,6 +924,8 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       workers: [
         {
           id: 1,
+          sessionID: "ses_w1",
+          directory: "/w",
           state: "running",
           outcome: null,
           task: "Fix the build",
@@ -932,6 +935,8 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
         },
         {
           id: 2,
+          sessionID: "ses_w2",
+          directory: "/w",
           state: "running",
           outcome: null,
           task: "Deploy",
@@ -945,6 +950,7 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
     {
       name: "polnareff",
       purpose: null,
+      sessionID: "ses_polnareff",
       busy: false,
       avatar: null,
       threads: [],
@@ -953,6 +959,18 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       sessions: [],
     },
   ]);
+  db.insert(workers)
+    .values({ ...worker, sessionID: "ses_notconfirmed", task: "Starting", state: "creating" })
+    .run();
+  db.update(dots).set({ sessionState: "creating" }).where(eq(dots.name, "polnareff")).run();
+  const listed = (await (await call("/dots")).json()) as {
+    sessionID: string | null;
+    workers: { task: string; sessionID: string | null; directory: string }[];
+  }[];
+  expect(
+    listed[0]?.workers.find((item: { task: string }) => item.task === "Starting"),
+  ).toMatchObject({ sessionID: null, directory: "/w" });
+  expect(listed[1]?.sessionID).toBeNull();
 });
 
 test("Threads discovery lists request-free owned workers, excludes hidden and duplicate sessions, and reports RPC failure", async () => {
