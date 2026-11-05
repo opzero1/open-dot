@@ -57,7 +57,7 @@ Every model request a question takes is a step. The report keeps every step's ow
 
 Its scores check that the harness works and say nothing about real use.
 
-## Measuring for real, later
+## Private source-backed measurements
 
 After some real use, the owner writes a private fixture with the same shape, `"synthetic": false`. It needs:
 
@@ -66,6 +66,18 @@ After some real use, the owner writes a private fixture with the same shape, `"s
 - Optionally, the ledger rows the observer actually wrote.
 
 Keep it outside the repository, for example under `~/.opendot/evidence/issue-42/`. Never commit it, and never paste its contents into an issue.
+
+A bounded pilot on November 5, 2026 used a consistent, read-only export of two enabled dots' memory tables: 2,033 archived messages, 159 actual observations and 5 notes. Thirty questions were frozen before scoring or tuning: 27 answerable and 3 negative controls, including older decisions, paraphrases and corrections. Private source text and results remain in ignored local evidence, not this repository's tracked files.
+
+The pilot found that three observer matches could exclude a strongly matching original owner message. Reserving one of those slots for the strongest qualifying owner hit improved source-and-displayed-answer recovery from 11 to 15 of 27 questions in composed memory, and from 8 to 14 in the automatic block alone. No earlier recovery was lost or known obsolete alternative added. Automatic context decreased from 61,176 to 60,482 total UTF-8 bytes across the 30 questions, under the unchanged three-record/4,800-byte cap per question. Unrelated automatic records decreased from 30 to 26, but one question gained an unrelated record; that relevance regression remains.
+
+These are manually checked source recoveries, not generated-answer accuracy or provider cache savings. Source-ID presence alone did not count: a displayed excerpt or observation had to support the answer too. The replay used the saved settings, checkpoint and current compaction mode, with six recent messages visible, not the complete live model context. Twelve full-memory source misses remain, including older-session and lexical-matching gaps. The pilot supports the small slot-allocation change, not a hierarchical memory rewrite or a general recall-quality claim.
+
+A separate validation froze 16 new questions after both code versions were fixed, then replayed them against the same snapshot without tuning. Fourteen were answerable, all with sources at least seven days old; two asked for unsupported details. Eight used paraphrases and three distinguished later decisions from earlier alternatives. Their primary sources did not overlap the development pilot's permitted or stale sources. This is post-development validation within an already inspected corpus, not a prospective or unseen-corpus holdout.
+
+Neither version did better: complete source-and-displayed-answer recovery was 5/14 in automatic recall and 6/14 in composed memory. Allowing any displayed source, including notes without rendered provenance, gave 7/14 in composed memory. These strict scores require the full frozen expected answer; three misses still supplied the central question facts but omitted supplementary caveats. Only one output changed, replacing an unrelated observation with an unrelated owner message and saving 194 bytes. There were no recovery losses, new known obsolete claims or per-question unrelated-record-count regressions. Neither control exposed an invented requested value; this does not test whether a model would abstain.
+
+The validation does not demonstrate broader superiority. Remaining problems include generic lexical matches, observations omitting details, citations to multi-topic messages without the needed text, and observation-first allocation excluding useful assistant-authored archive hits. Historical dates are not retrieval cutoffs, and a capped checkpoint can list a topic without its supporting fact. The owner-slot change addresses only one of these mechanisms. Both versions retained the existing byte caps, dot/session isolation, visible-message exclusion and bounded cached-deletion behavior. No model jobs, live changes or further runtime edits were made for this validation.
 
 ## Where the memory tail goes (#62)
 

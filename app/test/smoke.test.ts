@@ -5892,7 +5892,7 @@ test("request cards: Show more reaches every pending card, in a dot's chat and i
         "every card in Needs you",
       );
       expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
-        "Needs your action (1001)",
+        "Needs your action1001",
       );
       expect(await js(`document.querySelector("[data-inbox-count]").textContent`)).toBe("1001");
       await press('[data-needs-pane] [data-request="1001"]', "Allow once");

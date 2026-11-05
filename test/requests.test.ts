@@ -559,10 +559,14 @@ test("a Threads worker of the dot's exact session is detected and answered after
   expect(toDot()).toEqual([
     expect.stringContaining("Your Threads worker session ses_t1 is waiting on"),
   ]);
-  const listed = (await (await call("/dots")).json()) as { sessions: unknown[] }[];
-  expect(listed[0]?.sessions).toEqual([
+  const listed = (await (await call("/dots")).json()) as {
+    threads: unknown[];
+    sessions: unknown[];
+  }[];
+  expect(listed[0]?.sessions).toEqual([]);
+  expect(request()).toMatchObject({ id: 1, sessionID: "ses_t1", state: "open" });
+  expect(listed[0]?.threads).toEqual([
     expect.objectContaining({
-      request: 1,
       sessionID: "ses_t1",
       title: "Research",
       waiting: ["permission"],

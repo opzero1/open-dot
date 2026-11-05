@@ -705,19 +705,22 @@ ${dataJSON(
 
 /**
  * The `<recalled-context>` block for the memory tail, empty without hits: observed ledger rows
- * first, then archived messages, three in all. Entries are added best first while the whole
- * block, escaped, stays within `autoRecallBytes`, each message with the longest excerpt that fits.
+ * first, then archived messages, three in all. When observations fill all three slots, reserve
+ * one for the strongest qualifying owner message, if any. The escaped block stays within
+ * `autoRecallBytes`, each message with the longest excerpt that fits.
  */
 export function recalledBlock(
   hits: readonly AutoRecallHit[],
   observed: readonly ObservedHit[] = [],
 ) {
   const shown: Shown[] = [];
-  for (const row of observed.slice(0, autoRecallHits)) {
+  const owner =
+    observed.length >= autoRecallHits ? hits.find((hit) => hit.from === "owner") : undefined;
+  for (const row of observed.slice(0, autoRecallHits - (owner ? 1 : 0))) {
     if (Buffer.byteLength(recalledText([...shown, { observed: row }])) > autoRecallBytes) break;
     shown.push({ observed: row });
   }
-  for (const hit of hits.slice(0, autoRecallHits - shown.length)) {
+  for (const hit of (owner ? [owner] : hits).slice(0, autoRecallHits - shown.length)) {
     const length = excerptLengths.find(
       (each) =>
         Buffer.byteLength(recalledText([...shown, { hit, length: each }])) <= autoRecallBytes,
