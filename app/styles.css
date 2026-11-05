@@ -145,8 +145,9 @@ button:disabled {
 }
 
 .app {
+  --sidebar-width: 220px;
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   /* One row the window's height, so the message list scrolls instead of growing the page. */
   grid-template-rows: minmax(0, 100%);
   height: 100%;
@@ -154,6 +155,8 @@ button:disabled {
 }
 
 .sidebar {
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
   background: var(--panel);
   border-right: 1px solid var(--line);
   padding: 36px 8px 8px;
@@ -178,6 +181,11 @@ button:disabled {
 .sidebar-title button {
   -webkit-app-region: no-drag;
   border: none;
+}
+
+.app-icon {
+  display: block;
+  object-fit: contain;
 }
 
 .chat-identity {
@@ -224,6 +232,7 @@ button:disabled {
 
 .dot-name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -578,10 +587,6 @@ button:disabled {
   animation-delay: 0.32s;
 }
 
-.typing-stale {
-  margin-left: 8px;
-}
-
 @keyframes typing-dot {
   0%,
   60%,
@@ -616,7 +621,7 @@ button:disabled {
 }
 
 .app:has(> .worker-sidebar) {
-  grid-template-columns: 180px minmax(0, 1fr) 340px;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 340px;
 }
 
 .worker-sidebar {
@@ -714,8 +719,11 @@ button:disabled {
 }
 
 @media (max-width: 1000px) {
+  .app {
+    --sidebar-width: 180px;
+  }
   .app:has(> .worker-sidebar) {
-    grid-template-columns: 160px minmax(0, 1fr);
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto;
   }
   .app:has(> .worker-sidebar) > .sidebar {
@@ -1099,11 +1107,11 @@ button:disabled {
 }
 
 /* Panes: the Feed and a dot's Memory, Instructions, Library, Health and Slack. */
+.sidebar-actions,
 .inbox-entry {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin: 0 8px 8px;
   -webkit-app-region: no-drag;
 }
 
@@ -1129,6 +1137,27 @@ button:disabled {
   gap: 6px;
 }
 
+.inbox-head nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.feed {
+  position: relative;
+}
+
+.feed > .pane-body {
+  padding-right: 76px;
+}
+
+.feed-clear-all {
+  position: absolute;
+  right: 20px;
+  bottom: 16px;
+  box-shadow: 0 2px 8px #0003;
+}
+
 .inbox-head + .pane {
   flex: 1;
   height: auto;
@@ -1142,13 +1171,6 @@ button:disabled {
 .dot-row .dot {
   flex: 1;
   min-width: 0;
-}
-
-.dot-more {
-  border: none;
-  background: none;
-  padding: 2px 6px;
-  color: var(--muted);
 }
 
 .dot-menu [data-unsaved]::after {

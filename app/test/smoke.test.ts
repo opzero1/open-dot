@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -93,6 +94,7 @@ const json = (value: unknown, status = 200) => Response.json(value, { status });
 /** The daemon's other surfaces: feed, memory, instructions, Library, health, Slack and fresh. */
 const surfaces = () => ({
   feed: [feedItem(1, "Fix the build"), feedItem(2, "Review the docs"), feedItem(3, "Ship it")],
+  feedRemaining: 0,
   // Items a saved reply handed off, as the daemon moves them.
   handedOff: [] as ReturnType<typeof feedItem>[],
   // While set, each memory change waits for it.
@@ -791,7 +793,8 @@ class FakeDaemon {
         202,
       );
     }
-    if (path === "/feed") return json({ items: d.feed, remaining: 0, handedOff: d.handedOff });
+    if (path === "/feed")
+      return json({ items: d.feed, remaining: d.feedRemaining, handedOff: d.handedOff });
     if (path === "/feed/dismiss") {
       const ids = (body as { ids: number[] }).ids;
       d.feed = d.feed.filter((item) => !ids.includes(item.id));
@@ -1056,22 +1059,31 @@ const launch = async (
   const fake = new FakeDaemon(opendot);
   setup(fake);
   fake.start();
-  const app = Bun.spawn([electron as unknown as string, join(root, "build")], {
-    env: {
-      ...process.env,
-      HOME: home,
-      TMPDIR: temporary,
-      OPEN_DOT_HOME: opendot,
-      OPEN_DOT_APP_DATA: join(home, "app-data"),
-      OPEN_DOT_APP_SMOKE: "1",
-      // Never the owner's OpenCode: main runs only an absolute fake a test names here.
-      OPEN_DOT_OPENCODE: "",
-      ...env,
+  const app = Bun.spawn(
+    [
+      electron as unknown as string,
+      ...(process.env.OPEN_DOT_SMOKE_EVIDENCE
+        ? ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1", "--force-dark-mode"]
+        : []),
+      join(root, "build"),
+    ],
+    {
+      env: {
+        ...process.env,
+        HOME: home,
+        TMPDIR: temporary,
+        OPEN_DOT_HOME: opendot,
+        OPEN_DOT_APP_DATA: join(home, "app-data"),
+        OPEN_DOT_APP_SMOKE: "1",
+        // Never the owner's OpenCode: main runs only an absolute fake a test names here.
+        OPEN_DOT_OPENCODE: "",
+        ...env,
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
     },
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  );
   const waiting = new Map<
     number,
     (answer: { ok: boolean; value?: unknown; error?: string }) => void
@@ -1320,10 +1332,10 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         ]),
       );
       fake.activity = {
-        state: "tool",
-        tool: "bash",
-        label: "bun run check",
-        running: 1,
+        state: "thinking",
+        tool: null,
+        label: null,
+        running: 0,
         since: Date.now() - 65_000,
         observedAt: Date.now(),
       };
@@ -1351,10 +1363,42 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         `!!t.msg("msg_reply")?.querySelector('[aria-label="Execution details"]') && !!t.msg("msg_followup")?.querySelector('[aria-label="Execution details"]')`,
         "the separate turn disclosures",
       );
-      await until(
-        `document.querySelector("[data-activity='tool'] > span")?.textContent === "jojo is working"`,
-        "the activity line",
-      );
+      await until(`!!document.querySelector("[data-activity='thinking']")`, "thinking while busy");
+      expect(
+        await js(`(() => {
+        const activity = document.querySelector("[data-activity='thinking']");
+        return {
+          role: activity.getAttribute("role"),
+          state: activity.querySelector(".sr-only").textContent,
+          dots: activity.querySelectorAll(".typing-bubble[aria-hidden='true'] > span").length,
+          details: !!activity.querySelector(".execution-content"),
+          timer: !!activity.querySelector(".activity-time"),
+          expanded: activity.querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"),
+        };
+      })()`),
+      ).toEqual({
+        role: "status",
+        state: "jojo is thinking",
+        dots: 3,
+        details: false,
+        timer: false,
+        expanded: "false",
+      });
+      fake.activity = {
+        state: "tool",
+        tool: "bash",
+        label: "bun run check",
+        running: 1,
+        since: Date.now() - 65_000,
+        observedAt: Date.now(),
+      };
+      await until(`!!document.querySelector("[data-activity='tool']")`, "working while busy");
+      expect(
+        await js(`(() => {
+        const activity = document.querySelector("[data-activity='tool']");
+        return { dots: activity.querySelectorAll(".typing-bubble > span").length, state: activity.querySelector(".sr-only").textContent, details: !!activity.querySelector(".execution-content"), timer: !!activity.querySelector(".activity-time") };
+      })()`),
+      ).toEqual({ dots: 3, state: "jojo is working", details: false, timer: false });
       expect(
         await js(
           `({ rows: document.querySelectorAll("[data-message]").length, timestamps: document.querySelectorAll("[data-message] .meta").length, activityOnly: document.querySelectorAll("[data-activity-only]").length, raw: t.list().textContent.includes("dot_update"), logs: document.querySelectorAll("[data-work-log]").length, failed: t.msg("msg_reply").querySelector('[role="status"]').textContent, expanded: t.msg("msg_reply").querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"), liveRaw: document.querySelector("[data-activity]").textContent.includes("bash") })`,
@@ -1470,33 +1514,27 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         "msg_reply/cccccccccccccccc",
       ]);
       expect(fake.log.activityReads).toBeGreaterThan(0);
-      fake.activity = {
-        state: "thinking",
-        tool: null,
-        label: null,
-        running: 0,
-        since: Date.now() - 65_000,
-        observedAt: Date.now(),
-      };
-      await until(`!!document.querySelector("[data-activity='thinking']")`, "the thinking bubble");
-      expect(
-        await js(`(() => {
-          const activity = document.querySelector("[data-activity='thinking']");
-          return {
-            role: activity.getAttribute("role"),
-            text: activity.textContent,
-            dots: activity.querySelectorAll(".typing-bubble[aria-hidden='true'] > span").length,
-            timer: !!activity.querySelector(".activity-time"),
-            title: activity.querySelector(".typing-bubble").title,
-          };
+      await js(`t.click("Execution details", document.querySelector("[data-activity]")), true`);
+      for (const activityState of ["idle", "unknown"]) {
+        fake.activity = {
+          state: activityState,
+          tool: null,
+          label: null,
+          running: 0,
+          since: null,
+          observedAt: Date.now(),
+        };
+        await until(
+          `!!document.querySelector('[data-activity="${activityState}"]')`,
+          `${activityState} while still busy`,
+        );
+        expect(
+          await js(`(() => {
+          const activity = document.querySelector('[data-activity="${activityState}"]');
+          return { busy: !!document.querySelector('[data-dot][data-busy]'), dots: activity.querySelectorAll(".typing-bubble > span").length, details: !!activity.querySelector(".execution-content"), timer: !!activity.querySelector(".activity-time"), state: activity.querySelector(".sr-only").textContent };
         })()`),
-      ).toEqual({
-        role: "status",
-        text: "jojo is thinking",
-        dots: 3,
-        timer: false,
-        title: expect.stringMatching(/^jojo is thinking · 1:0\d$/),
-      });
+        ).toEqual({ busy: true, dots: 3, details: false, timer: false, state: "jojo is working" });
+      }
       fake.busy = false;
       await until(
         `!document.querySelector("[data-activity]")`,
@@ -1625,6 +1663,42 @@ test("renders safely, sends with its own ID, and settles a lost send from its re
       ];
     },
     async ({ fake, js, until, state }) => {
+      await until(
+        `(() => { const icon = document.querySelector('.sidebar-title img[alt="open-dot"]'); return !!icon?.complete && icon.naturalWidth > 0 && icon.naturalHeight > 0; })()`,
+        "the sidebar app icon to decode",
+      );
+      expect(
+        await js(`(() => {
+          const icon = document.querySelector('.sidebar-title img[alt="open-dot"]');
+          const settings = document.querySelector('.sidebar-title button[aria-label="Settings"]');
+          const inbox = document.querySelector('.sidebar-title button[aria-label="Inbox"]');
+          const bounds = icon.getBoundingClientRect();
+          const settingsBounds = settings?.getBoundingClientRect();
+          const inboxBounds = inbox?.getBoundingClientRect();
+          const header = icon.closest('.sidebar-title').getBoundingClientRect();
+          return {
+            name: icon.alt,
+            loaded: icon.complete && icon.naturalWidth > 0 && icon.naturalHeight > 0,
+            width: bounds.width,
+            height: bounds.height,
+            draggable: icon.draggable,
+            settings: !!settings && !settings.disabled,
+            adjacent: !!settingsBounds && settingsBounds.left >= bounds.right && Math.abs(settingsBounds.top + settingsBounds.height / 2 - bounds.top - bounds.height / 2) < 2,
+            headerActions: !!inboxBounds && inboxBounds.left >= bounds.right && settingsBounds.left > inboxBounds.right && Math.abs(settingsBounds.top - inboxBounds.top) < 2 && inboxBounds.top >= header.top && settingsBounds.bottom <= header.bottom,
+            separateInboxRow: !!document.querySelector('.sidebar > .inbox-entry'),
+          };
+        })()`),
+      ).toEqual({
+        name: "open-dot",
+        loaded: true,
+        width: 28,
+        height: 28,
+        draggable: false,
+        settings: true,
+        adjacent: true,
+        headerActions: true,
+        separateInboxRow: false,
+      });
       await until(
         `!!document.querySelector(".katex") && !!document.querySelector(".diff")`,
         "rendering",
@@ -2829,8 +2903,10 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
 
 /** Opens a pane of jojo's from its dot menu. */
 const openPane = async (app: App, label: string) => {
-  await app.until(`!!document.querySelector('[data-dot-menu="jojo"]')`, "jojo's menu button");
-  await app.js(`document.querySelector('[data-dot-menu="jojo"]').click(), true`);
+  await app.until(`!!document.querySelector('[data-dot="jojo"]')`, "jojo's dot row");
+  await app.js(
+    `document.querySelector('[data-dot="jojo"]').dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 120 })), true`,
+  );
   await app.press("[role=menu]", label);
 };
 
@@ -2864,15 +2940,234 @@ test("Feed: dismiss and Clear all; a reply to two dots keeps the refused dot's t
     (fake) => {
       fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
       fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+      fake.data.feedRemaining = 2;
+      fake.workers = [worker(7, "running")];
+      fake.data.requests = [requestCard(1), requestCard(2, { needsYou: false, actionable: false })];
     },
-    async ({ fake, js, until, press, state }) => {
+    async ({ fake, js, until, press, state, temporary }) => {
       await openInboxPane({ js, until });
-      expect(await js(`document.querySelector("[data-open-feed]").textContent`)).toBe("Activity");
-      expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
-        "Needs your action",
-      );
-      expect(await js(`!!document.querySelector("[data-inbox-count]")`)).toBe(false);
       await until(`document.querySelectorAll("[data-feed-item]").length === 3`, "three feed items");
+      await until(
+        `document.querySelector("[data-feed-count]")?.textContent === "5+" && document.querySelector("[data-open-needs] .badge")?.textContent === "1"`,
+        "counts on the Inbox tabs",
+      );
+      expect(
+        await js(
+          `({ activity: document.querySelector("[data-open-feed]").textContent, activityTitle: document.querySelector("[data-feed-count]").title, needs: document.querySelector("[data-open-needs]").textContent, sidebar: document.querySelector("[data-inbox-count]").textContent, duplicateHeader: !!document.querySelector(".feed .pane-head") })`,
+        ),
+      ).toEqual({
+        activity: "Activity5+",
+        activityTitle: "3 shown · at least 2 more",
+        needs: "Needs your action1",
+        sidebar: "1",
+        duplicateHeader: false,
+      });
+      await until(
+        `document.querySelector('.sidebar-title img').naturalWidth > 0`,
+        "decoded branding in the Inbox",
+      );
+      const layout = await js(`(() => {
+        const clear = document.querySelector('.feed button[aria-label="Clear all"]');
+        const rect = clear.getBoundingClientRect();
+        const pane = document.querySelector('.feed').getBoundingClientRect();
+          const icon = document.querySelector('.sidebar-title img');
+          const inbox = document.querySelector('.sidebar-title button[aria-label="Inbox"]');
+          const settings = document.querySelector('.sidebar-title button[aria-label="Settings"]');
+          const inboxBounds = inbox.getBoundingClientRect();
+          const settingsBounds = settings.getBoundingClientRect();
+          const headerBounds = icon.closest('.sidebar-title').getBoundingClientRect();
+        return {
+          dark: matchMedia('(prefers-color-scheme: dark)').matches,
+          name: clear.getAttribute('aria-label'), title: clear.title,
+          iconOnly: !!clear.querySelector('svg[aria-hidden=true]') && [...clear.children].every((child) => child.tagName.toLowerCase() === 'svg' || getComputedStyle(child).clipPath === 'inset(50%)'),
+          enabled: !clear.disabled, count: document.querySelectorAll('.feed button[aria-label="Clear all"]').length,
+          width: rect.width, height: rect.height, right: pane.right - rect.right, bottom: pane.bottom - rect.bottom,
+          overlap: [...document.querySelectorAll('.feed-item, .feed .item-actions button')].some((item) => { const box = item.getBoundingClientRect(); return rect.left < box.right && rect.right > box.left && rect.top < box.bottom && rect.bottom > box.top; }),
+          branding: { name: icon.alt, naturalWidth: icon.naturalWidth, naturalHeight: icon.naturalHeight, width: icon.getBoundingClientRect().width, height: icon.getBoundingClientRect().height },
+          settings: !settings.disabled,
+          headerActions: { inboxSelected: inbox.getAttribute('aria-pressed'), sameRow: Math.abs(inboxBounds.top - settingsBounds.top) < 2, contained: inboxBounds.top >= headerBounds.top && settingsBounds.bottom <= headerBounds.bottom, nonoverlap: icon.getBoundingClientRect().right <= inboxBounds.left && inboxBounds.right < settingsBounds.left, separateInboxRow: !!document.querySelector('.sidebar > .inbox-entry') },
+        };
+      })()`);
+      expect(layout).toMatchObject({
+        name: "Clear all",
+        title: "Clear all",
+        iconOnly: true,
+        enabled: true,
+        count: 1,
+        width: 30,
+        height: 30,
+        right: 20,
+        bottom: 16,
+        overlap: false,
+        branding: { name: "open-dot", width: 28, height: 28 },
+        settings: true,
+        headerActions: {
+          inboxSelected: "true",
+          sameRow: true,
+          contained: true,
+          nonoverlap: true,
+          separateInboxRow: false,
+        },
+      });
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        expect(layout).toMatchObject({ dark: true });
+        const portFile = join(temporary, "..", "app-data", "DevToolsActivePort");
+        for (let tick = 0; tick < 100 && !existsSync(portFile); tick++) await delay(100);
+        const port = Number(readFileSync(portFile, "utf8").split("\n")[0]);
+        const targets = (await (
+          await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(10_000) })
+        ).json()) as { type: string; webSocketDebuggerUrl: string }[];
+        const target = targets.find((item) => item.type === "page");
+        if (!target) throw new Error("No isolated smoke page to capture");
+        const socket = new WebSocket(target.webSocketDebuggerUrl);
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error("Smoke capture connection timed out")),
+              10_000,
+            );
+            socket.addEventListener(
+              "open",
+              () => {
+                clearTimeout(timer);
+                resolve();
+              },
+              { once: true },
+            );
+            socket.addEventListener(
+              "error",
+              () => {
+                clearTimeout(timer);
+                reject(new Error("Smoke capture connection failed"));
+              },
+              { once: true },
+            );
+          });
+          let id = 0;
+          const cdp = (method: string, params: object): Promise<{ data?: string }> =>
+            new Promise((resolve, reject) => {
+              const next = ++id;
+              const timer = setTimeout(
+                () => reject(new Error(`Smoke ${method} timed out`)),
+                10_000,
+              );
+              socket.addEventListener("message", function receive(event) {
+                const answer = JSON.parse(String(event.data)) as {
+                  id?: number;
+                  result?: { data?: string };
+                  error?: object;
+                };
+                if (answer.id !== next) return;
+                socket.removeEventListener("message", receive);
+                clearTimeout(timer);
+                if (answer.error) reject(new Error(JSON.stringify(answer.error)));
+                else resolve(answer.result ?? {});
+              });
+              socket.send(JSON.stringify({ id: next, method, params }));
+            });
+          const screenshot = await cdp("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!screenshot.data) throw new Error("No smoke screenshot data");
+          writeFileSync(
+            join(evidence, "branding-inbox-dark.png"),
+            Buffer.from(screenshot.data, "base64"),
+          );
+          writeFileSync(
+            join(evidence, "branding-inbox-dark-readback.json"),
+            JSON.stringify(layout, null, 2),
+          );
+          await cdp("Emulation.setDeviceMetricsOverride", {
+            width: 640,
+            height: 760,
+            deviceScaleFactor: 1,
+            mobile: false,
+          });
+          await until(`innerWidth === 640`, "the narrow viewport");
+          await js(`document.querySelector('[data-dot="jojo"]').click(), true`);
+          await until(
+            `!!document.querySelector('.worker-sidebar') && !!t.box()`,
+            "narrow chat with workers",
+          );
+          const narrow = await js(`(() => {
+            const icon = document.querySelector('.sidebar-title img').getBoundingClientRect();
+            const inbox = document.querySelector('.sidebar-title button[aria-label="Inbox"]').getBoundingClientRect();
+            const settings = document.querySelector('.sidebar-title button[aria-label="Settings"]').getBoundingClientRect();
+            const sidebar = document.querySelector('.sidebar').getBoundingClientRect();
+            const chat = document.querySelector('main.chat').getBoundingClientRect();
+            const workers = document.querySelector('.worker-sidebar').getBoundingClientRect();
+            return { viewport: innerWidth, sidebarWidth: sidebar.width, headerNonoverlap: icon.right <= inbox.left && inbox.right < settings.left, headerContained: icon.left >= sidebar.left && settings.right <= sidebar.right && Math.abs(inbox.top - settings.top) < 2, workersBelow: workers.top >= chat.bottom - 1 && Math.abs(workers.left - chat.left) < 1, dark: matchMedia('(prefers-color-scheme: dark)').matches };
+          })()`);
+          expect(narrow).toEqual({
+            viewport: 640,
+            sidebarWidth: 180,
+            headerNonoverlap: true,
+            headerContained: true,
+            workersBelow: true,
+            dark: true,
+          });
+          const narrowWidth = await js(
+            `document.querySelector('.sidebar').getBoundingClientRect().width`,
+          );
+          await js(`document.querySelector('[data-dot="dio"]').click(), true`);
+          await until(
+            `!document.querySelector('.worker-sidebar') && t.box()?.placeholder === "Message dio"`,
+            "narrow chat without workers",
+          );
+          expect(await js(`document.querySelector('.sidebar').getBoundingClientRect().width`)).toBe(
+            narrowWidth,
+          );
+          await js(`document.querySelector('[data-dot="jojo"]').click(), true`);
+          await until(
+            `!!document.querySelector('.worker-sidebar') && t.box()?.placeholder === "Message jojo"`,
+            "narrow workers restored for capture",
+          );
+          const narrowShot = await cdp("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!narrowShot.data) throw new Error("No narrow screenshot data");
+          writeFileSync(
+            join(evidence, "branding-inbox-narrow-dark.png"),
+            Buffer.from(narrowShot.data, "base64"),
+          );
+          writeFileSync(
+            join(evidence, "branding-inbox-narrow-readback.json"),
+            JSON.stringify(narrow, null, 2),
+          );
+          await cdp("Emulation.setDeviceMetricsOverride", {
+            width: 1100,
+            height: 760,
+            deviceScaleFactor: 1,
+            mobile: false,
+          });
+          await until(`innerWidth === 1100`, "the restored desktop viewport");
+          await js(`document.querySelector('[data-dot="jojo"]').click(), true`);
+          await until(
+            `t.box()?.placeholder === "Message jojo"`,
+            "jojo restored after layout checks",
+          );
+          await openInboxPane({ js, until });
+        } finally {
+          socket.close();
+        }
+      }
+      fake.data.feedRemaining = 0;
+      await openInboxPane({ js, until }, "needs");
+      await openInboxPane({ js, until });
+      await until(
+        `document.querySelector("[data-feed-count]")?.textContent === "3"`,
+        "the exact unread count without overflow",
+      );
+      fake.data.requests = [];
+      await until(
+        `document.querySelector("[data-open-needs] .badge")?.textContent === "0" && !document.querySelector("[data-inbox-count]")`,
+        "zero action requests",
+      );
       await press('[data-feed-item="1"]', "Dismiss Fix the build");
       await until(`!document.querySelector('[data-feed-item="1"]')`, "the dismissed item to go");
       await press('[data-feed-item="2"]', "Reply");
@@ -2951,8 +3246,12 @@ test("Feed: dismiss and Clear all; a reply to two dots keeps the refused dot's t
           [false, false],
         ],
       });
-      await press(".feed .pane-head", "Clear all");
+      await press(".feed", "Clear all");
       await until(`!document.querySelector("[data-feed-item]")`, "an empty feed");
+      await until(
+        `document.querySelector("[data-feed-count]")?.textContent === "0" && document.querySelector('.feed button[aria-label="Clear all"]').disabled`,
+        "zero Activity count and disabled Clear all",
+      );
       expect(mutations(fake, "/feed/dismiss").map((call) => call.body)).toEqual([{ ids: [3] }]);
       // The item left the feed, and its reply stays.
       await until(
@@ -3900,11 +4199,14 @@ test("Slack: a pickup ends and sends nothing once the dot's app changes, armed, 
 }, 170_000);
 
 test("avatars: a failed read is asked for again, a deleted one clears, and Command-2 and Escape keep the draft", async () => {
+  const longDot = "dio_with_a_deliberately_long_name";
   await scenario(
     "avatar",
     (fake) => {
       fake.messages = [{ id: "m1", kind: "dot", text: "Hello" }];
       fake.avatar = { revision: "a", failures: 1 };
+      fake.others.set(longDot, { messages: [], hold: undefined, reads: 0 });
+      fake.workers = [worker(7, "running")];
     },
     async (app) => {
       const { fake, js, until } = app;
@@ -3917,6 +4219,56 @@ test("avatars: a failed read is asked for again, a deleted one clears, and Comma
       await until(shown, "the new avatar");
       // Memory opens over the chat and Escape goes back with the draft as it was.
       await until(`!!t.box()`, "the chat");
+      await until(`!!document.querySelector('.worker-sidebar')`, "the selected dot's workers");
+      const sidebarWidth = await js(
+        `document.querySelector('.sidebar').getBoundingClientRect().width`,
+      );
+      expect(
+        await js(
+          `(() => { const dot = document.querySelector('[data-dot="${longDot}"]'); const name = dot.querySelector('.dot-name'); return { title: name.title, name: name.textContent, ellipsis: getComputedStyle(name).textOverflow, truncated: name.scrollWidth > name.clientWidth }; })()`,
+        ),
+      ).toEqual({ title: longDot, name: longDot, ellipsis: "ellipsis", truncated: true });
+      expect(await js(`document.querySelectorAll('.dot-more, [data-dot-menu]').length`)).toBe(0);
+      for (const dot of [longDot, "jojo"]) {
+        await js(
+          `(() => { const button = document.querySelector('[data-dot="${dot}"]'); const row = button.closest('.dot-row').getBoundingClientRect(); const target = document.elementFromPoint(row.right - 2, row.top + row.height / 2); if (!button.contains(target) || button.getBoundingClientRect().width < row.width - 0.5) throw new Error('Dot row hit area does not fill the row'); target.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: row.right - 2, clientY: row.top + row.height / 2 })); return true; })()`,
+        );
+        await until(
+          `!!document.querySelector('[role="menu"][aria-label="${dot} menu"]')`,
+          `${dot}'s row context menu`,
+        );
+        await js(`t.click("Chat", document.querySelector('[role="menu"]'))`);
+        await until(
+          `t.box()?.placeholder === "Message ${dot}"`,
+          `the context menu to select ${dot}`,
+        );
+        await until(
+          `!!document.querySelector('.worker-sidebar') === ${dot === "jojo"}`,
+          "the selected worker layout",
+        );
+        expect(await js(`document.querySelector('.sidebar').getBoundingClientRect().width`)).toBe(
+          sidebarWidth,
+        );
+        for (const key of ["ContextMenu", "F10"]) {
+          await js(
+            `(() => { const dot = document.querySelector('[data-dot="${dot}"]'); dot.focus(); dot.dispatchEvent(new KeyboardEvent("keydown", { key: ${JSON.stringify(key)}, shiftKey: ${key === "F10"}, bubbles: true, cancelable: true })); return true; })()`,
+          );
+          await until(
+            `!!document.querySelector('[role="menu"][aria-label="${dot} menu"]')`,
+            `${dot}'s ${key} menu`,
+          );
+          await js(`t.key("Escape"), true`);
+          await until(`!document.querySelector('[role="menu"]')`, "the menu to close");
+          expect(await js(`document.activeElement.dataset.dot`)).toBe(dot);
+        }
+      }
+      await js(`document.querySelector('[data-dot="${longDot}"]').click(), true`);
+      await until(`t.box()?.placeholder === "Message ${longDot}"`, "left-click selection");
+      expect(await js(`document.querySelector('.sidebar').getBoundingClientRect().width`)).toBe(
+        sidebarWidth,
+      );
+      await js(`document.querySelector('[data-dot="jojo"]').click(), true`);
+      await until(`t.box()?.placeholder === "Message jojo"`, "jojo restored");
       expect(
         await js(`document.querySelector(".chat-head").textContent.includes("Second brain.")`),
       ).toBe(false);
@@ -3927,7 +4279,7 @@ test("avatars: a failed read is asked for again, a deleted one clears, and Comma
       );
       expect(
         await js(`document.querySelector('[role="dialog"][aria-label="About jojo"]').textContent`),
-      ).toContain("Second brain.\n\nStatus: Idle\nWorkers: 0\nNeeds you: 0");
+      ).toContain("Second brain.\n\nStatus: Idle\nWorkers: 1\nNeeds you: 0");
       await js(`t.key("Escape"), true`);
       await until(
         `!document.querySelector('[role="dialog"][aria-label="About jojo"]')`,

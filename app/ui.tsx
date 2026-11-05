@@ -11,6 +11,7 @@ const icons = {
   inbox: "m3 14 3-10h12l3 10v6H3zM3 14h5l2 3h4l2-3h5",
   send: "M12 19V5m-6 6 6-6 6 6",
   close: "m6 6 12 12M6 18 18 6",
+  clearAll: "M3 5h18M3 10h11M3 15h7M3 20h7m12-7-7 7m0-7 7 7",
   copy: "M9 9h11v11H9zM5 15H4V4h11v1",
   open: "M14 4h6v6m0-6L10 14M10 4H4v16h16v-6",
   reply: "m9 5-6 6 6 6M3 11h10a7 7 0 0 1 7 7",

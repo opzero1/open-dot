@@ -293,6 +293,7 @@ const App = () => {
   const [composerErrors, setComposerErrors] = useState(new Map<string, string>());
   const [pane, setPane] = useState<Pane>("chat");
   const [feedOpen, setFeedOpen] = useState(false);
+  const [feedCount, setFeedCount] = useState<{ shown: number; more: number }>();
   // The one Needs you list of every dot's request cards.
   const [needsOpen, setNeedsOpen] = useState(false);
   const requests = useRequests();
@@ -1204,43 +1205,52 @@ const App = () => {
     >
       <aside className="sidebar">
         <div className="sidebar-title">
-          <span>open-dot</span>
-          <IconButton
-            ref={settingsButton}
-            icon="settings"
-            label="Settings"
-            aria-haspopup="dialog"
-            onClick={() => setSettingsOpen(true)}
+          <img
+            className="app-icon"
+            src={new URL("./resources/app-icon.png", import.meta.url).href}
+            alt="open-dot"
+            width={28}
+            height={28}
+            draggable={false}
           />
+          <div className="sidebar-actions">
+            <div className="inbox-entry">
+              <IconButton
+                icon="inbox"
+                label="Inbox"
+                title={`Inbox · ${inboxStatus}`}
+                aria-pressed={inboxOpen}
+                aria-describedby="inbox-status"
+                data-open-inbox
+                onClick={() => {
+                  setFeedOpen(!inboxOpen);
+                  setNeedsOpen(false);
+                  setMenu(undefined);
+                }}
+              />
+              {actionCount || requests.more ? (
+                <span className="badge needs" aria-hidden="true" data-inbox-count>
+                  {actionCount}
+                  {requests.more ? "+" : ""}
+                </span>
+              ) : null}
+              <span id="inbox-status" className="sr-only">
+                {inboxStatus}
+              </span>
+            </div>
+            <IconButton
+              ref={settingsButton}
+              icon="settings"
+              label="Settings"
+              aria-haspopup="dialog"
+              onClick={() => setSettingsOpen(true)}
+            />
+          </div>
         </div>
         {dotsError ? <div className="banner">{dotsError}</div> : null}
         {!shortcut ? (
           <div className="banner">Control-Option-Space is taken by another app.</div>
         ) : null}
-        <div className="inbox-entry">
-          <IconButton
-            icon="inbox"
-            label="Inbox"
-            title={`Inbox · ${inboxStatus}`}
-            aria-pressed={inboxOpen}
-            aria-describedby="inbox-status"
-            data-open-inbox
-            onClick={() => {
-              setFeedOpen(!inboxOpen);
-              setNeedsOpen(false);
-              setMenu(undefined);
-            }}
-          />
-          {actionCount || requests.more ? (
-            <span className="badge needs" aria-hidden="true" data-inbox-count>
-              {actionCount}
-              {requests.more ? "+" : ""}
-            </span>
-          ) : null}
-          <span id="inbox-status" className="sr-only">
-            {inboxStatus}
-          </span>
-        </div>
         <nav aria-label="Dots">
           {dots.map((item) => {
             const count = unread.get(item.name) ?? 0;
@@ -1252,6 +1262,8 @@ const App = () => {
                   type="button"
                   data-dot={item.name}
                   data-busy={item.busy ? "" : undefined}
+                  aria-haspopup="menu"
+                  aria-keyshortcuts="Shift+F10 ContextMenu"
                   className={`dot ${item.name === selected && !feedOpen && !needsOpen ? "selected" : ""}`}
                   aria-current={
                     item.name === selected && !feedOpen && !needsOpen ? "page" : undefined
@@ -1264,11 +1276,22 @@ const App = () => {
                   }}
                   onContextMenu={(event) => {
                     event.preventDefault();
+                    event.currentTarget.focus();
                     setDotMenu({ dot: item.name, x: event.clientX, y: event.clientY });
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "ContextMenu" && !(event.key === "F10" && event.shiftKey))
+                      return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const box = event.currentTarget.getBoundingClientRect();
+                    setDotMenu({ dot: item.name, x: box.left, y: box.bottom });
                   }}
                 >
                   <Avatar dot={item} url={avatars.get(item.name)} />
-                  <span className="dot-name">{item.name}</span>
+                  <span className="dot-name" title={item.name}>
+                    {item.name}
+                  </span>
                   {editing ? (
                     <span className="badge unsaved" aria-label="Unsaved instructions" />
                   ) : null}
@@ -1283,20 +1306,6 @@ const App = () => {
                       {count}
                     </span>
                   ) : null}
-                </button>
-                <button
-                  type="button"
-                  className="dot-more"
-                  aria-label={`${item.name} menu`}
-                  title={`${item.name} menu`}
-                  aria-haspopup="menu"
-                  data-dot-menu={item.name}
-                  onClick={(event) => {
-                    const box = event.currentTarget.getBoundingClientRect();
-                    setDotMenu({ dot: item.name, x: box.left, y: box.bottom });
-                  }}
-                >
-                  ⋯
                 </button>
               </div>
             );
@@ -1318,6 +1327,20 @@ const App = () => {
                 }}
               >
                 Activity
+                {feedCount ? (
+                  <span
+                    className="badge"
+                    data-feed-count
+                    title={
+                      feedCount.more > 0
+                        ? `${feedCount.shown} shown · at least ${feedCount.more} more`
+                        : `${feedCount.shown} unread items`
+                    }
+                  >
+                    {feedCount.shown + feedCount.more}
+                    {feedCount.more > 0 ? "+" : ""}
+                  </span>
+                ) : null}
               </button>
               <button
                 type="button"
@@ -1329,9 +1352,10 @@ const App = () => {
                 }}
               >
                 Needs your action
-                {requests.cards.length
-                  ? ` (${requests.cards.length}${requests.more ? "+" : ""})`
-                  : ""}
+                <span className="badge" title={inboxStatus}>
+                  {actionCount}
+                  {requests.more ? "+" : ""}
+                </span>
               </button>
             </nav>
           </header>
@@ -1350,6 +1374,7 @@ const App = () => {
           </div>
         ) : feedOpen ? (
           <Feed
+            onCount={setFeedCount}
             dots={dots}
             selected={selected}
             sessionFor={sessionFor}
@@ -1623,7 +1648,12 @@ const App = () => {
           unsaved={editors.current.get(dotMenu.dot)?.dirty ?? false}
           onPick={(next) => show(dotMenu.dot, next)}
           onFresh={() => confirmFresh(dotMenu.dot)}
-          onClose={() => setDotMenu(undefined)}
+          onClose={() => {
+            document
+              .querySelector<HTMLButtonElement>(`[data-dot="${CSS.escape(dotMenu.dot)}"]`)
+              ?.focus();
+            setDotMenu(undefined);
+          }}
         />
       ) : null}
       {ask ? <Dialog ask={ask} onClose={() => setAsk(undefined)} /> : null}
@@ -1698,8 +1728,6 @@ const App = () => {
   );
 };
 
-/** Keeps the newest sends when more pile up than any chat could show as pending. */
-/** A dot's menu, from its ⋯ button or a right-click: its panes and Start Fresh. */
 const DotMenu = ({
   menu,
   fresh,
@@ -2421,48 +2449,26 @@ const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
   const duration = from === undefined ? undefined : elapsed(from, stale && seen ? seen.at : now);
   return (
     <div className="typing" role="status" data-activity={seen?.view.state ?? "unknown"}>
-      {thinking ? (
-        <>
-          <span className="sr-only">
-            {dot} is thinking{stale ? ", status not updated" : ""}
+      <span className="sr-only">
+        {dot} is {thinking ? "thinking" : "working"}
+        {stale ? ", status not updated" : ""}
+      </span>
+      <span className="typing-bubble" aria-hidden="true" data-stale={stale || undefined}>
+        <span />
+        <span />
+        <span />
+      </span>
+      <ExecutionDetails>
+        {activityLine(dot, seen?.view)}
+        {from !== undefined ? (
+          <span className="activity-time">
+            {" "}
+            · {duration}
+            {seen?.view.since === null ? " observed" : ""}
+            {stale ? " · not updated" : ""}
           </span>
-          <span
-            className="typing-bubble"
-            aria-hidden="true"
-            data-stale={stale || undefined}
-            title={`${dot} is thinking · ${duration}${seen?.view.since === null ? " observed" : ""}${stale ? " · not updated" : ""}`}
-          >
-            <span />
-            <span />
-            <span />
-          </span>
-          {stale ? (
-            <span className="typing-stale" aria-hidden="true">
-              Not updated
-            </span>
-          ) : null}
-        </>
-      ) : seen?.view.state === "tool" ? (
-        <>
-          <span>
-            {dot} is working{stale ? " · not updated" : ""}
-          </span>
-          <ExecutionDetails>
-            {activityLine(dot, seen.view)} · {duration}
-            {seen.view.since === null ? " observed" : ""}
-          </ExecutionDetails>
-        </>
-      ) : (
-        activityLine(dot, seen?.view)
-      )}
-      {!thinking && seen?.view.state !== "tool" && from !== undefined ? (
-        <span className="activity-time">
-          {" "}
-          · {duration}
-          {seen?.view.since === null ? " observed" : ""}
-          {stale ? " · not updated" : ""}
-        </span>
-      ) : null}
+        ) : null}
+      </ExecutionDetails>
     </div>
   );
 };

@@ -40,6 +40,7 @@ export const Feed = ({
   sessionFor,
   onSent,
   onOpenChat,
+  onCount,
 }: {
   dots: DotView[];
   selected: string | undefined;
@@ -47,6 +48,7 @@ export const Feed = ({
   sessionFor: (dot: string) => Promise<string | undefined>;
   onSent: (dot: string) => void;
   onOpenChat: (dot: string) => void;
+  onCount: (count: { shown: number; more: number }) => void;
 }) => {
   const state = useRef(new FeedState());
   const [, setTick] = useState(0);
@@ -211,6 +213,9 @@ export const Feed = ({
   const items = state.current.items;
   const overflow = state.current.overflow;
   const more = remaining + overflow;
+  useEffect(() => {
+    if (loaded) onCount({ shown: items.length, more });
+  }, [loaded, items.length, more, onCount]);
   const listed = new Set([...items, ...handedOff].map((item) => item.id));
   // Replies whose item left both lists, such as one dismissed elsewhere, still show.
   const elsewhere = [...replies.boxes.values()].filter((box) => !listed.has(box.item.id));
@@ -237,19 +242,13 @@ export const Feed = ({
 
   return (
     <div className="pane feed" aria-label="Feed" data-pane="feed">
-      <header className="pane-head">
-        <h2>Activity</h2>
-        <div className="pane-tools">
-          {items.length ? (
-            <span className="count" data-feed-count>
-              {more > 0 ? `${items.length} shown · at least ${more} more` : `${items.length}`}
-            </span>
-          ) : null}
-          <button type="button" disabled={!items.length} onClick={() => void clearAll()}>
-            Clear all
-          </button>
-        </div>
-      </header>
+      <IconButton
+        icon="clearAll"
+        label="Clear all"
+        className="feed-clear-all"
+        disabled={!items.length}
+        onClick={() => void clearAll()}
+      />
       {error ? <div className="banner">{error}</div> : null}
       <div className="pane-body">
         {loaded && !items.length ? (
