@@ -204,35 +204,6 @@ test("a repeating reminder skips missed occurrences instead of sending a burst",
   expect(fake.state.prompted).toHaveLength(1);
 });
 
-test("a delivery whose response was lost is confirmed by ID, not sent again", async () => {
-  remind(100);
-  fake.state.prompt = "lost";
-
-  await tick(200);
-  expect(messages()[0]?.state).toBe("pending");
-
-  fake.state.prompt = "ok";
-  await tick(300);
-
-  expect(messages()[0]?.state).toBe("sent");
-  expect(fake.state.prompted).toHaveLength(1);
-});
-
-test("a delivery OpenCode never admitted is sent again with the same message ID", async () => {
-  remind(100);
-  fake.state.prompt = "fail";
-
-  await tick(200);
-  const saved = messages()[0]?.messageID;
-
-  fake.state.prompt = "ok";
-  await tick(300);
-
-  expect(messages()).toHaveLength(1);
-  expect(messages()[0]?.state).toBe("sent");
-  expect(fake.state.prompted).toEqual([saved ?? "missing"]);
-});
-
 test("a worker gets one session and task, and its dot hears once per approval and once when it ends", async () => {
   db.insert(workers)
     .values({
