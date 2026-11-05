@@ -79,6 +79,10 @@ Neither version did better: complete source-and-displayed-answer recovery was 5/
 
 The validation does not demonstrate broader superiority. Remaining problems include generic lexical matches, observations omitting details, citations to multi-topic messages without the needed text, and observation-first allocation excluding useful assistant-authored archive hits. Historical dates are not retrieval cutoffs, and a capped checkpoint can list a topic without its supporting fact. The owner-slot change addresses only one of these mechanisms. Both versions retained the existing byte caps, dot/session isolation, visible-message exclusion and bounded cached-deletion behavior. No model jobs, live changes or further runtime edits were made for this validation.
 
+## Experimental chronological tree
+
+The separate [tree trial protocol](tree-trial.md) fixes a 14-day, per-dot shadow comparison before tuning. It reuses source-linked observer sentences, adds no model calls, and does not replace live context. Its source-coverage proxies and sampled owner reviews are separate from the development and fixed-candidate results above. Building the experiment is not evidence that it improves recall.
+
 ## Where the memory tail goes (#62)
 
 `cache.ts` scores the prompt cache cost of the plugin's tail placement against putting the tail after the owner's message, with the plugin's own `placeTail`, OpenCode 2.2.0's automatic cache hints and Anthropic's prefix cache. It calls no model or OpenCode, and its token sizes are a scenario's, not provider counts:

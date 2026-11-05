@@ -382,10 +382,10 @@ const fingerprint = (dot: string, text: string) =>
       .join(" "),
   );
 
-type Tombstone = typeof forgottenObservations.$inferSelect;
+export type Tombstone = typeof forgottenObservations.$inferSelect;
 
 /** Whether any of these messages is one a forgotten row came from. */
-const citesForgotten = (tombstones: readonly Tombstone[], sources: readonly string[]) =>
+export const citesForgotten = (tombstones: readonly Tombstone[], sources: readonly string[]) =>
   tombstones.some((tombstone) => sources.some((source) => tombstone.sources.includes(source)));
 
 /**
@@ -393,7 +393,7 @@ const citesForgotten = (tombstones: readonly Tombstone[], sources: readonly stri
  * forgotten row came from, or has the forgotten text under any topic. A fact the owner says again
  * in a new message, in other words, is new information and may be observed.
  */
-const bringsBack = (
+export const bringsBack = (
   tombstones: readonly Tombstone[],
   dot: string,
   row: { readonly text: string; readonly sources: readonly string[] },

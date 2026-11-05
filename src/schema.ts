@@ -1290,3 +1290,137 @@ export const ownerFactKeys = sqliteTable(
   },
   (table) => [primaryKey({ columns: [table.kind, table.key] })],
 );
+
+/**
+ * Tree trial v1 (migration 0042): one per-dot run of the experimental chronological summary tree,
+ * which only shadows automatic recall and is never sent. The run's ID, protocol and baseline
+ * versions, bound session and the memory switches it froze are saved before any sample is taken.
+ * Off keeps the run's samples for review; turning it on again starts a new run and replaces them.
+ */
+export const treeTrials = sqliteTable("tree_trials", {
+  dot: text()
+    .primaryKey()
+    .references(() => dots.name),
+  enabled: integer({ mode: "boolean" }).notNull(),
+  run: text().notNull(),
+  version: text().notNull(),
+  baseline: text().notNull(),
+  sessionID: text("session_id").notNull(),
+  // The frozen memory switches as JSON, compared exactly before each sample.
+  settings: text().notNull(),
+  startedAt: integer("started_at").notNull(),
+  endsAt: integer("ends_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
+ * What a shown record credits: an observation by ID, version and text hash with its sources, or an
+ * archived message's excerpt by its `snippet` start and length and the excerpt's hash, each with
+ * the session it was shown from (a baseline observation may be from an earlier session of the
+ * same dot). Never text.
+ */
+export type TreeRef =
+  | {
+      readonly kind: "observation";
+      readonly sessionID: string;
+      readonly observation: number;
+      readonly version: number;
+      // Null when the whole text was shown, else the `snippet` length from its start that was.
+      readonly length: number | null;
+      // Of exactly the text shown.
+      readonly hash: string;
+      readonly sources: readonly string[];
+    }
+  | {
+      readonly kind: "message";
+      readonly sessionID: string;
+      readonly message: string;
+      readonly start: number;
+      // Null when the shown excerpt couldn't be matched to a reconstructible slice.
+      readonly length: number | null;
+      readonly hash: string;
+    };
+
+/** One record an arm showed: a baseline recall entry, or a tree node with what it represented. */
+export interface TreeRecord {
+  readonly node?: string;
+  readonly refs: readonly TreeRef[];
+}
+
+/** A sample's measured proxies: counts, bytes and latencies, never text. */
+export interface TreeMetrics {
+  readonly words: number;
+  readonly baseline: {
+    readonly records: number;
+    readonly bytes: number;
+    readonly observations: number;
+    readonly messages: number;
+    readonly sources: number;
+    readonly superseded: number;
+    readonly ms: number;
+  };
+  readonly tree: {
+    readonly records: number;
+    readonly bytes: number;
+    readonly observations: number;
+    readonly messages: number;
+    readonly sources: number;
+    readonly superseded: number;
+    readonly buildMs: number;
+    readonly retrieveMs: number;
+    // Collector preparation only; excludes the final transaction, commit and pragma changes.
+    readonly collectorMs: number;
+    readonly visited: number;
+  };
+  readonly overlap: {
+    readonly shared: number;
+    readonly treeOnly: number;
+    readonly baselineOnly: number;
+  };
+  readonly coverage: {
+    readonly observations: number;
+    readonly observationsUsed: number;
+    readonly observationsTruncated: boolean;
+    readonly messages: number;
+    readonly messagesUsed: number;
+    readonly messagesTruncated: boolean;
+    // Recent messages left out because a superseded observation cites them.
+    readonly messagesSuperseded: number;
+    readonly supersededTruncated: boolean;
+  };
+}
+
+export const treeReviews = ["tree", "baseline", "tie", "insufficient"] as const;
+
+/**
+ * One paired owner query of a tree trial run, at most once per run and owner message: the records
+ * each arm would show, as references, and its metrics. The owner's review is one label, no notes.
+ */
+export const treeSamples = sqliteTable(
+  "tree_samples",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    dot: text()
+      .notNull()
+      .references(() => dots.name),
+    run: text().notNull(),
+    sessionID: text("session_id").notNull(),
+    messageID: text("message_id").notNull(),
+    // A hash of the owner's query as the archive keeps it (redacted), never its text.
+    queryHash: text("query_hash").notNull(),
+    // Days since the Unix epoch, in UTC.
+    day: integer().notNull(),
+    createdAt: integer("created_at").notNull(),
+    baseline: text({ mode: "json" }).$type<readonly TreeRecord[]>().notNull(),
+    tree: text({ mode: "json" }).$type<readonly TreeRecord[]>().notNull(),
+    metrics: text({ mode: "json" }).$type<TreeMetrics>().notNull(),
+    review: text({ enum: treeReviews }),
+    reviewedAt: integer("reviewed_at"),
+  },
+  (table) => [
+    unique().on(table.dot, table.run, table.messageID),
+    index("tree_samples_day").on(table.dot, table.run, table.day),
+  ],
+);
+
+export type TreeSample = typeof treeSamples.$inferSelect;

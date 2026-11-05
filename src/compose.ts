@@ -11,6 +11,7 @@ import type { Db } from "./db";
 import { headFor, ledgerHits, type LatestCompaction, sinceCheckpoint, stateOf } from "./ledger";
 import { messageKind, messageSources } from "./reactions";
 import type { Dot } from "./schema";
+import { shadowTree } from "./tree";
 
 /** A public `session.context` item, as far as composing a request needs it. */
 export interface ContextItem {
@@ -98,17 +99,30 @@ export function composeTurn(
     ]);
     if (cache?.key === key && cache.text !== undefined) recalled = cache.text;
     else {
+      const started = performance.now();
       const shown = new Set([...(head?.rows ?? []), ...(since?.rows ?? [])]);
+      const words = autoRecallWords(owner.text);
       const observed =
-        phase3 && settings.ledger
-          ? ledgerHits(db, dot.name, autoRecallWords(owner.text), shown, autoRecallHits, 2)
-          : [];
+        phase3 && settings.ledger ? ledgerHits(db, dot.name, words, shown, autoRecallHits, 2) : [];
       const visible = new Set(items.map((item) => item.id));
-      recalled = recalledBlock(autoRecall(db, dot, owner.text, visible), observed);
+      const hits = autoRecall(db, dot, owner.text, visible);
+      recalled = recalledBlock(hits, observed);
       if (cache) {
         cache.key = key;
         cache.text = recalled;
       }
+      // The tree trial's shadow, paired with this exact block; it never changes what is sent.
+      if (phase3 && settings.ledger)
+        shadowTree(db, dot, {
+          owner: owner.id,
+          query: owner.text,
+          words,
+          hits,
+          recalled,
+          shown,
+          visible,
+          ms: performance.now() - started,
+        });
     }
   }
   return { head, notes, tail: (since?.text ?? "") + recalled };

@@ -27,6 +27,18 @@ import {
 import { avatarRevision, readAvatar } from "./avatar";
 import { recallResults } from "./compose";
 import {
+  isTreeReview,
+  listTreeSamples,
+  reviewTreeSample,
+  setTreeTrial,
+  treeNode,
+  treeNodes,
+  treeReport,
+  treeSample,
+  treeSampleSource,
+  treeStatus,
+} from "./tree";
+import {
   addObservation,
   editObservation,
   forgetObservation,
@@ -2556,6 +2568,96 @@ const observationRead = (
   return found ? Response.json(found) : error(404, "There's no such source for this observation.");
 };
 
+/** A body of exactly one key, or undefined. */
+const onlyKey = (value: unknown, key: string) =>
+  typeof value === "object" &&
+  value !== null &&
+  !Array.isArray(value) &&
+  Object.keys(value).length === 1 &&
+  key in value
+    ? Object.fromEntries(Object.entries(value))[key]
+    : undefined;
+
+/**
+ * The tree trial (experimental, shadow only): `GET …/memory/tree` shows its switch and run, `PUT`
+ * with exactly `{ enabled }` turns it on or off; `GET …/tree/report`, `…/tree/samples`,
+ * `…/tree/samples/<id>`, `…/tree/samples/<id>/sources/<message>` and `PUT
+ * …/tree/samples/<id>/review` with exactly `{ review }`; `GET …/tree/nodes[/<path>]` expands the
+ * current tree. None takes a query, calls a model, needs OpenCode or starts a turn.
+ */
+const treeRoute = async (
+  db: Db,
+  dot: Dot,
+  request: Request,
+  rawID: string | undefined,
+  extra: string[],
+) => {
+  const { method } = request;
+  if (new URL(request.url).search) return error(400, "The tree trial's routes take no query.");
+  const body = async () => {
+    const value = await messageBody(request, 1024).catch(() => undefined);
+    return value instanceof Response ? value : { read: value };
+  };
+  if (rawID === undefined) {
+    if (method === "GET") return Response.json(treeStatus(db, dot));
+    if (method !== "PUT") return error(404, "Not found");
+    const input = await body();
+    if (input instanceof Response) return input;
+    const enabled = onlyKey(input.read, "enabled");
+    if (typeof enabled !== "boolean") return error(400, "Send exactly {enabled: true or false}.");
+    const change = setTreeTrial(db, dot.name, enabled, Date.now());
+    if ("missing" in change) return error(404, `There's no dot named "${dot.name}".`);
+    if ("refused" in change)
+      return Response.json({ error: change.refused, current: change.current }, { status: 409 });
+    return Response.json(change.saved);
+  }
+  if (rawID === "report") {
+    if (extra.length || method !== "GET") return error(404, "Not found");
+    const report = treeReport(db, dot);
+    return report ? Response.json(report) : error(404, "This dot has no tree trial run.");
+  }
+  if (rawID === "nodes") {
+    if (method !== "GET" || extra.length > 1) return error(404, "Not found");
+    const node = extra[0] === undefined ? treeNodes(db, dot) : treeNode(db, dot, extra[0]);
+    if (!node) return error(404, "There's no such node in the current tree.");
+    return Response.json(node, { status: "blocked" in node ? 409 : 200 });
+  }
+  if (rawID !== "samples") return error(404, "Not found");
+  const [rawSample, part, rawMessage, ...more] = extra;
+  if (rawSample === undefined)
+    return method === "GET" ? Response.json(listTreeSamples(db, dot)) : error(404, "Not found");
+  const missing = error(404, "There's no such sample in this dot's tree trial run.");
+  if (!positive.test(rawSample) || !Number.isSafeInteger(Number(rawSample))) return missing;
+  const id = Number(rawSample);
+  if (part === undefined) {
+    if (method !== "GET") return error(404, "Not found");
+    const found = treeSample(db, dot, id);
+    return found ? Response.json(found) : missing;
+  }
+  if (part === "review" && rawMessage === undefined && method === "PUT") {
+    const input = await body();
+    if (input instanceof Response) return input;
+    const review = onlyKey(input.read, "review");
+    if (!isTreeReview(review))
+      return error(400, 'Send exactly {review: "tree", "baseline", "tie" or "insufficient"}.');
+    const saved = reviewTreeSample(db, dot, id, review, Date.now());
+    if (!saved) return missing;
+    if ("refused" in saved) return error(409, saved.refused);
+    return Response.json(saved.saved);
+  }
+  if (part !== "sources" || rawMessage === undefined || more.length || method !== "GET")
+    return error(404, "Not found");
+  let messageID: string;
+  try {
+    messageID = decodeURIComponent(rawMessage);
+  } catch {
+    return error(404, "Not found");
+  }
+  if (!/^msg_[\w-]{1,100}$/.test(messageID)) return missing;
+  const source = treeSampleSource(db, dot, id, messageID);
+  return source ? Response.json(source) : missing;
+};
+
 /** How much of a source message's text is shown. */
 const sourceTextLimit = 4000;
 
@@ -2654,6 +2756,7 @@ const memoryRoute = async (db: Db, request: Request, path: string[]) => {
       : error(404, "Not found");
   if (kind === "observations" && method === "GET")
     return observationRead(db, dot.name, request, rawID, extra);
+  if (kind === "tree") return treeRoute(db, dot, request, rawID, extra);
   if (extra.length) return error(404, "Not found");
   if (kind === undefined)
     return method === "GET"
