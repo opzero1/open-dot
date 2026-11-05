@@ -1319,6 +1319,16 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
       return isName(a)
         ? { method: "GET", path: `${base}/activity?sessionID=${segment(a)}`, timeout: 5_000 }
         : undefined;
+    case "stopDot":
+      return isName(a) &&
+        (b === null || (typeof b === "number" && Number.isSafeInteger(b) && b >= 0))
+        ? {
+            method: "POST",
+            path: `${base}/stop`,
+            body: { sessionID: a, since: b },
+            timeout: 35_000,
+          }
+        : undefined;
     case "work":
       return isName(a) && isText(b, cursorLimit)
         ? { method: "GET", path: `${base}/work?sessionID=${segment(a)}&cursor=${segment(b)}` }
@@ -1398,6 +1408,7 @@ const operationNames = new Set<string>([
   "slackLogin",
   "fresh",
   "activity",
+  "stopDot",
   "workerConversation",
   "requestConversation",
   "threadConversation",

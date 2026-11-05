@@ -302,6 +302,63 @@ test("a lost steer survives reopening and a failed lookup, and is never sent twi
   }
 });
 
+test("basic Stop public wrapper sends resume true while the old interrupt stays false, with no lost-call retry", async () => {
+  const discover = spyOn(Service, "discover").mockResolvedValue({
+    url: "http://opencode.test",
+    auth: undefined,
+  });
+  const calls: { path: string; resume: string | null }[] = [];
+  let mode: "ok" | "false" | "missing" | "lost" = "ok";
+  const fakeFetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const request =
+      input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
+    const url = new URL(request.url);
+    assert.equal(url.origin, "http://opencode.test", "No real network calls");
+    assert.equal(request.method, "POST");
+    assert.equal(url.pathname, "/api/session/ses_exact/interrupt");
+    calls.push({ path: url.pathname, resume: url.searchParams.get("resume") });
+    if (mode === "lost") throw new TypeError("Lost interrupt response");
+    if (mode === "missing")
+      return Response.json(
+        { _tag: "SessionNotFoundError", sessionID: "ses_exact", message: "Absent" },
+        { status: 404 },
+      );
+    return Response.json({ interrupted: mode !== "false" });
+  };
+  const transport: typeof fetch = Object.assign(fakeFetch, {
+    preconnect: () => {
+      throw new Error("Unexpected preconnect");
+    },
+  });
+  const layer = Layer.merge(OpenCode.layer, Layer.succeed(FetchHttpClient.Fetch, transport));
+  try {
+    const run = (kind: "stop" | "interrupt") =>
+      Effect.runPromise(
+        Effect.provide(
+          Effect.flatMap(OpenCode, (oc) => oc[kind]("ses_exact")),
+          layer,
+        ),
+      );
+    expect(await run("stop")).toBe(true);
+    expect(await run("interrupt")).toBe(true);
+    mode = "false";
+    expect(await run("stop")).toBe(false);
+    mode = "missing";
+    expect(await run("stop")).toBe(false);
+    mode = "lost";
+    let failed = false;
+    try {
+      await run("stop");
+    } catch {
+      failed = true;
+    }
+    expect(failed).toBe(true);
+    expect(calls.map((item) => item.resume)).toEqual(["true", "false", "true", "true", "true"]);
+  } finally {
+    discover.mockRestore();
+  }
+});
+
 test("over the public client, the saved mode reaches OpenCode, and only the history counts as delivered", async () => {
   const directory = mkdtempSync(join(tmpdir(), "open-dot-steer-http-"));
   const path = join(directory, "open-dot.db");

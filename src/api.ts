@@ -35,7 +35,7 @@ import {
   observationTextLimit,
 } from "./ledger";
 import { observerStatus } from "./observer";
-import { changeQueued, stopWorker } from "./daemon";
+import { changeQueued, gated, stopWorker } from "./daemon";
 import type { Db } from "./db";
 import type { HealthReport } from "./doctor";
 import { findDot, listDots } from "./dots";
@@ -1638,6 +1638,104 @@ const activityRead = (db: Db, dot: Dot, request: Request) =>
     );
   });
 
+const changed = (message: string) =>
+  Response.json({ error: message, result: "changed" }, { status: 409 });
+
+/**
+ * `POST /dots/<name>/stop` with exactly `{ sessionID, since }`: the session and activity marker the
+ * app showed. Like Escape in OpenCode's terminal, it stops the session's current work, never a
+ * particular turn: OpenCode's interrupt takes only the session, so work that started after these
+ * checks, from a queued or steered message or another client, can be what it stops. Inside the
+ * session's admission gate it checks the binding, then reads activity fresh and stops only a
+ * running session whose marker still matches. "stop-requested" means OpenCode interrupted a
+ * running execution; "not-interrupted" means it had none, as when the work was already finishing.
+ * `running` is a fresh read afterwards, null when unread. A lost or failed call is unknown and is
+ * never retried. Nothing is saved and queued messages keep their order. open-dot's workers are
+ * their own sessions and aren't touched, though OpenCode itself interrupts any subagent the
+ * stopped work is waiting on, as Escape does; background subagents go on.
+ */
+const stopRoute = (db: Db, dot: Dot, request: Request) =>
+  Effect.gen(function* () {
+    const body = yield* Effect.tryPromise(() => messageBody(request, 1024)).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (body instanceof Response) return body;
+    if (
+      !isRecord(body) ||
+      Array.isArray(body) ||
+      Object.keys(body).length !== 2 ||
+      typeof body.sessionID !== "string" ||
+      !body.sessionID ||
+      body.sessionID.length > 255 ||
+      !("since" in body) ||
+      !(
+        body.since === null ||
+        (typeof body.since === "number" && Number.isSafeInteger(body.since) && body.since >= 0)
+      )
+    )
+      return error(400, "Send {sessionID, since}: the session and activity the app showed.");
+    const sessionID = body.sessionID;
+    const since = body.since;
+    const rebind = "The dot's conversation changed, so nothing was stopped. Refresh.";
+    const unknown = Response.json(
+      {
+        error:
+          "open-dot couldn't confirm the stop, so it may or may not have happened. It won't try again on its own.",
+        result: "unknown",
+      },
+      { status: 502 },
+    );
+    if (dot.sessionState !== "ready" || sessionID !== dot.sessionID) return changed(rebind);
+    const opencode = yield* OpenCode;
+    let called = false;
+    const now = () =>
+      opencode.activity(sessionID).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.orElseSucceed(() => undefined),
+      );
+    const attempt = gated(sessionID)(
+      Effect.gen(function* () {
+        if (rebound(db, dot)) return changed(rebind);
+        const before = yield* now();
+        if (rebound(db, dot)) return changed(rebind);
+        if (!before)
+          return error(
+            503,
+            "open-dot couldn't read what the dot is doing, so nothing was stopped.",
+          );
+        if (!before.active) return Response.json({ result: "not-running", running: false });
+        if (before.since !== since)
+          return changed(
+            "The dot's work changed since the app showed it, so nothing was stopped. Look again, then stop it if you still want to.",
+          );
+        called = true;
+        const stopped = yield* opencode.stop(sessionID).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (stopped === undefined) return unknown;
+        // OpenCode acknowledges before its cleanup settles, so give it a moment to finish.
+        let after = yield* now();
+        for (let tries = 0; after?.active && tries < 6; tries++) {
+          yield* Effect.sleep("500 millis");
+          after = yield* now();
+        }
+        return Response.json({
+          result: stopped ? "stop-requested" : "not-interrupted",
+          running: after ? after.active : null,
+        });
+      }),
+    );
+    return yield* attempt.pipe(
+      Effect.timeout("25 seconds"),
+      Effect.orElseSucceed(() =>
+        called
+          ? unknown
+          : error(503, "open-dot was busy with this session, so nothing was stopped. Try again."),
+      ),
+    );
+  });
+
 const conversationMessage = (db: Db, dot: Dot, id: string, request: Request) =>
   Effect.gen(function* () {
     const query = new URL(request.url).searchParams;
@@ -2971,6 +3069,8 @@ const route = (
     return connect(conversationMessage(db, dot, id, request));
   if (rest === "activity" && extra.length === 0 && request.method === "GET")
     return connect(activityRead(db, dot, request));
+  if (rest === "stop" && extra.length === 0 && request.method === "POST")
+    return connect(stopRoute(db, dot, request));
   if (
     rest === "messages" &&
     part === "tools" &&

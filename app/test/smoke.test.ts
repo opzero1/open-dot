@@ -323,6 +323,8 @@ class FakeDaemon {
   threadFailure = false;
   sessions: object[] = [];
   busy = false;
+  stops: { dot: string; body: unknown }[] = [];
+  onStop: (() => Response | Promise<Response>) | undefined;
   // The work log the latest page carries, the activity it reports and each call's detail.
   work: object[] = [];
   activity: object | null = null;
@@ -593,8 +595,15 @@ class FakeDaemon {
     }
     if (receipt?.[1] && (method === "PATCH" || method === "DELETE"))
       return Response.json({ pending: null });
+    const stopDot = /^\/dots\/([^/]+)\/stop$/.exec(path);
+    if (stopDot && method === "POST") {
+      this.stops.push({ dot: stopDot[1] ?? "", body: await request.json() });
+      return this.onStop ? await this.onStop() : json({ result: "stop-requested", running: false });
+    }
     if (path === "/dots/jojo/activity" && method === "GET") {
       this.log.activityReads++;
+      if (url.searchParams.get("sessionID") !== this.sessionID)
+        return json({ error: "Conversation changed" }, 409);
       return this.activity
         ? Response.json({ ...this.activity, sessionID: url.searchParams.get("sessionID") })
         : Response.json({ error: "Not found" }, { status: 404 });
@@ -1376,6 +1385,212 @@ const toolCall = (
   label,
   files,
 });
+
+test("basic Stop UI is one session-scoped request, preserves every draft part, and reports only confirmed outcomes", async () => {
+  const since = Date.now() - 5000;
+  await scenario(
+    "basic-stop",
+    (fake) => {
+      fake.busy = true;
+      fake.activity = {
+        state: "thinking",
+        tool: null,
+        label: null,
+        running: 0,
+        since,
+        observedAt: Date.now(),
+      };
+      fake.messages = [{ id: "source", kind: "dot", text: "Keep this quote" }];
+      fake.workers = [
+        { ...worker(7, "running"), sessionID: "ses_worker", directory: "/work/native" },
+      ];
+      fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+      fake.pending = [
+        { id: "msg_queue1", status: "sent", delivery: "queue" },
+        { id: "msg_queue2", status: "sent", delivery: "queue" },
+      ];
+    },
+    async ({ fake, js, until, press, menu, temporary }) => {
+      await until(
+        `!!t.box()&&!!document.querySelector('.stop-session')`,
+        "fresh session activity Stop",
+      );
+      const page = process.env.OPEN_DOT_SMOKE_EVIDENCE ? await smokePage(temporary) : undefined;
+      const capture = async (name: string) => {
+        const dir = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+        if (!dir || !page) return;
+        const shot = await page.send("Page.captureScreenshot", {
+          format: "png",
+          fromSurface: true,
+          captureBeyondViewport: false,
+        });
+        if (!shot.data) throw new Error("Missing Stop screenshot");
+        writeFileSync(join(dir, name), Buffer.from(shot.data, "base64"));
+      };
+      const draft = () =>
+        js(
+          `({text:t.box().value,images:document.querySelectorAll('.draft-thumb').length,quote:document.querySelector('.quote-text')?.textContent,ref:document.querySelector('[data-ref]')?.getAttribute('data-ref')})`,
+        );
+      try {
+        await js(`t.box().focus(),t.type('Keep my words'),t.paste('keep.png'),true`);
+        await menu("source", "Reply");
+        await js(
+          `document.querySelector('[data-worker="7"] .worker-select').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:700,clientY:150})),true`,
+        );
+        await press('[role="menu"]', "Add to chat");
+        const kept = await draft();
+        expect(kept).toEqual({
+          text: "Keep my words",
+          images: 1,
+          quote: "Keep this quote",
+          ref: "ses_worker",
+        });
+        expect(
+          await js(
+            `(()=>{const b=document.querySelector('.stop-session');return {count:document.querySelectorAll('.stop-session').length,label:b.getAttribute('aria-label'),icon:b.querySelectorAll('svg').length,title:b.title,confirm:!!document.querySelector('[role="alertdialog"]')};})()`,
+          ),
+        ).toMatchObject({
+          count: 1,
+          label: "Stop the session's current work",
+          icon: 1,
+          confirm: false,
+        });
+        expect(await js(`document.querySelector('.stop-session').title`)).toContain(
+          "may be newer than what's shown here",
+        );
+        await capture("stop-current-dark.png");
+        let release: ((response: Response) => void) | undefined;
+        fake.onStop = () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          });
+        await js(
+          `(()=>{const b=document.querySelector('.stop-session');b.click();b.click();return true;})()`,
+        );
+        await until(
+          `document.querySelector('.stop-session')?.disabled===true`,
+          "pending Stop disabled",
+        );
+        expect(fake.stops).toEqual([{ dot: "jojo", body: { sessionID: "ses_jojo", since } }]);
+        expect(await draft()).toEqual(kept);
+        expect(await js(`!!document.querySelector('[role="alertdialog"]')`)).toBe(false);
+        release?.(json({ result: "stop-requested", running: true }));
+        await until(
+          `document.querySelector('.stop-note')?.textContent.includes("It's still running")`,
+          "accepted is not stopped",
+        );
+        expect(await js(`document.querySelector('.stop-note').textContent`)).toContain(
+          "OpenCode accepted the stop.",
+        );
+        await capture("stop-outcome-dark.png");
+        fake.onStop = () => json({ result: "not-interrupted", running: false });
+        await js(`document.querySelector('.stop-session').click(),true`);
+        await until(
+          `document.querySelector('.stop-note')?.textContent.includes('nothing to interrupt')`,
+          "false outcome is not a stopped claim",
+        );
+        fake.onStop = () => json({ error: "Stop call outcome unknown", result: "unknown" }, 502);
+        await js(`document.querySelector('.stop-session').click(),true`);
+        await until(
+          `document.querySelector('.stop-note')?.textContent.startsWith('Not confirmed:')`,
+          "unknown outcome honest",
+        );
+        const attempts = fake.stops.length;
+        await delay(1100);
+        expect(fake.stops).toHaveLength(attempts);
+        for (const malformed of [
+          { result: "stop-requested", running: "malformed" },
+          { result: "stop-requested" },
+          { result: "unrecognised-stop-outcome", running: false },
+        ]) {
+          const before = fake.stops.length;
+          fake.onStop = () => json(malformed);
+          await js(`document.querySelector('.stop-session').click(),true`);
+          await until(
+            `document.querySelector('.stop-note')?.textContent.startsWith('Not confirmed:')&&!document.querySelector('.stop-session').disabled`,
+            "malformed IPC result refused",
+          );
+          const note = await js(`document.querySelector('.stop-note').textContent`);
+          expect(note).toBe(
+            "Not confirmed: open-dot couldn't tell whether OpenCode stopped the session. It won't try again on its own.",
+          );
+          expect(await draft()).toEqual(kept);
+          await delay(1100);
+          expect(fake.stops).toHaveLength(before + 1);
+          console.log(
+            "STOP_MALFORMED_READBACK",
+            JSON.stringify({ malformed, note, requests: fake.stops.length, draft: await draft() }),
+          );
+        }
+        // Hold another request across navigation and a session rebind: its result belongs to neither new view.
+        fake.onStop = () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          });
+        await js(`document.querySelector('.stop-session').click(),true`);
+        await until(`document.querySelector('.stop-session')?.disabled===true`, "second held Stop");
+        await js(`document.querySelector('[data-dot="dio"]').click(),true`);
+        await until(
+          `t.box()?.placeholder==='Message dio'&&!document.querySelector('.stop-note')`,
+          "note does not leak to another dot",
+        );
+        fake.sessionID = "ses_rebound";
+        fake.activity = {
+          state: "tool",
+          tool: "bash",
+          label: "Rebound session work",
+          running: 1,
+          since: since + 1,
+          observedAt: Date.now(),
+        };
+        await js(`document.querySelector('[data-dot="jojo"]').click(),true`);
+        await until(
+          `!!t.box()&&!!document.querySelector('[data-activity="tool"] .stop-session')&&!document.querySelector('.quote-bar')`,
+          "fresh rebound conversation activity and stale quote safety cleanup",
+        );
+        release?.(json({ result: "stop-requested", running: false }));
+        await delay(150);
+        expect(await js(`!!document.querySelector('.stop-note')`)).toBe(false);
+        expect(await draft()).toEqual({ text: "Keep my words", images: 1, ref: "ses_worker" });
+        expect(
+          fake.stops.every(
+            (stop) =>
+              stop.dot === "jojo" && (stop.body as { sessionID: string }).sessionID === "ses_jojo",
+          ),
+        ).toBe(true);
+        expect(fake.pending.map((item) => item.id)).toEqual(["msg_queue1", "msg_queue2"]);
+        expect(fake.log.posts).toEqual([]);
+        fake.activity = {
+          state: "idle",
+          tool: null,
+          label: null,
+          running: 0,
+          since: null,
+          observedAt: Date.now(),
+        };
+        await until(`!document.querySelector('.stop-session')`, "idle activity has no Stop");
+        const dir = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+        if (dir)
+          writeFileSync(
+            join(dir, "stop-ui-readback.json"),
+            JSON.stringify(
+              {
+                kept,
+                final: await draft(),
+                stops: fake.stops,
+                pending: fake.pending,
+                posts: fake.log.posts,
+              },
+              null,
+              2,
+            ),
+          );
+      } finally {
+        page?.close();
+      }
+    },
+  );
+}, 30_000);
 
 test("a busy dot shows what it is doing, and its turn's calls fold under its reply", async () => {
   await scenario(
