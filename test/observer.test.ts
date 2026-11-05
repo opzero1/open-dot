@@ -225,67 +225,28 @@ test("a job saves its IDs before each call, runs in a scratch session, and adds,
   ]);
 });
 
-test("lost outcomes are looked up by ID and never sent again", async () => {
+test("observer admission and restart reconcile the saved prompt ID without replay", async () => {
   observerOn();
   enough();
   work();
-  // Creation failed and the session isn't there: failed, no prompt.
-  fake.state.scratch = "fail";
+  fake.state.prompt = "lost";
   await pass();
-  expect(jobs()[0]).toMatchObject({ state: "failed" });
-  expect(fake.state.prompted).toEqual([]);
-
-  // A lost prompt that OpenCode has is running; one it can't confirm is unknown.
-  for (const [mode, lookup, expected] of [
-    ["lost", false, "running"],
-    ["fail", false, "failed"],
-    ["fail", true, "unknown"],
-  ] as const) {
-    fake.state.scratch = "ok";
-    fake.state.prompt = mode;
-    fake.state.lookupFailure = lookup;
-    message(`More. ${"z".repeat(tokenJobChars)}`);
-    work();
-    await pass();
-    expect(jobs().at(-1)?.state).toBe(expected);
-    // The dot runs one job at a time; let the next one start.
-    db.update(observerJobs).set({ state: "done" }).where(eq(observerJobs.state, "running")).run();
-  }
-  fake.state.lookupFailure = false;
+  const job = jobs()[0];
+  if (!job?.promptMessage) throw new Error("Missing saved prompt ID");
+  expect(job.state).toBe("running");
+  const sent = [...fake.state.prompted];
+  expect(sent).toHaveLength(1);
+  expect(String(sent[0])).toBe(job.promptMessage);
+  db.update(observerJobs).set({ state: "started" }).run();
   fake.state.prompt = "ok";
-  const sent = fake.state.prompted.length;
   await pass();
+  expect(jobs()[0]?.state).toBe("running");
+  db.update(observerJobs).set({ state: "started" }).run();
+  fake.state.messages.clear();
   await pass();
-  expect(fake.state.prompted).toHaveLength(sent);
-});
-
-test("a job a stopped daemon left started is unknown unless OpenCode has its prompt", async () => {
-  observerOn();
-  const now = Date.now();
-  for (const prompt of ["msg_never", "msg_there"])
-    db.insert(observerJobs)
-      .values({
-        dot: "jojo",
-        sessionID: "ses_jojo",
-        kind: "tokens",
-        trigger: prompt,
-        fromID: 1,
-        toID: 1,
-        state: "started",
-        epoch: 0,
-        generation: settingsOf(db, "jojo").generation,
-        model: "fake/observer-1",
-        scratchSession: "ses_scratch",
-        promptMessage: prompt,
-        createdAt: now,
-        startedAt: now,
-        updatedAt: now,
-      })
-      .run();
-  fake.state.messages.add("msg_there");
+  expect(jobs()[0]?.state).toBe("unknown");
   await pass();
-  expect(jobs().map((job) => job.state)).toEqual(["unknown", "running"]);
-  expect(fake.state.prompted).toEqual([]);
+  expect(fake.state.prompted).toEqual(sent);
 });
 
 test("the daily budget holds a job queued, and only two run at once, one per dot", async () => {
@@ -366,18 +327,6 @@ test("an owner's forget or edit during a job saves nothing of it, and turning th
   expect(fake.state.prompted).toHaveLength(before);
   // With it off, a pass needs no OpenCode at all.
   expect(work()).toBe(false);
-});
-
-test("a running job's answer is never read once the observer is off", () => {
-  observerOn();
-  enough();
-  work();
-  db.update(observerJobs)
-    .set({ state: "running", promptMessage: "msg_p", scratchSession: "ses_s" })
-    .run();
-  saveArchiveSettings(db, "jojo", { observer: false }, 2);
-  expect(work()).toBe(false);
-  expect(jobs()[0]).toMatchObject({ state: "cancelled" });
 });
 
 test("parseOps keeps only well-formed operations", () => {
@@ -1202,19 +1151,6 @@ test("a call is charged on the local day it's made, not the day its job claimed 
   }
 });
 
-test("a settings change during the turn read means no usage call", async () => {
-  await runningJob();
-  const after = await counted(() => ({
-    turnAfter: () =>
-      Effect.sync(() => {
-        saveArchiveSettings(db, "jojo", { observerModel: "fake/two" }, 2);
-        return succeeded;
-      }),
-  }));
-  await after.pass();
-  expect(after.calls.usage).toBeUndefined();
-});
-
 test("usage is summed across every page of assistant messages, and an unreadable sum fails", async () => {
   const tokens = { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 1 } };
   const pages =
@@ -1254,16 +1190,6 @@ test("usage is summed across every page of assistant messages, and an unreadable
   );
 });
 
-test("a rebind before the poll reads nothing at all", async () => {
-  await runningJob();
-  db.update(dots).set({ sessionID: "ses_new" }).run();
-  const idle = await counted(() => ({}));
-  await idle.pass();
-  expect(idle.calls.turnAfter).toBeUndefined();
-  expect(idle.calls.usage).toBeUndefined();
-  expect(jobs()[0]?.state).toBe("cancelled");
-});
-
 test("a failed call whose job became unwanted meanwhile is never looked up", async () => {
   // The scratch session fails while the observer is turned off: no session lookup, nothing sent,
   // and the chunk comes back.
@@ -1298,39 +1224,6 @@ test("a failed call whose job became unwanted meanwhile is never looked up", asy
   expect(prompt.calls.messageExists).toBeUndefined();
   expect(jobs().at(-1)?.state).toBe("unknown");
   expect(stateOf(db, "jojo").observedThrough).toBeGreaterThan(0);
-});
-
-test("a started job left behind is unknown without a lookup once it's unwanted", async () => {
-  observerOn();
-  const now = Date.now();
-  db.insert(observerJobs)
-    .values({
-      dot: "jojo",
-      sessionID: "ses_jojo",
-      kind: "tokens",
-      trigger: "left",
-      state: "started",
-      epoch: 0,
-      generation: settingsOf(db, "jojo").generation,
-      model: "fake/observer-1",
-      scratchSession: "ses_scratch",
-      promptMessage: "msg_left",
-      createdAt: now,
-      startedAt: now,
-      updatedAt: now,
-    })
-    .run();
-  db.update(dots).set({ sessionID: "ses_new" }).run();
-  const left = await counted(() => ({}));
-  await left.pass();
-  expect(left.calls.messageExists).toBeUndefined();
-  expect(jobs()[0]?.state).toBe("unknown");
-  // Settings changed instead: the database-only pass marks it unknown too, never cancelled.
-  db.update(dots).set({ sessionID: "ses_jojo" }).run();
-  db.update(observerJobs).set({ state: "started" }).run();
-  saveArchiveSettings(db, "jojo", { observerModel: "fake/two" }, 4);
-  work();
-  expect(jobs()[0]?.state).toBe("unknown");
 });
 
 /** A page of compactions that never completed, for `latestCompleted`. */

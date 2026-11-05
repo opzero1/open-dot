@@ -24,6 +24,7 @@
     "src",
     "test",
     "measure",
+    "model",
     "vite.config.ts",
     "drizzle.config.ts"
   ]

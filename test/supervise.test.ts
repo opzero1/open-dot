@@ -170,6 +170,7 @@ test("each event is reported once, including ones during downtime and after a re
   fake.state.ends.set(owner, [
     end(start - 1, "Before the binding."),
     end(start + 1, "Finished."),
+    { ...end(start + 1, "Same timestamp, another ID."), id: "msg_tied" },
     end(start + 2, undefined, "failed"),
   ]);
   fake.state.waiting.set(owner, [
@@ -178,11 +179,12 @@ test("each event is reported once, including ones during downtime and after a re
   ]);
   await tick();
   await tick();
-  expect(notices()).toHaveLength(4);
-  expect(notices()[2]).toContain(`Supervised session ${owner} (binding #${binding.id}`);
-  expect(notices()[2]).toContain(") failed.");
-  expect(notices()[2]).toContain('"error": "Provider error"');
-  expect(notices()[3]).toContain("answer a question");
+  expect(notices()).toHaveLength(5);
+  expect(notices()[2]).toContain("Same timestamp, another ID.");
+  expect(notices()[3]).toContain(`Supervised session ${owner} (binding #${binding.id}`);
+  expect(notices()[3]).toContain(") failed.");
+  expect(notices()[3]).toContain('"error": "Provider error"');
+  expect(notices()[4]).toContain("answer a question");
   // Notices go through the outbox to the dot only; nothing is sent to the supervised session.
   expect(fake.state.texts.every((sent) => sent.sessionID === "ses_jojo")).toBe(true);
 });
