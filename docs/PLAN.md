@@ -144,11 +144,12 @@ That shared-prefix guarantee covers the stored d3 message and the earlier unchan
 
 **Recall with the ledger on.** `dot_recall`'s first page leads with up to three matching current rows (`kind: "observed"`). Automatic recall puts rows matching two of the owner's words first, skipping rows the checkpoint or tail shows. Its one block per owner message is reused only while the session, owner message, ledger epoch, settings, latest compaction and checkpoint are all unchanged, so a forget, an edit, the ledger turned off or a native compaction drops it at once. `dot_zoom` takes `observation` instead of `message_id` and shows the row with excerpts of its sources, at most ten, about 12 KB in all.
 
-**Prompt cache.** Nothing here changes a request's system prompt or tool list from turn to turn:
+**Prompt cache.** The checkpoint and recall tail have different stability guarantees from the saved-note instruction entry:
 
 - The checkpoint is the only addition at the start, byte-identical until the next compaction or an owner's edit or forget.
-- Automatic recall, ranked notes and rows observed since the checkpoint all sit in the existing memory tail.
-- Turning a layer on or off changes the request once, when it's turned, not on every turn.
+- Automatic recall and rows observed since the checkpoint sit in the existing memory tail.
+- When instruction entries are available, ranked notes are synchronized into `open-dot.notes`. Their query-dependent selection can change that entry, and therefore the system prompt, between turns. The changed section also appears in the current request's tail; without instruction entries, notes appear in the fallback memory tail.
+- Turning a layer on or off can change the request's composition. A stable checkpoint alone does not guarantee provider cache reuse.
 
 **Ranked notes.** With `rankNotes`, each request lists at most 30 notes in 8,000 bytes: those matching the owner's latest message by BM25 first, then the most recently changed. It says how many aren't shown.
 
