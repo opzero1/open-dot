@@ -288,32 +288,6 @@ test("a revoked binding's unsent message is never admitted; an admitted one is o
   expect(db.select().from(outbox).where(eq(outbox.id, admitted.id)).get()?.state).toBe("sent");
 });
 
-test("a binding revoked while the daemon looks the message up is never admitted", async () => {
-  const binding = bind("send");
-  const queued = queueSend(binding.id);
-  // Revocation lands after the start is saved and before the prompt.
-  fake.state.messages = new Proxy(fake.state.messages, {
-    get(target, key) {
-      if (key === "has")
-        return (id: string) => {
-          db.update(supervisions)
-            .set({ state: "ended", endReason: "revoked" })
-            .where(eq(supervisions.id, binding.id))
-            .run();
-          return target.has(id);
-        };
-      const value = Reflect.get(target, key);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-  await tick();
-  expect(fake.state.prompted).toEqual([]);
-  expect(db.select().from(outbox).where(eq(outbox.id, queued.id)).get()).toMatchObject({
-    state: "cancelled",
-    startedAt: expect.any(Number),
-  });
-});
-
 /** Runs the real public-client adapter against a loopback fake OpenCode, never a live one. */
 async function withAdapter(
   handler: (url: URL) => Response,

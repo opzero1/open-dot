@@ -304,7 +304,7 @@ test("issue27: revoke while message existence request is awaited cancels before 
   endBinding(db, binding.id, "owner");
   absent.resolve(false);
   await running;
-  expect(rows()[0]?.state).toBe("cancelled");
+  expect(rows()[0]).toMatchObject({ state: "cancelled", startedAt: expect.any(Number) });
   expect(fake.state.prompted).toEqual([]);
 });
 

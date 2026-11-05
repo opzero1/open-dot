@@ -35,6 +35,7 @@
         "remark-breaks": "4.0.0",
         "remark-gfm": "4.0.1",
         "remark-math": "6.0.0",
+        "tla-ts": "0.0.8",
         "typescript": "7.0.2",
         "vite-plus": "1.3.0",
       },
@@ -1622,6 +1623,8 @@
     "tinypool": ["tinypool@2.2.0", "", {}, "sha512-jBrmx4lYmaC9k/mgPbylxs7kBUxHtD8256up+HjLaDFfXScKJQyil+SWXSvhAtT7XHo+yTVlpB81PGmHP8oLSQ=="],
 
     "tinyrainbow": ["tinyrainbow@3.2.0", "", {}, "sha512-LgO3D9yZJjApUiuUfl9iFAwrtaX4+lok3wJIqttGoKCHlWUqHqbQpnxCf82L8FjgKsh4iGo78hqJwgL8F6To2A=="],
+
+    "tla-ts": ["tla-ts@0.0.8", "", { "dependencies": { "fflate": "^0.8.3" }, "bin": { "tla-ts": "dist/cli.js" } }, "sha512-o6l6mvlV+o81B6ZRN/k1Jb4De788F4584vzm13U+EBgEIqifeyHjBNvCiUJtZFFM/GV3LugdKhhnCS/cAbA3qg=="],
 
     "tmp": ["tmp@0.2.7", "", {}, "sha512-e0votIpp4Uo2AJYSzVHV6xCcawuiez3DzqDAbrTc3YxBkplN6e+dM13ZeIcZnDg/QpSuU2zfZ3rzwY8ukEnaXw=="],
 
