@@ -28,6 +28,7 @@ import type {
   ToolCallView,
   ToolDetailView,
   WorkLogView,
+  WorkerConversation,
 } from "./bridge";
 import {
   activityLine,
@@ -85,7 +86,7 @@ import { Memory } from "./Memory";
 import { Health, Library } from "./Panes";
 import { Slack } from "./SlackView";
 import { AvatarState, InstructionsState } from "./surfaces";
-import { type Ask, bridge, Dialog, LocalThumb } from "./ui";
+import { type Ask, bridge, Dialog, Icon, IconButton, LocalThumb } from "./ui";
 
 /** What the window shows for the selected dot; the Feed shows over any of them. */
 type Pane = "chat" | "memory" | "instructions" | "library" | "health" | "slack";
@@ -101,6 +102,7 @@ const paneNames: [Pane, string][] = [
 
 // Older pages a list too short to scroll loads on its own before it waits for Load older.
 const autoFillLimit = 10;
+const followThreshold = 48;
 
 // Daemon images become blob URLs, a bounded number at a time; evicted ones are revoked.
 const blobs = new Map<string, string>();
@@ -258,6 +260,19 @@ const App = () => {
   const [sent, sentRef, updateSent] = useLive(new Map<string, Sent>());
   const [changing, setChanging] = useState(new Set<string>());
   const [showHidden, setShowHidden] = useState(false);
+  const [dotInfo, setDotInfo] = useState<Ask>();
+  const dotInfoButton = useRef<HTMLButtonElement>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsButton = useRef<HTMLButtonElement>(null);
+  const hiddenSetting = useRef<HTMLInputElement>(null);
+  const settingsClose = useRef<HTMLButtonElement>(null);
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    settingsButton.current?.focus();
+  };
+  useEffect(() => {
+    if (settingsOpen) hiddenSetting.current?.focus();
+  }, [settingsOpen]);
   const [menu, setMenu] = useState<Menu>();
   const [viewer, setViewer] = useState<string>();
   const [toast, setToast] = useState<Toast>();
@@ -271,6 +286,9 @@ const App = () => {
   // The one Needs you list of every dot's request cards.
   const [needsOpen, setNeedsOpen] = useState(false);
   const requests = useRequests();
+  const actionCount = requests.cards.filter((card) => card.needsYou).length;
+  const inboxOpen = feedOpen || needsOpen;
+  const inboxStatus = `${actionCount || requests.more ? `${requests.more ? "At least " : ""}${actionCount} requests need you` : "No action requests shown"}${requests.error ? " (not up to date)" : ""}`;
   const [ask, setAsk] = useState<Ask>();
   const [dotMenu, setDotMenu] = useState<{ dot: string; x: number; y: number }>();
   const [freshening, setFreshening] = useState(new Set<string>());
@@ -1116,7 +1134,16 @@ const App = () => {
 
   // Command-1, 2 and 3 pick Chat, Memory and Instructions; Escape goes back to the chat. None of
   // them discards a draft, and Escape does nothing while a dialog, a menu or IME input is open.
-  const modal = !!(ask || confirm || menu || viewer || capturing || dotMenu);
+  const modal = !!(
+    ask ||
+    confirm ||
+    menu ||
+    viewer ||
+    capturing ||
+    dotMenu ||
+    settingsOpen ||
+    dotInfo
+  );
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.isComposing || event.defaultPrevented) return;
@@ -1155,38 +1182,44 @@ const App = () => {
       data-sent={sent.size}
     >
       <aside className="sidebar">
-        <div className="sidebar-title">open-dot</div>
+        <div className="sidebar-title">
+          <span>open-dot</span>
+          <IconButton
+            ref={settingsButton}
+            icon="settings"
+            label="Settings"
+            aria-haspopup="dialog"
+            onClick={() => setSettingsOpen(true)}
+          />
+        </div>
         {dotsError ? <div className="banner">{dotsError}</div> : null}
         {!shortcut ? (
           <div className="banner">Control-Option-Space is taken by another app.</div>
         ) : null}
-        <button
-          type="button"
-          className={`feed-button ${feedOpen ? "selected" : ""}`}
-          aria-pressed={feedOpen}
-          data-open-feed
-          onClick={() => {
-            setFeedOpen((open) => !open);
-            setNeedsOpen(false);
-            setMenu(undefined);
-          }}
-        >
-          Feed
-        </button>
-        <button
-          type="button"
-          className={`feed-button ${needsOpen ? "selected" : ""}`}
-          aria-pressed={needsOpen}
-          data-open-needs
-          onClick={() => {
-            setNeedsOpen((open) => !open);
-            setFeedOpen(false);
-            setMenu(undefined);
-          }}
-        >
-          Needs you
-          {requests.cards.length ? ` (${requests.cards.length}${requests.more ? "+" : ""})` : ""}
-        </button>
+        <div className="inbox-entry">
+          <IconButton
+            icon="inbox"
+            label="Inbox"
+            title={`Inbox · ${inboxStatus}`}
+            aria-pressed={inboxOpen}
+            aria-describedby="inbox-status"
+            data-open-inbox
+            onClick={() => {
+              setFeedOpen(!inboxOpen);
+              setNeedsOpen(false);
+              setMenu(undefined);
+            }}
+          />
+          {actionCount || requests.more ? (
+            <span className="badge needs" aria-hidden="true" data-inbox-count>
+              {actionCount}
+              {requests.more ? "+" : ""}
+            </span>
+          ) : null}
+          <span id="inbox-status" className="sr-only">
+            {inboxStatus}
+          </span>
+        </div>
         <nav aria-label="Dots">
           {dots.map((item) => {
             const count = unread.get(item.name) ?? 0;
@@ -1234,6 +1267,7 @@ const App = () => {
                   type="button"
                   className="dot-more"
                   aria-label={`${item.name} menu`}
+                  title={`${item.name} menu`}
                   aria-haspopup="menu"
                   data-dot-menu={item.name}
                   onClick={(event) => {
@@ -1249,13 +1283,45 @@ const App = () => {
         </nav>
       </aside>
       <main className="chat">
+        {inboxOpen ? (
+          <header className="inbox-head">
+            <h2>Inbox</h2>
+            <nav aria-label="Inbox sections">
+              <button
+                type="button"
+                aria-pressed={feedOpen}
+                data-open-feed
+                onClick={() => {
+                  setFeedOpen(true);
+                  setNeedsOpen(false);
+                }}
+              >
+                Activity
+              </button>
+              <button
+                type="button"
+                aria-pressed={needsOpen}
+                data-open-needs
+                onClick={() => {
+                  setNeedsOpen(true);
+                  setFeedOpen(false);
+                }}
+              >
+                Needs your action
+                {requests.cards.length
+                  ? ` (${requests.cards.length}${requests.more ? "+" : ""})`
+                  : ""}
+              </button>
+            </nav>
+          </header>
+        ) : null}
         {needsOpen ? (
           <div className="needs-pane" data-needs-pane>
             <RequestList
               requests={requests}
               cards={requests.cards}
               ask={setAsk}
-              title="Needs you"
+              title="Needs your action"
             />
             {requests.cards.length || requests.error ? null : (
               <p className="request-empty">Nothing waits for you.</p>
@@ -1295,24 +1361,31 @@ const App = () => {
         ) : dot && conversation ? (
           <>
             <header className="chat-head">
-              <div>
-                <div className="chat-title">{dot.name}</div>
-                {dot.purpose ? <div className="chat-purpose">{dot.purpose}</div> : null}
-              </div>
+              <button
+                ref={dotInfoButton}
+                type="button"
+                className="chat-identity"
+                aria-label={`About ${dot.name}`}
+                title={`About ${dot.name}`}
+                aria-haspopup="dialog"
+                onClick={() =>
+                  setDotInfo({
+                    role: "dialog",
+                    title: `About ${dot.name}`,
+                    text: `${dot.purpose || "No description set."}\n\nStatus: ${dot.busy ? "Working" : "Idle"}\nWorkers: ${dot.workers.length}\nNeeds you: ${needsCount(dot)}`,
+                    buttons: [{ label: "Close" }],
+                  })
+                }
+              >
+                <Avatar dot={dot} url={avatars.get(dot.name)} />
+                <span className="chat-title">{dot.name}</span>
+              </button>
               <div className="chat-tools">
                 {readErrors.get(dot.name) ? (
                   <span className="stale" title={readErrors.get(dot.name)}>
                     Not up to date
                   </span>
                 ) : null}
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={showHidden}
-                    onChange={(event) => setShowHidden(event.target.checked)}
-                  />{" "}
-                  Show deleted
-                </label>
               </div>
             </header>
             {/* More may wait past the cards read, some of them this dot's, so Show more stays here. */}
@@ -1345,7 +1418,6 @@ const App = () => {
               onRetry={(message) => retry(dot.name, message.id)}
               onPending={(pending, change) => changePending(dot.name, pending, change)}
               onCopyText={(text) => void bridge.copyText(text)}
-              onShareText={(text) => void bridge.shareText(text)}
               onForget={(attempt) => {
                 setConfirm({
                   text: "Stop tracking this message? open-dot never confirmed it, and it won't be sent again.",
@@ -1358,20 +1430,18 @@ const App = () => {
                 });
               }}
             />
-            <Workers dot={dot} onConfirm={setConfirm} onToast={showToast} />
             <div className="composer">
               {draft.quote ? (
                 <div className="quote-bar">
                   <span>Replying to {draft.quote.author === "owner" ? "you" : dot.name}: </span>
                   <span className="quote-text">{draft.quote.text}</span>
-                  <button
-                    type="button"
+                  <IconButton
+                    icon="close"
+                    label="Cancel reply"
                     onClick={() =>
                       setDraft(dot.name, (current) => ({ ...current, quote: undefined }))
                     }
-                  >
-                    Cancel
-                  </button>
+                  />
                 </div>
               ) : null}
               {draft.images.length ? (
@@ -1417,14 +1487,13 @@ const App = () => {
                   onKeyDown={onKeyDown}
                   onPaste={onPaste}
                 />
-                <button
-                  type="button"
+                <IconButton
+                  icon="send"
+                  label={sending.has(dot.name) ? "Sending…" : "Send"}
                   className="send"
                   disabled={sending.has(dot.name) || (!draft.text.trim() && !draft.images.length)}
                   onClick={() => void send()}
-                >
-                  {sending.has(dot.name) ? "Sending…" : "Send"}
-                </button>
+                />
               </div>
             </div>
           </>
@@ -1434,6 +1503,9 @@ const App = () => {
           </div>
         )}
       </main>
+      {dot && looking ? (
+        <Workers key={dot.name} dot={dot} onConfirm={setConfirm} onToast={showToast} />
+      ) : null}
       {menu && selected && menuMessage ? (
         <MessageMenu
           menu={{ ...menu, message: menuMessage }}
@@ -1463,14 +1535,6 @@ const App = () => {
               .copyMessage(selected, menuMessage.id, menuMessage.sessionID)
               .then((result) => {
                 if (!result.ok) showToast({ text: `Nothing was copied: ${result.error}` });
-              });
-            setMenu(undefined);
-          }}
-          onShare={() => {
-            void bridge
-              .shareMessage(selected, menuMessage.id, menuMessage.sessionID)
-              .then((result) => {
-                if (!result.ok) showToast({ text: result.error });
               });
             setMenu(undefined);
           }}
@@ -1542,6 +1606,56 @@ const App = () => {
         />
       ) : null}
       {ask ? <Dialog ask={ask} onClose={() => setAsk(undefined)} /> : null}
+      {dotInfo ? (
+        <Dialog
+          ask={dotInfo}
+          onClose={() => {
+            setDotInfo(undefined);
+            dotInfoButton.current?.focus();
+          }}
+        />
+      ) : null}
+      {settingsOpen ? (
+        <div
+          className="modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings"
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.stopPropagation();
+              closeSettings();
+            }
+            if (event.key === "Tab") {
+              event.preventDefault();
+              if (document.activeElement === hiddenSetting.current) settingsClose.current?.focus();
+              else hiddenSetting.current?.focus();
+            }
+          }}
+        >
+          <div className="modal-box">
+            <p className="modal-title">Settings</p>
+            <label className="settings-option">
+              <input
+                ref={hiddenSetting}
+                type="checkbox"
+                checked={showHidden}
+                onChange={(event) => setShowHidden(event.target.checked)}
+              />
+              Show deleted
+            </label>
+            <p className="note">
+              Include messages deleted from the app in your conversations. Applies until the app
+              closes.
+            </p>
+            <div className="modal-actions">
+              <button ref={settingsClose} type="button" onClick={closeSettings}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {toast ? (
         <div className="toast" role="status">
           {toast.text}
@@ -1693,7 +1807,6 @@ const MessageList = ({
   onRetry,
   onPending,
   onCopyText,
-  onShareText,
   onForget,
 }: {
   dot: string;
@@ -1715,7 +1828,6 @@ const MessageList = ({
   onRetry: (message: MessageView) => void;
   onPending: (pending: PendingView, change: "steer" | "cancel") => void;
   onCopyText: (text: string) => void;
-  onShareText: (text: string) => void;
   onForget: (attempt: Attempt) => void;
 }) => {
   const scroller = useRef<HTMLDivElement>(null);
@@ -1749,6 +1861,7 @@ const MessageList = ({
     // Older pages go above without moving what's being read; new rows follow at the bottom.
     anchorTo: "end",
     followOnAppend: true,
+    scrollEndThreshold: followThreshold,
   });
 
   useEffect(() => {
@@ -1819,7 +1932,8 @@ const MessageList = ({
   const onScroll = () => {
     const element = scroller.current;
     if (!element) return;
-    atBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+    atBottom.current =
+      element.scrollHeight - element.scrollTop - element.clientHeight <= followThreshold;
     setLatest(!atBottom.current || conversation.detached);
     if (element.scrollTop < 300 && conversation.next && !olderError && !loading.current) {
       fills.current = 0;
@@ -1901,7 +2015,6 @@ const MessageList = ({
                   changing={changing.has(row.pending.id)}
                   onPending={onPending}
                   onCopyText={onCopyText}
-                  onShareText={onShareText}
                 />
               ) : (
                 <div className="message owner pending" data-attempt-unknown>
@@ -1924,8 +2037,9 @@ const MessageList = ({
       ) : null}
       {busy ? <Activity dot={dot} sessionID={conversation.sessionID} /> : null}
       {latest ? (
-        <button
-          type="button"
+        <IconButton
+          icon="down"
+          label={conversation.detached ? "Back to latest" : "Latest messages"}
           className="latest"
           data-latest
           onClick={() => {
@@ -1933,9 +2047,7 @@ const MessageList = ({
             else virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
             atBottom.current = true;
           }}
-        >
-          {conversation.detached ? "Back to latest" : "Latest ↓"}
-        </button>
+        />
       ) : null}
     </div>
   );
@@ -1948,7 +2060,6 @@ const PendingRow = ({
   changing,
   onPending,
   onCopyText,
-  onShareText,
 }: {
   dot: string;
   pending: PendingView;
@@ -1956,7 +2067,6 @@ const PendingRow = ({
   changing: boolean;
   onPending: (pending: PendingView, change: "steer" | "cancel") => void;
   onCopyText: (text: string) => void;
-  onShareText: (text: string) => void;
 }) => {
   const actions = pendingActions(pending);
   const captured = sent?.captured;
@@ -1964,39 +2074,47 @@ const PendingRow = ({
     <div className="message owner pending" data-pending={pending.status} data-id={pending.id}>
       {captured ? <SentPreview dot={dot} sent={captured} /> : null}
       <div className="status">
-        {pendingLabel[pending.status]}
+        {pending.status === "confirming" ? (
+          <span className="warning" role="status">
+            {pendingLabel[pending.status]}
+          </span>
+        ) : (
+          <span
+            className={`delivery-status ${pending.status === "sending" ? "is-sending" : ""}`}
+            role="status"
+            title={
+              pending.status === "sending"
+                ? "Sending to OpenCode"
+                : "Sent to OpenCode. This does not mean delivered or read."
+            }
+          >
+            <Icon icon={pending.status === "sending" ? "progress" : "save"} />
+            <span className="sr-only">{pendingLabel[pending.status]}</span>
+          </span>
+        )}
         {actions.sendNow ? (
-          <button
-            type="button"
+          <IconButton
+            icon="send"
+            label="Send now"
             disabled={changing}
             title="Join the dot's running turn at its next step instead of waiting for it to end"
             onClick={() => onPending(pending, "steer")}
-          >
-            Send now
-          </button>
+          />
         ) : null}
         {actions.cancel ? (
-          <button
-            type="button"
+          <IconButton
+            icon="close"
+            label="Cancel"
             disabled={changing}
             title="Withdraw this message before the dot gets it"
             onClick={() => onPending(pending, "cancel")}
-          >
-            Cancel
-          </button>
+          />
         ) : null}
         {captured?.text ? (
-          <button type="button" onClick={() => onCopyText(captured.text)}>
-            Copy
-          </button>
-        ) : null}
-        {captured?.text && !captured.images.length ? (
-          <button type="button" onClick={() => onShareText(captured.text)}>
-            Share…
-          </button>
+          <IconButton icon="copy" label="Copy" onClick={() => onCopyText(captured.text)} />
         ) : null}
         {captured?.images.length ? (
-          <span className="note">Its images copy and share once delivered.</span>
+          <span className="note">Its images copy once delivered.</span>
         ) : null}
       </div>
     </div>
@@ -2244,7 +2362,7 @@ const WorkLog = ({
   );
 };
 
-/** What a busy dot is doing now, read once a second, with how long it has been at it. */
+/** What a busy dot is doing now, read once a second. */
 const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
   const [seen, setSeen] = useState<{ view: ActivityView; at: number; first: number }>();
   const [now, setNow] = useState(() => Date.now());
@@ -2280,13 +2398,38 @@ const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
   }, [dot, sessionID]);
   const stale = seen !== undefined && now - seen.at > staleAfter;
   const from = seen?.view.since ?? seen?.first;
+  const thinking = seen?.view.state === "thinking";
+  const duration = from === undefined ? undefined : elapsed(from, stale && seen ? seen.at : now);
   return (
     <div className="typing" role="status" data-activity={seen?.view.state ?? "unknown"}>
-      {activityLine(dot, seen?.view)}
-      {from !== undefined ? (
+      {thinking ? (
+        <>
+          <span className="sr-only">
+            {dot} is thinking{stale ? ", status not updated" : ""}
+          </span>
+          <span
+            className="typing-bubble"
+            aria-hidden="true"
+            data-stale={stale || undefined}
+            title={`${dot} is thinking · ${duration}${seen?.view.since === null ? " observed" : ""}${stale ? " · not updated" : ""}`}
+          >
+            <span />
+            <span />
+            <span />
+          </span>
+          {stale ? (
+            <span className="typing-stale" aria-hidden="true">
+              Not updated
+            </span>
+          ) : null}
+        </>
+      ) : (
+        activityLine(dot, seen?.view)
+      )}
+      {!thinking && from !== undefined ? (
         <span className="activity-time">
           {" "}
-          · {elapsed(from, stale && seen ? seen.at : now)}
+          · {duration}
           {seen?.view.since === null ? " observed" : ""}
           {stale ? " · not updated" : ""}
         </span>
@@ -2477,7 +2620,6 @@ const MessageMenu = ({
   onDetails,
   onReply,
   onCopy,
-  onShare,
   onDelete,
 }: {
   menu: Menu;
@@ -2490,7 +2632,6 @@ const MessageMenu = ({
   onDetails: () => void;
   onReply: () => void;
   onCopy: () => void;
-  onShare: () => void;
   onDelete: () => void;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
@@ -2560,7 +2701,7 @@ const MessageMenu = ({
     blocked ? "Waiting for saved message state before another change." : undefined,
     message.kind === "dot" ? undefined : `Tapbacks are only for ${dot}'s messages.`,
     repliable ? undefined : `Reply is only for your messages and ${dot}'s.`,
-    content ? undefined : "There's no text or image to copy or share.",
+    content ? undefined : "There's no text or image to copy.",
   ].filter((reason) => reason !== undefined);
   return (
     <div className="menu-backdrop" onClick={onClose}>
@@ -2623,9 +2764,6 @@ const MessageMenu = ({
         <button type="button" role="menuitem" disabled={!content} onClick={onCopy}>
           Copy
         </button>
-        <button type="button" role="menuitem" disabled={!content} onClick={onShare}>
-          Share…
-        </button>
         <button
           type="button"
           role="menuitem"
@@ -2645,6 +2783,112 @@ const MessageMenu = ({
   );
 };
 
+type WorkerTarget = { kind: "worker" | "request"; id: number; title: string };
+
+const WorkerPanel = ({
+  target,
+  onClose,
+  onOpen,
+}: {
+  target: WorkerTarget;
+  onClose: () => void;
+  onOpen: () => void;
+}) => {
+  const [view, setView] = useState<WorkerConversation>();
+  const [error, setError] = useState<string>();
+  const close = useRef<HTMLButtonElement>(null);
+  useEffect(() => close.current?.focus(), []);
+  useEffect(() => {
+    let live = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const read = async () => {
+      const result = await bridge
+        .call(target.kind === "worker" ? "workerConversation" : "requestConversation", target.id)
+        .catch(() => ({ ok: false as const, error: "Couldn't read this conversation." }));
+      if (!live) return;
+      if (result.ok) {
+        setView(result.value);
+        setError(undefined);
+      } else setError(result.error);
+      timer = setTimeout(() => void read(), 5_000);
+    };
+    void read();
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [target.kind, target.id]);
+  return (
+    <section
+      className="worker-panel"
+      aria-label="Worker conversation"
+      data-worker-panel
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          onClose();
+        }
+      }}
+    >
+      <header className="worker-panel-head">
+        <h3>{target.title}</h3>
+        <IconButton ref={close} icon="close" label="Close worker panel" onClick={onClose} />
+      </header>
+      <p className="note">
+        Read-only recent conversation. Replying and attachments are available in the terminal.
+      </p>
+      <button type="button" onClick={onOpen}>
+        Open in terminal
+      </button>
+      {error ? (
+        <p className="item-error" role="status">
+          {view ? "Not up to date. " : ""}
+          {error}
+        </p>
+      ) : null}
+      {view ? (
+        <>
+          <dl className="worker-details">
+            <dt>Status</dt>
+            <dd>{view.state}</dd>
+            <dt>Session</dt>
+            <dd>{view.sessionID}</dd>
+            <dt>Directory</dt>
+            <dd>{view.directory}</dd>
+          </dl>
+          {view.more ? (
+            <p className="note">
+              Earlier history is available in the terminal. Showing the latest 40 history items.
+            </p>
+          ) : null}
+          {!view.messages.length ? (
+            <p className="note">No text messages in the recent history.</p>
+          ) : null}
+          {view.messages.map((message) => (
+            <article key={message.id} className="worker-message" data-worker-message={message.id}>
+              <div className="note">
+                {message.role === "assistant" ? "Worker" : "Input"} · {time(message.time)}
+              </div>
+              <Markdown text={message.text} />
+              {message.tools.length ? (
+                <p className="note">Tools: {message.tools.join(", ")}</p>
+              ) : null}
+              {message.attachments ? (
+                <p className="note">{message.attachments} attachment(s) · view in terminal</p>
+              ) : null}
+              {message.truncated ? (
+                <p className="note">Message shortened · full text in terminal</p>
+              ) : null}
+            </article>
+          ))}
+        </>
+      ) : !error ? (
+        <p role="status">Loading conversation…</p>
+      ) : null}
+    </section>
+  );
+};
+
 const Workers = ({
   dot,
   onConfirm,
@@ -2655,7 +2899,17 @@ const Workers = ({
   onToast: (toast: Toast) => void;
 }) => {
   const [busy, setBusy] = useState(new Set<number>());
-  if (!dot.workers.length && !dot.sessions.length) return null;
+  const [selected, setSelected] = useState<WorkerTarget>();
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  if (!dot.workers.length && !dot.sessions.length && !selected) return null;
+  const pick = (target: WorkerTarget, button: HTMLButtonElement) => {
+    trigger.current = button;
+    setSelected(target);
+  };
+  const close = () => {
+    setSelected(undefined);
+    trigger.current?.focus();
+  };
   const opened = (result: Result<{ opened: boolean; command?: string; error?: string }>) => {
     if (!result.ok) onToast({ text: result.error });
     else if (!result.value.opened)
@@ -2690,50 +2944,87 @@ const Workers = ({
       <span>{fallback}</span>
     );
   return (
-    <div className="workers">
-      {dot.workers.map((worker) => {
-        const actions = workerActions(worker.state);
-        return (
-          <div key={worker.id} className="worker" data-worker={worker.id} data-state={worker.state}>
-            <span className="worker-task">{worker.task}</span>
-            {state(
-              worker.needs,
-              worker.waiting,
-              worker.state === "stopping" ? "stopping, not confirmed" : worker.state,
-            )}
-            {actions.open ? (
-              <button type="button" onClick={() => void bridge.openWorker(worker.id).then(opened)}>
-                Open
-              </button>
-            ) : null}
-            {actions.stop ? (
+    <aside className="worker-sidebar" aria-label="Workers">
+      <h2>Workers</h2>
+      <div className="workers">
+        {dot.workers.map((worker) => {
+          const actions = workerActions(worker.state);
+          return (
+            <div
+              key={worker.id}
+              className="worker"
+              data-worker={worker.id}
+              data-state={worker.state}
+            >
               <button
                 type="button"
-                disabled={busy.has(worker.id)}
-                onClick={() =>
-                  onConfirm({
-                    text: `Stop this worker? ${worker.task}`,
-                    action: "Stop",
-                    run: () => stop(worker.id),
-                  })
+                className="worker-select"
+                aria-label={`View worker: ${worker.task}`}
+                aria-pressed={selected?.kind === "worker" && selected.id === worker.id}
+                onClick={(event) =>
+                  pick({ kind: "worker", id: worker.id, title: worker.task }, event.currentTarget)
                 }
               >
-                {worker.state === "stopping" ? "Stop again" : "Stop"}
+                <span className="worker-task">{worker.task}</span>
+                {state(
+                  worker.needs,
+                  worker.waiting,
+                  worker.state === "stopping" ? "stopping, not confirmed" : worker.state,
+                )}
               </button>
-            ) : null}
+              {actions.stop ? (
+                <button
+                  type="button"
+                  disabled={busy.has(worker.id)}
+                  onClick={() =>
+                    onConfirm({
+                      text: `Stop this worker? ${worker.task}`,
+                      action: "Stop",
+                      run: () => stop(worker.id),
+                    })
+                  }
+                >
+                  {worker.state === "stopping" ? "Stop again" : "Stop"}
+                </button>
+              ) : null}
+            </div>
+          );
+        })}
+        {dot.sessions.map((item) => (
+          <div key={item.sessionID} className="worker" data-session={item.sessionID}>
+            <button
+              type="button"
+              className="worker-select"
+              aria-label={`View session: ${item.title ?? item.sessionID}`}
+              aria-pressed={selected?.kind === "request" && selected.id === item.request}
+              onClick={(event) =>
+                pick(
+                  { kind: "request", id: item.request, title: item.title ?? item.sessionID },
+                  event.currentTarget,
+                )
+              }
+            >
+              <span className="worker-task">{item.title ?? item.sessionID}</span>
+              {state(item.needs, item.waiting, item.source)}
+            </button>
           </div>
-        );
-      })}
-      {dot.sessions.map((item) => (
-        <div key={item.sessionID} className="worker" data-session={item.sessionID}>
-          <span className="worker-task">{item.title ?? item.sessionID}</span>
-          {state(item.needs, item.waiting, item.source)}
-          <button type="button" onClick={() => void bridge.openRequest(item.request).then(opened)}>
-            Open
-          </button>
-        </div>
-      ))}
-    </div>
+        ))}
+      </div>
+      {selected ? (
+        <WorkerPanel
+          key={`${selected.kind}:${selected.id}`}
+          target={selected}
+          onClose={close}
+          onOpen={() =>
+            void (
+              selected.kind === "worker"
+                ? bridge.openWorker(selected.id)
+                : bridge.openRequest(selected.id)
+            ).then(opened)
+          }
+        />
+      ) : null}
+    </aside>
   );
 };
 

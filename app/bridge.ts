@@ -18,6 +18,23 @@ export interface WorkerView {
   answered: string | null;
 }
 
+export interface WorkerConversation {
+  title: string;
+  sessionID: string;
+  directory: string;
+  state: string;
+  more: boolean;
+  messages: {
+    id: string;
+    role: string;
+    text: string;
+    time: number;
+    tools: string[];
+    attachments: number;
+    truncated: boolean;
+  }[];
+}
+
 export interface SessionView {
   request: number;
   source: string;
@@ -767,6 +784,8 @@ export interface OwnerMutation {
  * Main builds each request itself from validated arguments: never a path, URL or file.
  */
 export interface Operations {
+  workerConversation: [[id: number], WorkerConversation];
+  requestConversation: [[id: number], WorkerConversation];
   feed: [[], FeedPage];
   dismiss: [[id: number], true];
   dismissAll: [[ids: number[]], { dismissed: number[]; missing: number[] }];

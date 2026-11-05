@@ -1104,6 +1104,10 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
   const base = isName(dot) ? `/dots/${segment(dot)}` : undefined;
   const memory = base && `${base}/memory`;
   switch (op) {
+    case "workerConversation":
+      return isID(dot) ? { method: "GET", path: `/workers/${dot}/conversation` } : undefined;
+    case "requestConversation":
+      return isID(dot) ? { method: "GET", path: `/requests/${dot}/conversation` } : undefined;
     case "feed":
       return { method: "GET", path: "/feed" };
     case "dismiss":
@@ -1390,6 +1394,8 @@ const operationNames = new Set<string>([
   "slackLogin",
   "fresh",
   "activity",
+  "workerConversation",
+  "requestConversation",
   "work",
   "toolDetail",
   "pendingRequests",

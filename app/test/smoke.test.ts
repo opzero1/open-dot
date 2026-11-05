@@ -309,6 +309,7 @@ class FakeDaemon {
   receipts = new Map<string, string>();
   failing = new Set<string>();
   workers: object[] = [];
+  sessions: object[] = [];
   busy = false;
   // The work log the latest page carries, the activity it reports and each call's detail.
   work: object[] = [];
@@ -359,6 +360,8 @@ class FakeDaemon {
     posts: [] as Post[],
     puts: [] as { id: string; part: string; body: Record<string, unknown> }[],
     stops: [] as number[],
+    conversations: [] as string[],
+    opens: [] as string[],
     staleCursors: 0,
     olderReads: 0,
     latestReads: 0,
@@ -437,7 +440,7 @@ class FakeDaemon {
           busy: this.busy,
           avatar: this.avatar ? { revision: this.avatar.revision } : null,
           workers: this.workers,
-          sessions: [],
+          sessions: this.sessions,
         },
         ...[...this.others.keys()].map((name) => ({
           name,
@@ -641,7 +644,32 @@ class FakeDaemon {
       this.log.stops.push(Number(workerStop[1]));
       return Response.json({ ok: true });
     }
-    if (/^\/workers\/\d+\/open$/.test(path)) return Response.json({ opened: true });
+    const conversation = /^\/(workers|requests)\/(\d+)\/conversation$/.exec(path);
+    if (conversation && method === "GET") {
+      this.log.conversations.push(path);
+      return json({
+        title: "Task 2",
+        sessionID: conversation[1] === "workers" ? "ses_w2" : "ses_threads",
+        directory: "/work/jojo",
+        state: "running",
+        more: true,
+        messages: [
+          {
+            id: "msg_worker",
+            role: "assistant",
+            text: "# Worker progress\n\nChecked **the build**.",
+            time: now,
+            tools: ["bash"],
+            attachments: 1,
+            truncated: false,
+          },
+        ],
+      });
+    }
+    if (/^\/workers\/\d+\/open$/.test(path) && method === "POST") {
+      this.log.opens.push(path);
+      return Response.json({ opened: true });
+    }
     return this.surface(method, path, url, request);
   }
 
@@ -734,6 +762,7 @@ class FakeDaemon {
     const opening = /^\/requests\/(\d+)\/open$/.exec(path)?.[1];
     if (opening && method === "POST") {
       d.opened.push(Number(opening));
+      this.log.opens.push(path);
       return json({ opened: true });
     }
     const answering = /^\/dots\/\w+\/requests\/(\d+)\/answer$/.exec(path)?.[1];
@@ -1132,6 +1161,18 @@ const launch = async (
 
 type App = Awaited<ReturnType<typeof launch>>;
 
+const openInboxPane = async (
+  { js, until }: Pick<App, "js" | "until">,
+  pane: "feed" | "needs" = "feed",
+) => {
+  await until(`!!document.querySelector("[data-open-inbox]")`, "the Inbox button");
+  await js(
+    `if (!document.querySelector("[data-open-feed]")) document.querySelector("[data-open-inbox]").click(); true`,
+  );
+  await until(`!!document.querySelector("[data-open-${pane}]")`, "the Inbox navigation");
+  await js(`document.querySelector("[data-open-${pane}]").click(), true`);
+};
+
 /** Runs a scenario and always closes the app; nothing may show or focus its window. */
 const scenario = async (
   name: string,
@@ -1379,6 +1420,38 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         "msg_reply/cccccccccccccccc",
       ]);
       expect(fake.log.activityReads).toBeGreaterThan(0);
+      fake.activity = {
+        state: "thinking",
+        tool: null,
+        label: null,
+        running: 0,
+        since: Date.now() - 65_000,
+        observedAt: Date.now(),
+      };
+      await until(`!!document.querySelector("[data-activity='thinking']")`, "the thinking bubble");
+      expect(
+        await js(`(() => {
+          const activity = document.querySelector("[data-activity='thinking']");
+          return {
+            role: activity.getAttribute("role"),
+            text: activity.textContent,
+            dots: activity.querySelectorAll(".typing-bubble[aria-hidden='true'] > span").length,
+            timer: !!activity.querySelector(".activity-time"),
+            title: activity.querySelector(".typing-bubble").title,
+          };
+        })()`),
+      ).toEqual({
+        role: "status",
+        text: "jojo is thinking",
+        dots: 3,
+        timer: false,
+        title: expect.stringMatching(/^jojo is thinking · 1:0\d$/),
+      });
+      fake.busy = false;
+      await until(
+        `!document.querySelector("[data-activity]")`,
+        "the idle dot to clear its activity",
+      );
     },
   );
 }, 60_000);
@@ -1741,6 +1814,42 @@ test("long history: anchored prepend, selection across messages, a detached wind
       fake.failOlder = false;
       await js(`t.click("Back to latest", document.querySelector("[data-older-error]"))`);
       await until(`t.count() === 50 && !document.querySelector("[data-older-error]")`, "recovery");
+      // Follow append and same-message growth from 24px above the end, but not while reading history.
+      const atEnd = `t.list().scrollHeight - t.list().scrollTop - t.list().clientHeight < 3`;
+      await js(`t.scroll(t.list().scrollHeight - t.list().clientHeight - 24), true`);
+      await delay(200);
+      const growing: FakeMessage = { id: "m700", kind: "dot", text: "Near-bottom reply" };
+      fake.messages.push(growing);
+      await until(`!!t.msg("m700") && ${atEnd}`, "the near-bottom append to follow");
+      growing.text += "\n\nGrowth while following".repeat(16);
+      await until(
+        `t.msg("m700")?.textContent.includes("Growth while following") && ${atEnd}`,
+        "same-message growth to follow",
+      );
+      await js(`t.scroll(t.list().scrollHeight - t.list().clientHeight - 600), true`);
+      await delay(200);
+      const reading = String(
+        await js(
+          `[...document.querySelectorAll("[data-message]")].find((row) => row.getBoundingClientRect().top >= t.list().getBoundingClientRect().top)?.dataset.message`,
+        ),
+      );
+      expect(reading).not.toBe("undefined");
+      const readingTop = Number(await js(`t.top(${JSON.stringify(reading)})`));
+      const readingCount = Number(await js(`t.count()`));
+      fake.messages.push({ id: "m701", kind: "dot", text: "Arrived while reading history" });
+      await until(`t.count() > ${readingCount}`, "the update while reading history");
+      await delay(200);
+      expect(
+        Math.abs(Number(await js(`t.top(${JSON.stringify(reading)})`)) - readingTop),
+      ).toBeLessThan(4);
+      expect(
+        await js(`t.list().scrollHeight - t.list().scrollTop - t.list().clientHeight > 48`),
+      ).toBe(true);
+      await until(`!!document.querySelector("[data-latest]")`, "the jump to latest control");
+      await js(`document.querySelector("[data-latest]").click(), true`);
+      await until(`!!t.msg("m701") && ${atEnd}`, "the jump to latest");
+      fake.messages.push({ id: "m702", kind: "dot", text: "Following resumed" });
+      await until(`!!t.msg("m702") && ${atEnd}`, "following after the jump to latest");
     },
   );
 }, 170_000);
@@ -1790,7 +1899,22 @@ test("changes to older messages settle by their own reads, stale reads can't und
       await press(".modal", "Delete");
       await until(`!t.msg("m5")`, "the delete");
       expect(fake.hidden.has("m5")).toBe(true);
-      await js(`document.querySelector(".chat-tools input[type=checkbox]").click(), true`);
+      expect(await js(`!!document.querySelector(".chat-tools input[type=checkbox]")`)).toBe(false);
+      await js(`t.click("Settings")`);
+      await until(`!!document.querySelector('[role="dialog"][aria-label="Settings"]')`, "Settings");
+      expect(
+        await js(
+          `document.querySelector('[role="dialog"][aria-label="Settings"] label').textContent`,
+        ),
+      ).toBe("Show deleted");
+      await js(
+        `document.querySelector('[role="dialog"][aria-label="Settings"] input[type=checkbox]').click(), t.click("Done"), true`,
+      );
+      await until(
+        `!document.querySelector('[role="dialog"][aria-label="Settings"]')`,
+        "Settings to close",
+      );
+      expect(await js(`document.activeElement.getAttribute("aria-label")`)).toBe("Settings");
       await until(
         `!!t.msg("m5") && !t.button("Restore", t.msg("m5")).disabled`,
         "Restore to be ready",
@@ -2422,6 +2546,19 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
         worker(3, "stopping"),
         worker(4, "done"),
       ];
+      fake.sessions = [
+        {
+          request: 9,
+          source: "threads",
+          worker: null,
+          sessionID: "ses_threads",
+          title: "Review session",
+          directory: "/work/jojo",
+          needs: [],
+          waiting: [],
+          answered: null,
+        },
+      ];
     },
     async ({ fake, js, until, state, menu, press }) => {
       await until(`!!t.msg("m3") && !!document.querySelector("[data-pending]")`, "the chat");
@@ -2437,11 +2574,13 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
         `!!document.querySelector(".toast")?.textContent.includes("Nothing was copied")`,
         "the copy refusal",
       );
-      await menu("m1", "Share…");
-      await until(
-        `!!document.querySelector(".toast")?.textContent.includes("nothing was shared")`,
-        "the share refusal",
-      );
+      await menu("m1");
+      expect(await js(`!!t.button("Share…", document.querySelector("[role=menu]"))`)).toBe(false);
+      await js(`t.key("Escape"), true`);
+      // Sharing remains covered through main's existing fake bridge, not removed UI.
+      expect(await js(`window.openDot.shareMessage("jojo", "m1", "ses_jojo")`)).toMatchObject({
+        ok: false,
+      });
       let recorded = (await state()).recorded;
       expect(recorded.clipboard).toEqual([]);
       expect(recorded.shares).toEqual([]);
@@ -2451,8 +2590,14 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
       await js(`t.msg("m1").querySelector("[data-failed]").click(), true`);
       await until(`t.msg("m1").querySelectorAll("button.thumb").length === 2`, "the retried image");
       await menu("m1", "Copy");
-      await menu("m1", "Share…");
-      await menu("m3", "Share…");
+      expect(await js(`window.openDot.shareMessage("jojo", "m1", "ses_jojo")`)).toEqual({
+        ok: true,
+        value: true,
+      });
+      expect(await js(`window.openDot.shareMessage("jojo", "m3", "ses_jojo")`)).toEqual({
+        ok: true,
+        value: true,
+      });
       for (let tick = 0; tick < 50 && (await state()).recorded.shares.length < 2; tick++)
         await delay(100);
       recorded = (await state()).recorded;
@@ -2472,6 +2617,26 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
         msg_p3: ["Cancel"],
         msg_p4: [],
       });
+      expect(
+        await js(`["msg_p1", "msg_p2", "msg_p4"].map((id) => {
+        const status = document.querySelector('[data-id="' + id + '"] [role=status]');
+        return { text: status.textContent.trim(), title: status.title, icon: !!status.querySelector("svg[aria-hidden='true']"), hiddenText: !!status.querySelector(".sr-only") };
+      })`),
+      ).toEqual([
+        { text: "Sending…", title: "Sending to OpenCode", icon: true, hiddenText: true },
+        {
+          text: "Sent",
+          title: "Sent to OpenCode. This does not mean delivered or read.",
+          icon: true,
+          hiddenText: true,
+        },
+        { text: "Confirming…", title: "", icon: false, hiddenText: false },
+      ]);
+      expect(
+        await js(
+          `[...document.querySelectorAll("[data-pending] button")].every((button) => !!button.getAttribute("aria-label") && !!button.querySelector("svg[aria-hidden='true']"))`,
+        ),
+      ).toBe(true);
 
       // A reply with an image shows its quote and thumbnail while pending, and copies its text.
       await menu("m2", "Reply");
@@ -2489,17 +2654,77 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
         ),
       ).toEqual({ quote: "jojo: The report", thumb: true, share: false });
       await js(`t.click("Copy", ${row})`);
+      expect(await js(`!!t.button("Copy", ${row}).querySelector("svg[aria-hidden='true']")`)).toBe(
+        true,
+      );
 
-      // Workers open once created and stop until done; a creating one can be stopped.
+      // Viewing a worker stays in-app, read-only, without replacing the main chat or its draft.
       const workers = await js(
-        `Object.fromEntries([...document.querySelectorAll("[data-worker]")].map((row) => [row.dataset.worker, [...row.querySelectorAll("button")].map((b) => b.textContent)]))`,
+        `Object.fromEntries([...document.querySelectorAll("[data-worker]")].map((row) => [row.dataset.worker, [...row.querySelectorAll("button")].map((b) => b.getAttribute("aria-label") ?? b.textContent)]))`,
       );
       expect(workers).toEqual({
-        1: ["Stop"],
-        2: ["Open", "Stop"],
-        3: ["Open", "Stop again"],
-        4: ["Open"],
+        1: ["View worker: Task 1", "Stop"],
+        2: ["View worker: Task 2", "Stop"],
+        3: ["View worker: Task 3", "Stop again"],
+        4: ["View worker: Task 4"],
       });
+      await js(
+        `t.type("Keep my draft"), document.querySelector('[data-worker="2"] .worker-select').click(), true`,
+      );
+      await until(
+        `!!document.querySelector("[data-worker-message='msg_worker'] strong")`,
+        "the worker transcript",
+      );
+      expect(
+        await js(`(() => {
+        const panel = document.querySelector("[data-worker-panel]");
+        return {
+          separate: !document.querySelector("main").contains(panel),
+          detail: [...panel.querySelectorAll("dd")].map((item) => item.textContent),
+          markdown: panel.querySelector("strong").textContent,
+          readonly: !panel.querySelector("textarea, input, [contenteditable=true]"),
+          draft: t.box().value,
+          chat: !!t.msg("m2"),
+          focused: document.activeElement.getAttribute("aria-label"),
+        };
+      })()`),
+      ).toEqual({
+        separate: true,
+        detail: ["running", "ses_w2", "/work/jojo"],
+        markdown: "the build",
+        readonly: true,
+        draft: "Keep my draft",
+        chat: true,
+        focused: "Close worker panel",
+      });
+      expect(fake.log.conversations).toContain("/workers/2/conversation");
+      expect(fake.log.opens).toEqual([]);
+      await js(`t.key("Escape"), true`);
+      await until(`!document.querySelector("[data-worker-panel]")`, "the panel to close on Escape");
+      expect(await js(`document.activeElement.getAttribute("aria-label")`)).toBe(
+        "View worker: Task 2",
+      );
+      await js(
+        `document.querySelector('[data-session="ses_threads"] .worker-select').click(), true`,
+      );
+      await until(
+        `document.querySelector("[data-worker-panel]")?.textContent.includes("ses_threads") === true`,
+        "the request session transcript",
+      );
+      expect(fake.log.conversations).toContain("/requests/9/conversation");
+      expect(fake.log.opens).toEqual([]);
+      await press("[data-worker-panel]", "Open in terminal");
+      for (let tick = 0; tick < 50 && !fake.log.opens.length; tick++) await delay(100);
+      expect(fake.log.opens).toEqual(["/requests/9/open"]);
+      await press("[data-worker-panel]", "Close worker panel");
+      await until(`!document.querySelector("[data-worker-panel]")`, "the close button");
+      expect(
+        await js(
+          `({ focus: document.activeElement.getAttribute("aria-label"), draft: t.box().value })`,
+        ),
+      ).toEqual({ focus: "View session: Review session", draft: "Keep my draft" });
+      expect(fake.log.posts).toHaveLength(1);
+      // A creating worker can still be stopped.
       await press('[data-worker="1"]', "Stop");
       await press(".modal", "Stop");
       for (let tick = 0; tick < 50 && !fake.log.stops.length; tick++) await delay(100);
@@ -2554,10 +2779,14 @@ test("Feed: dismiss and Clear all; a reply to two dots keeps the refused dot's t
       fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
     },
     async ({ fake, js, until, press, state }) => {
-      await until(`!!document.querySelector("[data-open-feed]")`, "the Feed button");
-      await js(`document.querySelector("[data-open-feed]").click(), true`);
+      await openInboxPane({ js, until });
+      expect(await js(`document.querySelector("[data-open-feed]").textContent`)).toBe("Activity");
+      expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
+        "Needs your action",
+      );
+      expect(await js(`!!document.querySelector("[data-inbox-count]")`)).toBe(false);
       await until(`document.querySelectorAll("[data-feed-item]").length === 3`, "three feed items");
-      await press('[data-feed-item="1"]', "Dismiss");
+      await press('[data-feed-item="1"]', "Dismiss Fix the build");
       await until(`!document.querySelector('[data-feed-item="1"]')`, "the dismissed item to go");
       await press('[data-feed-item="2"]', "Reply");
       await until(`!!document.querySelector('[data-reply="2"]')`, "the reply box");
@@ -2597,7 +2826,7 @@ test("Feed: dismiss and Clear all; a reply to two dots keeps the refused dot's t
         `document.querySelector('[data-reply="2"] textarea').focus(), t.key("Escape"), true`,
       );
       await until(`!document.querySelector('[data-pane="feed"]') && !!t.box()`, "the chat");
-      await js(`document.querySelector("[data-open-feed]").click(), true`);
+      await openInboxPane({ js, until });
       await until(`!!document.querySelector('[data-reply="2"]')`, "the kept reply");
       expect(await js(replyState(2))).toEqual(kept);
       // Sending again goes only to dio, which refuses again: jojo never gets it twice.
@@ -2657,7 +2886,7 @@ test("Feed: a receipt the chat's poll settles while the Feed is closed still set
     },
     async ({ fake, js, until, press, state }) => {
       const openFeed = async () => {
-        await js(`document.querySelector("[data-open-feed]").click(), true`);
+        await openInboxPane({ js, until });
         await until(`!!document.querySelector('[data-pane="feed"]')`, "the Feed");
       };
       const leaveFeed = async (id: number) => {
@@ -2693,7 +2922,6 @@ test("Feed: a receipt the chat's poll settles while the Feed is closed still set
         throw new Error("The receipt poll never settled the send.");
       };
 
-      await until(`!!document.querySelector("[data-open-feed]")`, "the Feed button");
       await openFeed();
       await until(`document.querySelectorAll("[data-feed-item]").length === 3`, "three feed items");
       // Saved: between the unknown answer and its receipt the owner changes the text and adds an
@@ -2784,7 +3012,7 @@ test("Memory: a new note, observation and feed trigger survive Escape, the Feed 
       await until(`!document.querySelector('[data-pane="memory"]') && !!t.box()`, "the chat");
       await reopen();
       // The Feed.
-      await js(`document.querySelector("[data-open-feed]").click(), true`);
+      await openInboxPane({ js, until });
       await until(`!!document.querySelector('[data-pane="feed"]')`, "the Feed");
       await reopen();
       // Another dot, then back.
@@ -3602,6 +3830,23 @@ test("avatars: a failed read is asked for again, a deleted one clears, and Comma
       await until(shown, "the new avatar");
       // Memory opens over the chat and Escape goes back with the draft as it was.
       await until(`!!t.box()`, "the chat");
+      expect(
+        await js(`document.querySelector(".chat-head").textContent.includes("Second brain.")`),
+      ).toBe(false);
+      await js(`document.querySelector('[aria-label="About jojo"]').click(), true`);
+      await until(
+        `!!document.querySelector('[role="dialog"][aria-label="About jojo"]')`,
+        "the dot information",
+      );
+      expect(
+        await js(`document.querySelector('[role="dialog"][aria-label="About jojo"]').textContent`),
+      ).toContain("Second brain.\n\nStatus: Idle\nWorkers: 0\nNeeds you: 0");
+      await js(`t.key("Escape"), true`);
+      await until(
+        `!document.querySelector('[role="dialog"][aria-label="About jojo"]')`,
+        "the dot information to close",
+      );
+      expect(await js(`document.activeElement.getAttribute("aria-label")`)).toBe("About jojo");
       await js(`t.fill("textarea", "half a thought"), true`);
       await js(`t.box().focus(), t.cmd("2"), true`);
       await until(`!!document.querySelector('[data-pane="memory"]')`, "Memory");
@@ -3891,9 +4136,11 @@ test("request cards: answered from the chat and Needs you, Always only after its
       expect(await js(`document.querySelector('[data-request="1"] code').textContent`)).toBe(
         "<b>rm -rf build</b>",
       );
-      expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
-        "Needs you (6)",
+      expect(await js(`document.querySelector("[data-inbox-count]").textContent`)).toBe("6");
+      expect(await js(`document.querySelector("[data-open-inbox]").title`)).toBe(
+        "Inbox · 6 requests need you",
       );
+      expect(await js(`!!document.querySelector("[data-open-needs]")`)).toBe(false);
       // A sensitive card offers only its terminal.
       expect(
         await js(
@@ -3935,7 +4182,7 @@ test("request cards: answered from the chat and Needs you, Always only after its
         body: { revision: "rev_4", answer: { decision: "always" }, confirmedAlways: true },
       });
       // Needs you lists the worker's question; Submit sends the whole form once it's complete.
-      await js(`document.querySelector("[data-open-needs]").click(), true`);
+      await openInboxPane({ js, until }, "needs");
       await until(`!!document.querySelector('[data-needs-pane] [data-request="2"]')`, "Needs you");
       await press('[data-request="2"]', "Submit");
       await until(
@@ -4009,10 +4256,10 @@ test("request cards: Show more reaches every pending card, in a dot's chat and i
     },
     async ({ js, until, press, fake }) => {
       await until(
-        `document.querySelector("[data-open-needs]")?.textContent === "Needs you (1000+)"`,
+        `document.querySelector("[data-inbox-count]")?.textContent === "1000+"`,
         "the first thousand counted, with more to come",
       );
-      await js(`document.querySelector("[data-open-needs]").click(), true`);
+      await openInboxPane({ js, until }, "needs");
       await until(
         `document.querySelectorAll("[data-needs-pane] [data-request]").length === 1000`,
         "a thousand cards in Needs you",
@@ -4035,14 +4282,15 @@ test("request cards: Show more reaches every pending card, in a dot's chat and i
       await delay(4_500);
       expect(await js(`!!document.querySelector('[data-request="1001"]')`)).toBe(true);
       // Needs you shows every card, and answers the last one.
-      await js(`document.querySelector("[data-open-needs]").click(), true`);
+      await openInboxPane({ js, until }, "needs");
       await until(
         `document.querySelectorAll("[data-needs-pane] [data-request]").length === 1001`,
         "every card in Needs you",
       );
       expect(await js(`document.querySelector("[data-open-needs]").textContent`)).toBe(
-        "Needs you (1001)",
+        "Needs your action (1001)",
       );
+      expect(await js(`document.querySelector("[data-inbox-count]").textContent`)).toBe("1001");
       await press('[data-needs-pane] [data-request="1001"]', "Allow once");
       await until(`!document.querySelector('[data-request="1001"]')`, "the last card answered");
       expect(fake.data.answers).toMatchObject([{ id: 1001 }]);

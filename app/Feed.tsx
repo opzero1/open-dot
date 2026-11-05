@@ -20,7 +20,7 @@ import {
   shortAgo,
   sourceNames,
 } from "./surfaces";
-import { bridge, LocalThumb } from "./ui";
+import { bridge, IconButton, LocalThumb } from "./ui";
 
 type ReplyBox = FeedReply<DraftImage>;
 
@@ -238,7 +238,7 @@ export const Feed = ({
   return (
     <div className="pane feed" aria-label="Feed" data-pane="feed">
       <header className="pane-head">
-        <h2>Feed</h2>
+        <h2>Activity</h2>
         <div className="pane-tools">
           {items.length ? (
             <span className="count" data-feed-count>
@@ -274,20 +274,19 @@ export const Feed = ({
                 ) : null}
                 <div className="item-actions">
                   {item.url ? (
-                    <button type="button" onClick={() => void bridge.openLink(item.url ?? "")}>
-                      Open
-                    </button>
+                    <IconButton
+                      icon="open"
+                      label="Open"
+                      title="Open in browser"
+                      onClick={() => void bridge.openLink(item.url ?? "")}
+                    />
                   ) : null}
-                  <button type="button" onClick={() => startReply(item)}>
-                    Reply
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Dismiss ${item.title}`}
+                  <IconButton icon="reply" label="Reply" onClick={() => startReply(item)} />
+                  <IconButton
+                    icon="close"
+                    label={`Dismiss ${item.title}`}
                     onClick={() => void dismiss(item)}
-                  >
-                    Dismiss
-                  </button>
+                  />
                 </div>
                 {editor(item.id)}
               </li>
@@ -309,13 +308,14 @@ export const Feed = ({
                   <span className="note">→ {(item.handedTo ?? []).join(", ")}</span>
                   <div className="item-actions">
                     {item.url ? (
-                      <button type="button" onClick={() => void bridge.openLink(item.url ?? "")}>
-                        Open
-                      </button>
+                      <IconButton
+                        icon="open"
+                        label="Open"
+                        title="Open in browser"
+                        onClick={() => void bridge.openLink(item.url ?? "")}
+                      />
                     ) : null}
-                    <button type="button" onClick={() => startReply(item)}>
-                      Reply
-                    </button>
+                    <IconButton icon="reply" label="Reply" onClick={() => startReply(item)} />
                   </div>
                   {editor(item.id)}
                 </li>
@@ -465,14 +465,13 @@ const ReplyEditor = ({
         <button type="button" onClick={onCancel} disabled={box.sending}>
           {results.length ? "Discard" : "Cancel"}
         </button>
-        <button
-          type="button"
+        <IconButton
+          icon="send"
+          label={box.sending ? "Sending…" : "Send"}
           className="send"
           disabled={box.sending || !picked.length || !box.text.trim()}
           onClick={onSend}
-        >
-          {box.sending ? "Sending…" : "Send"}
-        </button>
+        />
       </div>
     </div>
   );

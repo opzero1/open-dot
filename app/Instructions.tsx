@@ -3,7 +3,7 @@
 // dots and panes; nothing discards it without asking, and nothing is saved or retried on its own.
 import { useEffect } from "react";
 import { type InstructionsState, instructionsLimit, instructionsTiming } from "./surfaces";
-import { type AskOwner, bridge } from "./ui";
+import { type AskOwner, bridge, IconButton } from "./ui";
 
 export const Instructions = ({
   dot,
@@ -78,9 +78,7 @@ export const Instructions = ({
               Unsaved changes
             </span>
           ) : null}
-          <button type="button" disabled={!!busy} onClick={reload}>
-            Reload
-          </button>
+          <IconButton icon="reload" label="Reload" disabled={!!busy} onClick={reload} />
           <button
             type="button"
             disabled={!state.canRevert}
@@ -118,14 +116,13 @@ export const Instructions = ({
           >
             Cancel
           </button>
-          <button
-            type="button"
+          <IconButton
+            icon="save"
+            label={busy === "saving" ? "Saving…" : "Save"}
             className="send"
             disabled={!state.canSave}
             onClick={() => void save(false)}
-          >
-            {busy === "saving" ? "Saving…" : "Save"}
-          </button>
+          />
         </div>
       </header>
       <p className="note">{instructionsTiming}</p>

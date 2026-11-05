@@ -3068,7 +3068,39 @@ const openSession = async (
   });
 };
 
-/** `POST /workers/<id>/open` and `POST /workers/<id>/stop`. */
+const sessionConversation = (
+  target: { title: string; sessionID: string; directory: string; state: string },
+  layer: Layer.Layer<OpenCode, OpenCodeError>,
+) =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const oc = yield* OpenCode;
+      const page = yield* oc.messagePage(target.sessionID, 40);
+      return Response.json(
+        {
+          ...target,
+          more: !!page.next,
+          messages: page.entries.map((entry) => ({
+            id: entry.id,
+            role: entry.role,
+            text: entry.text.slice(0, 8_000),
+            time: entry.time,
+            tools: entry.tools.slice(0, 20).map((tool) => tool.slice(0, 200)),
+            attachments: entry.files.length,
+            truncated: entry.text.length > 8_000 || entry.tools.length > 20,
+          })),
+        },
+        { headers: { "cache-control": "no-store" } },
+      );
+    }).pipe(
+      Effect.provide(layer),
+      Effect.catch(() =>
+        Effect.succeed(error(503, "Couldn't read this session's recent messages.")),
+      ),
+    ),
+  );
+
+/** Reads a worker's recent conversation, or opens/stops it on the owner's request. */
 const workerRoute = (
   db: Db,
   request: Request,
@@ -3078,9 +3110,11 @@ const workerRoute = (
 ): Promise<Response> => {
   const [rawID, action, ...extra] = path;
   if (
-    request.method !== "POST" ||
     extra.length ||
-    (action !== "open" && action !== "stop") ||
+    !(
+      (request.method === "POST" && (action === "open" || action === "stop")) ||
+      (request.method === "GET" && action === "conversation")
+    ) ||
     rawID === undefined ||
     !positive.test(rawID) ||
     !Number.isSafeInteger(Number(rawID))
@@ -3089,6 +3123,19 @@ const workerRoute = (
   const id = Number(rawID);
   const worker = db.select().from(workers).where(eq(workers.id, id)).get();
   if (!worker) return Promise.resolve(error(404, "There's no such worker."));
+  if (action === "conversation") {
+    if (worker.state === "creating")
+      return Promise.resolve(error(409, "Its session isn't ready yet. Try again in a moment."));
+    return sessionConversation(
+      {
+        title: worker.task,
+        sessionID: worker.sessionID,
+        directory: worker.directory,
+        state: worker.outcome ?? worker.state,
+      },
+      layer,
+    );
+  }
   if (action === "open") {
     if (worker.state === "creating")
       return Promise.resolve(error(409, "Its session isn't ready yet. Try again in a moment."));
@@ -3134,12 +3181,20 @@ const workerRoute = (
  * `POST /requests/<id>/open` opens the request's session, such as a Threads worker's, in a new
  * terminal window. Threads keeps that worker's lifecycle, so there is no stop here.
  */
-const requestRoute = (db: Db, request: Request, path: string[], run: Run): Promise<Response> => {
+const requestRoute = (
+  db: Db,
+  request: Request,
+  path: string[],
+  run: Run,
+  layer: Layer.Layer<OpenCode, OpenCodeError>,
+): Promise<Response> => {
   const [rawID, action, ...extra] = path;
   if (
-    request.method !== "POST" ||
     extra.length ||
-    action !== "open" ||
+    !(
+      (request.method === "POST" && action === "open") ||
+      (request.method === "GET" && action === "conversation")
+    ) ||
     rawID === undefined ||
     !positive.test(rawID) ||
     !Number.isSafeInteger(Number(rawID))
@@ -3151,6 +3206,16 @@ const requestRoute = (db: Db, request: Request, path: string[], run: Run): Promi
     .where(eq(requests.id, Number(rawID)))
     .get();
   if (!row) return Promise.resolve(error(404, "There's no such request."));
+  if (action === "conversation")
+    return sessionConversation(
+      {
+        title: row.title ?? row.sessionID,
+        sessionID: row.sessionID,
+        directory: row.directory,
+        state: row.state,
+      },
+      layer,
+    );
   return openSession({ ...row, label: `request #${row.id}` }, run, process.env);
 };
 
@@ -3345,7 +3410,7 @@ export const api = (
       return Promise.resolve(
         request.method === "GET" ? pendingRoute(db, request) : error(404, "Not found"),
       );
-    if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run);
+    if (path[0] === "requests") return requestRoute(db, request, path.slice(1), run, layer);
     if (path[0] === "dots" && path[2] === "requests" && path.length > 3)
       return ownerRequestRoute(db, request, path).catch((cause) => {
         console.error(`Requests: ${cause instanceof Error ? cause.name : "failed"}`);

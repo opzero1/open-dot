@@ -45,6 +45,17 @@ const toolCall = {
 } as const;
 const workCounts = { commands: "n", edits: "n", edited: "n", failed: "n", total: "n" } as const;
 
+const workerConversation = {
+  title: "s",
+  sessionID: "s",
+  directory: "s",
+  state: "s",
+  more: "b",
+  messages: [
+    { id: "s", role: "s", text: "s", time: "n", tools: ["s"], attachments: "n", truncated: "b" },
+  ],
+} as const;
+
 /** A work log as the renderer reads it, whether from a page or on its own. */
 export const workLogShape = {
   "anchor?": "s",
@@ -276,6 +287,8 @@ export const shapes: Record<Operation, Shape> = {
     "since?": "n",
     observedAt: "n",
   },
+  workerConversation,
+  requestConversation: workerConversation,
   work: { calls: [toolCall], counts: workCounts, complete: "b", "more?": "s" },
   toolDetail: {
     ...toolCall,

@@ -541,6 +541,88 @@ test("a finished worker can't be stopped, and unknown workers and bad tokens are
   expect(runs).toEqual([]);
 });
 
+test("a worker conversation reads only its saved session, bounded and without writes or attachment bytes", async () => {
+  const session = running();
+  const before = worker();
+  const queued = db.select().from(outbox).all();
+  fake.state.history.set(
+    session,
+    Array.from({ length: 45 }, (_, index) => ({
+      id: `msg_history${index}`,
+      role: "assistant" as const,
+      text: "x".repeat(8_001),
+      tools: Array.from({ length: 21 }, () => "t".repeat(201)),
+      files: [{ mime: "image/png", name: "private.png", data: "PRIVATE_ATTACHMENT_BYTES" }],
+      time: index,
+    })),
+  );
+  fake.state.history.set("ses_jojo", [
+    { id: "msg_wrong", role: "user", text: "Wrong session", tools: [], files: [], time: 0 },
+  ]);
+  expect((await call("/workers/1/conversation", "GET", "wrong")).status).toBe(401);
+  expect(fake.state.pageReads).toEqual([]);
+  const response = await call("/workers/1/conversation?sessionID=ses_jojo", "GET");
+  expect(response.status).toBe(200);
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  const body = (await response.json()) as {
+    sessionID: string;
+    more: boolean;
+    messages: {
+      id: string;
+      role: string;
+      text: string;
+      tools: string[];
+      attachments: number;
+      truncated: boolean;
+      time: number;
+    }[];
+  };
+  expect(body).toMatchObject({
+    title: "Task 1.",
+    sessionID: session,
+    directory: "/work/jojo",
+    state: "running",
+    more: true,
+  });
+  expect(body.messages).toHaveLength(40);
+  expect(body.messages[0]?.id).toBe("msg_history5");
+  expect(body.messages.at(-1)).toEqual({
+    id: "msg_history44",
+    role: "assistant",
+    text: "x".repeat(8_000),
+    tools: Array.from({ length: 20 }, () => "t".repeat(200)),
+    attachments: 1,
+    truncated: true,
+    time: 44,
+  });
+  expect(JSON.stringify(body)).not.toContain("PRIVATE_ATTACHMENT_BYTES");
+  expect(JSON.stringify(body)).not.toContain("private.png");
+  expect((await call("/workers/99/conversation", "GET")).status).toBe(404);
+  db.update(workers).set({ state: "creating" }).run();
+  expect((await call("/workers/1/conversation", "GET")).status).toBe(409);
+  db.update(workers).set({ state: "running" }).run();
+  const down = Layer.effect(OpenCode, Effect.fail(new OpenCodeError({ message: "Not running" })));
+  expect(
+    (
+      await api(
+        db,
+        "secret",
+        down,
+        run,
+      )(
+        new Request("http://127.0.0.1/workers/1/conversation", {
+          headers: { authorization: "Bearer secret" },
+        }),
+      )
+    ).status,
+  ).toBe(503);
+  expect(worker()).toEqual(before);
+  expect(db.select().from(outbox).all()).toEqual(queued);
+  expect(fake.state.prompted).toEqual([]);
+  expect(fake.state.interrupted).toEqual([]);
+  expect(runs).toEqual([]);
+});
+
 test("open runs the configured binary on the session in a new terminal window", async () => {
   running();
   process.env.OPEN_DOT_TERMINAL = "terminal";
