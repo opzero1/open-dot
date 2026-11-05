@@ -54,7 +54,8 @@ import {
   logCounts,
   turnCalls,
   workSummary,
-  groupActivity,
+  groupTurns,
+  type WorkState,
 } from "../chat";
 
 test("worker titles remove only anchored work attribution and preserve meaningful names and casing", () => {
@@ -360,34 +361,215 @@ const message = (id: string, fields: Partial<MessageView> = {}): MessageView => 
   ...fields,
 });
 
-test("activity grouping keeps hidden, non-assistant and session boundaries and an info-only fallback", () => {
-  const info = { text: "", tools: ["dot_update"] };
-  const grouped = groupActivity(
-    [
-      message("first"),
-      message("update1", info),
-      message("last"),
-      message("update2", info),
-      message("hidden", { hidden: true }),
-      message("orphan1", info),
-      message("orphan2", info),
-      message("owner", { kind: "owner" }),
-      message("after-owner", info),
-      message("other-session", { ...info, sessionID: "ses_b" }),
-    ],
-    (item) => (item.kind === "dot" && !item.hidden ? item.sessionID : undefined),
-    (item) => item.kind === "dot" && !item.hidden && !item.text.trim(),
+const onlyActivity = (item: MessageView) =>
+  item.kind === "dot" && !item.hidden && !item.text.trim();
+const shape = (rows: ReturnType<typeof groupTurns>["rows"]) =>
+  rows.map((row) =>
+    row.kind === "message"
+      ? [
+          row.message.id,
+          row.sources.filter((source) => source !== row.message).map((source) => source.id),
+        ]
+      : [`log after ${row.after}`, []],
   );
+const turnLog = (
+  anchor: string | null,
+  turn: string | undefined,
+  open = false,
+  ids: string[] = [],
+) => ({
+  anchor,
+  ...(turn ? { turn } : {}),
+  calls: ids.map((id) => ({ ...editCall(id, `${id}.ts`), messageID: id })),
+  counts: { commands: 0, edits: 0, edited: 0, failed: 0, total: ids.length },
+  complete: true,
+  open,
+  more: null,
+});
+const state = (
+  turns: [string, string][],
+  logs: ReturnType<typeof turnLog>[] = [],
+  open?: ReturnType<typeof turnLog>,
+): WorkState => ({
+  sessionID: "ses_a",
+  logs: new Map(logs.flatMap((log) => (log.anchor ? [[log.anchor, log] as const] : []))),
+  open,
+  turns: new Map(turns),
+});
+
+const turn = (ids: string[], value: string) => ids.map((id): [string, string] => [id, value]);
+
+test("a turn's log goes once to its newest reply, and a running turn moves from the bubble to its reply", () => {
+  const info = { text: "", tools: ["bash"] };
+  // The daemon named the last dot_ step; the turn's newest visible reply still shows the log.
+  const done = turnLog("a2", "after:i1", false, ["a1", "a2"]);
+  const messages = [
+    // A run whose start the read couldn't prove: its own key, never joined to the next turn.
+    message("y1", info),
+    message("m1", { kind: "owner" }),
+    message("p1"),
+    message("a1", info),
+    message("p2"),
+    message("a2", info),
+    message("h1", { hidden: true }),
+    message("m2", { kind: "owner" }),
+    message("a3", info),
+  ];
+  const running = turnLog("a3", "after:i2", true, ["a3"]);
+  const keys = [
+    ...turn(["y1"], "head:y1"),
+    ...turn(["m1", "p1", "a1", "p2", "a2", "h1"], "after:i1"),
+    ...turn(["m2", "a3"], "after:i2"),
+  ];
+  const busy = groupTurns(messages, state(keys, [done], running), true, onlyActivity);
+  expect(shape(busy.rows)).toEqual([
+    ["y1", []],
+    ["m1", []],
+    ["p1", []],
+    ["p2", ["a1", "a2"]],
+    ["h1", []],
+    ["m2", []],
+  ]);
+  const logs = busy.rows.flatMap((row) =>
+    row.kind === "message" && row.log ? [row.message.id] : [],
+  );
+  expect(logs).toEqual(["p2"]);
+  expect(busy.bubble.log).toBe(running);
+  expect(busy.bubble.steps.map((step) => step.id)).toEqual(["a3"]);
+  // Its reply arrives: the steps and the running log go beneath it, and the bubble empties.
+  const replied = groupTurns(
+    [...messages, message("p3")],
+    state([...keys, ["p3", "after:i2"]], [done], running),
+    true,
+    onlyActivity,
+  );
+  expect(shape(replied.rows).at(-1)).toEqual(["p3", ["a3"]]);
+  expect(replied.rows.at(-1)).toMatchObject({ log: running });
+  expect(replied.bubble).toEqual({ log: undefined, steps: [] });
+  // Not running any more and still no reply: one compact row, its newest step, holds the log.
+  const idle = groupTurns(messages, state(keys, [done], running), false, onlyActivity);
+  expect(shape(idle.rows).at(-1)).toEqual(["a3", []]);
+  expect(idle.rows.at(-1)).toMatchObject({ log: running });
+});
+
+const sourceIDs = (rows: ReturnType<typeof groupTurns>["rows"]) =>
+  rows.map((row) =>
+    row.kind === "message"
+      ? [row.message.id, row.sources.map((source) => source.id)]
+      : [`log after ${row.after}`, []],
+  );
+
+test("a turn's replies with their own tools show them once, under the newest reply", () => {
+  const info = { text: "", tools: ["bash"] };
+  const messages = [
+    message("s0", info),
+    message("p1", { tools: ["read"] }),
+    message("n1", { kind: "notice" }),
+    message("s1", info),
+    message("p2", { tools: ["edit"] }),
+    message("s2", info),
+    message("legacy", { tools: ["grep"] }),
+  ].map((item, time) => ({ ...item, time }));
+  const keys = turn(["s0", "p1", "n1", "s1", "p2", "s2"], "after:i1");
+  const expected = [
+    ["p1", []],
+    ["n1", []],
+    ["p2", ["s0", "p1", "s1", "p2", "s2"]],
+    // Without a key a reply keeps its own tools, and nothing joins it.
+    ["legacy", ["legacy"]],
+  ];
+  expect(sourceIDs(groupTurns(messages, state(keys), false, onlyActivity).rows)).toEqual(expected);
+  // With the turn's log the sources stay the same; the row shows the log instead of their notes.
+  const logged = groupTurns(
+    messages,
+    state(keys, [turnLog("p2", "after:i1", false, ["s0", "p1", "s1", "p2", "s2"])]),
+    false,
+    onlyActivity,
+  );
+  expect(sourceIDs(logged.rows)).toEqual(expected);
   expect(
-    grouped.map(({ message: item, activity }) => [item.id, activity.map((source) => source.id)]),
-  ).toEqual([
-    ["first", []],
-    ["last", ["update1", "update2"]],
-    ["hidden", []],
-    ["orphan1", ["orphan2"]],
-    ["owner", []],
-    ["after-owner", []],
-    ["other-session", []],
+    logged.rows.flatMap((row) => (row.kind === "message" && row.log ? [row.message.id] : [])),
+  ).toEqual(["p2"]);
+});
+
+test("without turn keys nothing is joined, and an input's log gets a row of its own", () => {
+  const info = { text: "", tools: ["bash"] };
+  const grouped = groupTurns(
+    [
+      message("o", { kind: "owner" }),
+      message("b", info),
+      message("c", info),
+      message("p"),
+      message("a", info),
+      message("e", { text: "" }),
+      message("other", { ...info, sessionID: "ses_b" }),
+    ],
+    state([], [turnLog("o", undefined, false, ["b"]), turnLog("p", undefined, false, ["a"])]),
+    false,
+    onlyActivity,
+  );
+  // b and a are listed in a shown log; c is listed nowhere; e has nothing to show.
+  expect(shape(grouped.rows)).toEqual([
+    ["o", []],
+    ["log after o", []],
+    ["c", []],
+    ["p", []],
+    ["other", []],
+  ]);
+  expect(
+    grouped.rows.find((row) => row.kind === "message" && row.message.id === "o"),
+  ).toMatchObject({
+    log: undefined,
+  });
+  expect(
+    grouped.rows.find((row) => row.kind === "message" && row.message.id === "p"),
+  ).toMatchObject({
+    log: { anchor: "p" },
+  });
+});
+
+test("execution info belongs once to newest prose across same-turn steers and notices", () => {
+  const info = { text: "", tools: ["bash"] };
+  // These keys are supplied by idle-delimited history, not inferred from adjacent rows or logs.
+  const turns = new Map([
+    ...["m0", "a1", "n1", "p1", "a2", "s1", "a3", "p2", "a4", "e1"].map(
+      (id) => [id, "start"] as const,
+    ),
+    ...["m1", "a5"].map((id) => [id, "after:idle1"] as const),
+    ...["x1", "px"].map((id) => [id, "head:x1"] as const),
+  ]);
+  const grouped = groupTurns(
+    [
+      message("m0", { kind: "owner" }),
+      message("a1", info),
+      message("n1", { kind: "notice" }),
+      message("p1"),
+      message("a2", info),
+      message("s1", { kind: "owner" }),
+      message("a3", info),
+      message("p2"),
+      message("a4", info),
+      message("e1", { text: "" }),
+      message("m1", { kind: "owner" }),
+      message("a5", info),
+      message("x1", info),
+      message("px"),
+    ].map((item, time) => ({ ...item, time })),
+    { sessionID: "ses_a", logs: new Map(), open: undefined, turns },
+    false,
+    onlyActivity,
+  );
+  const actual = shape(grouped.rows);
+  console.log("EXECUTION_GROUPING_READBACK", JSON.stringify(actual));
+  expect(actual).toEqual([
+    ["m0", []],
+    ["n1", []],
+    ["p1", []],
+    ["s1", []],
+    ["p2", ["a1", "a2", "a3", "a4"]],
+    ["m1", []],
+    ["a5", []],
+    ["px", ["x1"]],
   ]);
 });
 
@@ -749,6 +931,118 @@ describe("work log", () => {
     );
     expect(fresh.logs.size).toBe(0);
     expect(pageWork({})).toEqual([]);
+  });
+
+  test("a refreshed same-turn log wins even when its existing anchor has an earlier insertion", () => {
+    const messages = [
+      message("a1", { text: "", tools: ["edit"] }),
+      message("p1"),
+      message("a2", { text: "", tools: ["edit"] }),
+      message("p2"),
+      message("a3", { text: "", tools: ["edit"] }),
+    ];
+    const loaded = new Set(messages.map(({ id }) => id));
+    const turns = Object.fromEntries(messages.map(({ id }) => [id, "after:i1"]));
+    const snapshot = (anchor: string, callMessages: string[]) => ({
+      sessionID: "ses_a",
+      messages,
+      turns,
+      work: [turnLog(anchor, "after:i1", false, callMessages)],
+    });
+    // Partial-window reads can name different anchors for the same proven turn. Keep both
+    // messages loaded, then refresh the first anchor: Map.set must not make insertion order
+    // decide which turn snapshot the canonical reply displays.
+    const first = mergeWork(undefined, snapshot("p1", ["a1"]), true, loaded);
+    const second = mergeWork(first, snapshot("p2", ["a1", "a2"]), true, loaded);
+    const refreshed = mergeWork(second, snapshot("p1", ["a1", "a2", "a3"]), true, loaded);
+    const grouped = groupTurns(messages, refreshed, false, onlyActivity);
+    const canonical = grouped.rows.find((row) => row.kind === "message" && row.message.id === "p2");
+    const shown = canonical?.kind === "message" ? canonical.log : undefined;
+    console.log(
+      "EXECUTION_MERGE_FRESHNESS_READBACK",
+      JSON.stringify({
+        retained: [...refreshed.logs].map(([anchor, kept]) => ({
+          anchor,
+          turn: kept.turn,
+          calls: kept.calls.map((call) => [call.messageID, call.callID]),
+          total: kept.counts.total,
+        })),
+        canonical: shown
+          ? {
+              anchor: shown.anchor,
+              calls: shown.calls.map((call) => [call.messageID, call.callID]),
+              total: shown.counts.total,
+            }
+          : null,
+      }),
+    );
+    expect(refreshed.logs.get("p1")?.counts.total).toBe(3);
+    expect(shown?.calls.map((call) => call.messageID)).toEqual(["a1", "a2", "a3"]);
+    expect(shown?.counts.total).toBe(3);
+  });
+
+  test("only logs of the same proven turn replace each other", () => {
+    const loaded = new Set(["p1", "p2", "p3"]);
+    const take = (
+      current: WorkState | undefined,
+      logs: ReturnType<typeof turnLog>[],
+      latest = true,
+    ) => mergeWork(current, { sessionID: "ses_a", work: logs }, latest, loaded);
+    // Without keys, as from an older daemon, each anchor keeps its own log.
+    const legacy = take(take(undefined, [turnLog("p1", undefined)]), [turnLog("p2", undefined)]);
+    expect([...legacy.logs.keys()]).toEqual(["p1", "p2"]);
+    // Unproven heads are different turns, however close.
+    const heads = take(take(undefined, [turnLog("p1", "head:x")]), [turnLog("p2", "head:y")]);
+    expect([...heads.logs.keys()]).toEqual(["p1", "p2"]);
+    // A running turn's open log gives way to its own completed log, not to another turn's.
+    const running = take(undefined, [turnLog("p3", "after:i2", true)]);
+    expect(take(running, [turnLog("p1", "after:i1")], false).open?.turn).toBe("after:i2");
+    expect(take(running, [turnLog("p3", "after:i2")], false).open).toBeUndefined();
+    const completed = take(undefined, [turnLog("p1", "after:i1")]);
+    const reopened = take(completed, [turnLog("p2", "after:i1", true)]);
+    expect(reopened.logs.size).toBe(0);
+    expect(reopened.open?.anchor).toBe("p2");
+    const ignored = take(completed, [turnLog("p2", "after:i1", true)], false);
+    expect([...ignored.logs.keys()]).toEqual(["p1"]);
+    expect(ignored.open).toBeUndefined();
+    // Another session starts over.
+    expect(mergeWork(heads, { sessionID: "ses_b", work: [] }, true, loaded).logs.size).toBe(0);
+  });
+
+  test("turn keys come from the newest read that showed the message, and only well-formed", () => {
+    const shown = [message("m1"), message("m2"), message("m3")];
+    const first = mergeWork(
+      undefined,
+      {
+        sessionID: "s",
+        work: [],
+        messages: shown,
+        turns: { m1: "start", m2: "start", m3: 7 } as never,
+      },
+      true,
+      new Set(["m1", "m2", "m3"]),
+    );
+    expect([...first.turns]).toEqual([
+      ["m1", "start"],
+      ["m2", "start"],
+    ]);
+    // An older daemon's page places nothing: the messages it shows lose their keys.
+    const older = mergeWork(
+      first,
+      { sessionID: "s", work: [], messages: [message("m2")] },
+      true,
+      new Set(["m1", "m2"]),
+    );
+    expect([...older.turns]).toEqual([["m1", "start"]]);
+    // A running turn is the open log, whatever message the daemon named.
+    const running = mergeWork(
+      older,
+      { sessionID: "s", work: [{ ...log("m1", 1), open: true }] },
+      true,
+      new Set(["m1"]),
+    );
+    expect(running.open?.anchor).toBe("m1");
+    expect(running.logs.size).toBe(0);
   });
 
   test("activity lines, timers and long output", () => {

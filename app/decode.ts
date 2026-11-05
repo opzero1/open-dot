@@ -59,6 +59,7 @@ const workerConversation = {
 /** A work log as the renderer reads it, whether from a page or on its own. */
 export const workLogShape = {
   "anchor?": "s",
+  "turn?": "s",
   calls: [toolCall],
   counts: workCounts,
   complete: "b",

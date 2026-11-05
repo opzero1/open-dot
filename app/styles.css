@@ -131,6 +131,15 @@ button:disabled {
   min-width: 0;
 }
 
+/*
+ * Open details take the row's width, not their content's: a long unbroken command or diff line
+ * would otherwise widen the line past the row. Their content wraps or scrolls inside, and the
+ * whole panel (`.execution-content`, contained inline) scrolls past a bounded height.
+ */
+.message > .meta:has(> .execution-details > .execution-content) {
+  align-self: stretch;
+}
+
 .typing > .execution-details > .icon-button,
 .typing > .stop-session {
   margin-left: 6px;
@@ -152,6 +161,10 @@ button:disabled {
   padding: var(--execution-padding);
   border: var(--execution-border) solid var(--line);
   border-radius: var(--execution-radius);
+  contain: inline-size;
+  max-height: min(60vh, 560px);
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .execution-content .tool-text pre {

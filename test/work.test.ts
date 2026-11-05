@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DateTime } from "effect";
-import { api, groupWork, workCounts } from "../src/api";
+import { api, groupWork, turnKeys, workCounts } from "../src/api";
 import { type Db, openDatabase } from "../src/db";
 import { type ToolCall, toolCall, toolDetail, type WorkItem } from "../src/opencode";
 import { dots } from "../src/schema";
@@ -188,6 +188,88 @@ const message = (
 });
 const idle = (id: string): WorkItem => ({ type: "idle", id });
 
+test("execution info never anchors a completed tool-only turn on an owner steer", () => {
+  const result = groupWork(
+    [
+      {
+        items: [
+          message("owner", "user", true),
+          message("tool_before", "assistant", false, [call("tool_before", "c1")]),
+          message("owner_steer", "user", true),
+          message("tool_after", "assistant", false, [call("tool_after", "c2")]),
+          idle("idle_done"),
+        ],
+        next: undefined,
+      },
+    ],
+    { head: "start", latest: true },
+  );
+  console.log("EXECUTION_ANCHOR_READBACK", JSON.stringify(result));
+  expect(result).toHaveLength(1);
+  expect(result[0]?.calls.map(({ messageID, callID }) => [messageID, callID])).toEqual([
+    ["tool_before", "c1"],
+    ["tool_after", "c2"],
+  ]);
+  expect(result[0]).toMatchObject({ anchor: "tool_after", open: false, complete: true });
+});
+
+test("turn keys come only from a recorded idle or the start of OpenCode's history", () => {
+  const pages = [
+    {
+      items: [
+        message("a", "assistant", false, [call("a", "c1")]),
+        idle("i1"),
+        message("u", "user", true),
+        message("b", "assistant", true),
+      ],
+      next: "older",
+    },
+  ];
+  // The first run's start is out of sight: its key names its first item, never "start".
+  expect([...turnKeys(pages, "head:a")]).toEqual([
+    ["a", "head:a"],
+    ["u", "after:i1"],
+    ["b", "after:i1"],
+  ]);
+  expect(
+    groupWork(pages, { head: "head:a", latest: true }).map((log) => [
+      log.turn,
+      log.anchor,
+      log.complete,
+    ]),
+  ).toEqual([["head:a", "a", false]]);
+  // The open tail keeps the key it will have once its idle arrives.
+  const open = groupWork(
+    [
+      {
+        items: [
+          idle("i0"),
+          message("u", "user", true),
+          message("t", "assistant", false, [call("t", "c")]),
+        ],
+        next: undefined,
+      },
+    ],
+    { head: "start", latest: true },
+  );
+  expect(open.map((log) => [log.turn, log.anchor, log.open])).toEqual([["after:i0", "t", true]]);
+  const closed = groupWork(
+    [
+      {
+        items: [
+          idle("i0"),
+          message("u", "user", true),
+          message("t", "assistant", false, [call("t", "c")]),
+          idle("i1"),
+        ],
+        next: undefined,
+      },
+    ],
+    { head: "start", latest: true },
+  );
+  expect(closed.map((log) => [log.turn, log.anchor, log.open])).toEqual([["after:i0", "t", false]]);
+});
+
 test("work groups by turn between idles, under the turn's last reply, with shared inputs", () => {
   const items = [
     message("msg_u1", "user", true),
@@ -206,7 +288,7 @@ test("work groups by turn between idles, under the turn's last reply, with share
     message("msg_u3", "user", true),
     message("msg_a4", "assistant", false, [call("msg_a4", "c5", "bash", "running")]),
   ];
-  const latest = groupWork([{ items, next: undefined }], { startKnown: true, latest: true });
+  const latest = groupWork([{ items, next: undefined }], { head: "start", latest: true });
   expect(latest).toHaveLength(2);
   expect(latest[0]).toMatchObject({
     anchor: "msg_a3",
@@ -215,13 +297,19 @@ test("work groups by turn between idles, under the turn's last reply, with share
     counts: { commands: 1, edits: 3, edited: 1, failed: 1, total: 4 },
   });
   expect(latest[0]?.calls.map((item) => item.callID)).toEqual(["c1", "c2", "c3", "c4"]);
-  // The running turn has no reply yet: it goes under the owner's message.
-  expect(latest[1]).toMatchObject({ anchor: "msg_u3", open: true, complete: true });
+  expect(latest[0]?.turn).toBe("start");
+  // The running turn has no reply yet: it goes beneath its last dot step, never an input.
+  expect(latest[1]).toMatchObject({
+    anchor: "msg_a4",
+    turn: "after:idle_1",
+    open: true,
+    complete: true,
+  });
   // An older page leaves the turn its newer neighbor ends to that page.
-  expect(groupWork([{ items, next: "c" }], { startKnown: false, latest: false })).toHaveLength(1);
-  expect(groupWork([{ items, next: "c" }], { startKnown: false, latest: false })[0]?.complete).toBe(
-    false,
-  );
+  expect(groupWork([{ items, next: "c" }], { head: "head:msg_u1", latest: false })).toHaveLength(1);
+  expect(
+    groupWork([{ items, next: "c" }], { head: "head:msg_u1", latest: false })[0]?.complete,
+  ).toBe(false);
   // The same call twice counts once.
   expect(workCounts([call("m", "x"), call("m", "y")]).total).toBe(2);
   expect(
@@ -236,7 +324,7 @@ test("work groups by turn between idles, under the turn's last reply, with share
         },
       ],
       {
-        startKnown: true,
+        head: "start",
         latest: true,
       },
     )[0]?.counts.total,
@@ -305,10 +393,15 @@ test("the conversation carries each turn's log, reading back across pages for a 
   expect(work).toHaveLength(1);
   expect(work[0]).toMatchObject({
     anchor: "msg_a1",
+    turn: "after:idle_msg_a0",
     complete: true,
     more: null,
     counts: { total: 30 },
   });
+  // The read-back found the idle before the turn, so every shown message carries its key.
+  const turns = page.body.turns as Record<string, string>;
+  expect(Object.keys(turns).length).toBeGreaterThan(0);
+  expect(new Set(Object.values(turns))).toEqual(new Set(["after:idle_msg_a0"]));
 
   // A longer turn than two extra pages: the log says it is partial and continues by cursor.
   for (let index = 30; index < 80; index++) {
@@ -321,6 +414,12 @@ test("the conversation carries each turn's log, reading back across pages for a 
   )[0];
   expect(log?.complete).toBe(false);
   expect(log?.counts.total).toBeLessThan(80);
+  // Two read-back pages end before the idle: the key names the first item read, never "start".
+  const cut = (partial.body.work as { turn: string }[])[0]?.turn ?? "";
+  expect(cut.startsWith("head:")).toBe(true);
+  expect(new Set(Object.values(partial.body.turns as Record<string, string>))).toEqual(
+    new Set([cut]),
+  );
   let more: string | null | undefined = log?.more;
   let total = log?.counts.total ?? 0;
   for (let reads = 0; more && reads < 10; reads++) {

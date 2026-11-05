@@ -327,6 +327,8 @@ class FakeDaemon {
   onStop: (() => Response | Promise<Response>) | undefined;
   // The work log the latest page carries, the activity it reports and each call's detail.
   work: object[] = [];
+  // Each message's turn key, as a daemon with turn keys sends them; unset like an older daemon.
+  turns: Record<string, string> | undefined;
   activity: object | null = null;
   details = new Map<string, object>();
   // A work log whose `more` is this placeholder gets a cursor signed like the daemon's, naming
@@ -534,6 +536,17 @@ class FakeDaemon {
         pending: [...this.pending],
         recentEmojis: [],
         ...(this.capable ? { clientMessageIDs: true } : {}),
+        ...(this.turns
+          ? {
+              turns: Object.fromEntries(
+                this.messages
+                  .slice(start, end)
+                  .flatMap((item) =>
+                    this.turns?.[item.id] ? [[item.id, this.turns[item.id]]] : [],
+                  ),
+              ),
+            }
+          : {}),
         ...(before === null
           ? {
               work: this.work.map((log) =>
@@ -1120,7 +1133,9 @@ const launch = async (
   const app = Bun.spawn(
     [
       electron as unknown as string,
-      ...(process.env.OPEN_DOT_SMOKE_EVIDENCE || name === "selection-click-regression"
+      ...(process.env.OPEN_DOT_SMOKE_EVIDENCE ||
+      name === "selection-click-regression" ||
+      name === "execution-info-owner-red"
         ? ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1", "--force-dark-mode"]
         : []),
       join(root, "build"),
@@ -1592,6 +1607,690 @@ test("basic Stop UI is one session-scoped request, preserves every draft part, a
   );
 }, 30_000);
 
+interface Box {
+  left: number;
+  right: number;
+  top: number;
+  width: number;
+  height: number;
+}
+interface Scrolled {
+  clientWidth: number;
+  scrollWidth: number;
+  clientHeight: number;
+  scrollHeight: number;
+}
+/** The owner-layout readback; a panel, its output and input are null only while collapsed. */
+interface Measured {
+  width: number;
+  height: number;
+  sidebar: Box;
+  row: Box;
+  meta: Box;
+  panel: Box & Scrolled;
+  messages: Box & { clientWidth: number; scrollWidth: number };
+  documentWidth: number;
+  output: Scrolled & { lines: number };
+  input: { clientWidth: number; scrollWidth: number; whiteSpace: string; wordBreak: string };
+  ownerDisclosures: number;
+  rows: { id: string; activityOnly: boolean; disclosures: number }[];
+  blankRows: number;
+  notice: boolean;
+  peer: boolean;
+}
+
+test("execution info mixed prose has one rendered disclosure and retains every source with or without a log", async () => {
+  const sources = [
+    ["msg_before", "before_only_tool"],
+    ["msg_p1", "earlier_prose_tool"],
+    ["msg_between", "between_only_tool"],
+    ["msg_p2", "newest_prose_tool"],
+    ["msg_after", "after_only_tool"],
+  ] as const;
+  const failures: string[] = [];
+  const readbacks: unknown[] = [];
+  for (const logged of [true, false]) {
+    const phase = logged ? "logged" : "notes";
+    await scenario(
+      `execution-mixed-prose-${phase}`,
+      (fake) => {
+        fake.messages = [
+          { id: "msg_owner", kind: "owner", text: "Synthetic request" },
+          { id: "msg_before", kind: "dot", text: "", extra: { tools: ["before_only_tool"] } },
+          {
+            id: "msg_p1",
+            kind: "dot",
+            text: "Earlier same-turn prose with its own tool",
+            extra: { tools: ["earlier_prose_tool"] },
+          },
+          { id: "msg_notice", kind: "notice", text: "Synthetic preserved notice" },
+          { id: "msg_steer", kind: "owner", text: "Synthetic steer in the same turn" },
+          { id: "msg_between", kind: "dot", text: "", extra: { tools: ["between_only_tool"] } },
+          {
+            id: "msg_p2",
+            kind: "dot",
+            text: "Newest same-turn prose with its own tool",
+            extra: { tools: ["newest_prose_tool"] },
+          },
+          { id: "msg_after", kind: "dot", text: "", extra: { tools: ["after_only_tool"] } },
+          { id: "msg_empty", kind: "dot", text: "" },
+        ];
+        fake.turns = Object.fromEntries(
+          fake.messages.map(({ id }) => [id, "after:synthetic_idle"]),
+        );
+        const calls = sources.map(([messageID, name], i) => ({
+          ...toolCall(
+            `call_${messageID}`,
+            name,
+            `synthetic source ${messageID}`,
+            i === 1 ? "error" : "done",
+          ),
+          messageID,
+        }));
+        fake.work = logged
+          ? [
+              {
+                anchor: "msg_p2",
+                turn: "after:synthetic_idle",
+                calls,
+                counts: { commands: 0, edits: 0, edited: 0, failed: 1, total: calls.length },
+                complete: true,
+                open: false,
+                more: null,
+              },
+            ]
+          : [];
+        for (const call of calls)
+          fake.details.set(`${call.messageID}/${call.callID}`, {
+            ...call,
+            input: `synthetic input ${call.messageID}`,
+            output: `synthetic output ${call.messageID}`,
+            error: call.status === "error" ? "Synthetic failure preserved" : null,
+            patches: [],
+            truncated: false,
+          });
+      },
+      async ({ fake, js, until, temporary, state }) => {
+        await until(
+          `!!t.msg('msg_p1')&&!!t.msg('msg_p2')?.querySelector('[aria-label="Execution details"]')`,
+          "mixed prose rendered",
+        );
+        // Count real DOM disclosures before opening them: a grouping-unit log list cannot prove this.
+        const collapsed = await js(
+          `({total:document.querySelectorAll('[aria-label="Execution details"]').length,older:t.msg('msg_p1').querySelectorAll('[aria-label="Execution details"]').length,newest:t.msg('msg_p2').querySelectorAll('[aria-label="Execution details"]').length})`,
+        );
+        await js(
+          `document.querySelectorAll('[aria-label="Execution details"]').forEach(b=>b.click()),true`,
+        );
+        await until(
+          logged
+            ? `document.querySelectorAll('[data-tool-call]').length===5`
+            : `!!t.msg('msg_p2').querySelector('.execution-content > .note')`,
+          "mixed execution contents expanded",
+        );
+        if (logged) {
+          await js(
+            `document.querySelectorAll('[data-tool-call] .tool-call-head').forEach(b=>b.click()),true`,
+          );
+          await until(
+            `document.querySelectorAll('[data-tool-call] .tool-text').length>=10`,
+            "all original call details accessible",
+          );
+        }
+        const dom = (await js(`(() => {
+          const notes = row => [...row.querySelectorAll('.execution-content > .note')].map(n=>n.textContent);
+          return {total:document.querySelectorAll('[aria-label="Execution details"]').length,
+            older:t.msg('msg_p1').querySelectorAll('[aria-label="Execution details"]').length,
+            newest:t.msg('msg_p2').querySelectorAll('[aria-label="Execution details"]').length,
+            owner:document.querySelectorAll('.message.owner [aria-label="Execution details"]').length,
+            olderNotes:notes(t.msg('msg_p1')),canonicalNotes:notes(t.msg('msg_p2')),
+            calls:[...document.querySelectorAll('[data-tool-call]')].map(e=>({callID:e.getAttribute('data-tool-call'),host:e.closest('[data-message]')?.getAttribute('data-message'),text:e.textContent})),
+            rows:[...document.querySelectorAll('[data-message]')].map(e=>e.getAttribute('data-message')),
+            canonicalFailure:t.msg('msg_p2').textContent.includes('Execution failed'),
+            notice:!!t.msg('msg_notice'),steer:!!t.msg('msg_steer'),
+            blankRows:[...document.querySelectorAll('.row')].filter(e=>!e.children.length).length};
+        })()`)) as {
+          total: number;
+          older: number;
+          newest: number;
+          owner: number;
+          olderNotes: string[];
+          canonicalNotes: string[];
+          calls: { callID: string; host: string; text: string }[];
+          rows: string[];
+          canonicalFailure: boolean;
+          notice: boolean;
+          steer: boolean;
+          blankRows: number;
+        };
+        const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+        if (evidence) {
+          const page = await smokePage(temporary);
+          try {
+            await page.send("Emulation.setEmulatedMedia", {
+              features: [{ name: "prefers-color-scheme", value: "dark" }],
+            });
+            const shot = await page.send("Page.captureScreenshot", {
+              format: "png",
+              fromSurface: true,
+              captureBeyondViewport: false,
+            });
+            if (!shot.data) throw new Error("Missing mixed-prose screenshot");
+            writeFileSync(
+              join(evidence, `mixed-prose-${phase}-dark.png`),
+              Buffer.from(shot.data, "base64"),
+            );
+          } finally {
+            page.close();
+          }
+        }
+        const cleanup = await state();
+        const result = {
+          phase,
+          collapsed,
+          dom,
+          expectedSources: sources,
+          toolReads: fake.log.toolReads,
+          posts: fake.log.posts,
+          recorded: cleanup.recorded,
+          violations: cleanup.violations,
+        };
+        readbacks.push(result);
+        console.log("EXECUTION_MIXED_PROSE_READBACK", JSON.stringify(result));
+        if (dom.total !== 1 || dom.older !== 0 || dom.newest !== 1)
+          failures.push(
+            `${phase}: expected one canonical disclosure on newest prose only; total=${dom.total},older=${dom.older},newest=${dom.newest}`,
+          );
+        if (dom.owner !== 0) failures.push(`${phase}: owner contains execution disclosure`);
+        if (!dom.notice || !dom.steer || dom.blankRows !== 0)
+          failures.push(`${phase}: notice/steer/empty-row preservation failed`);
+        if (logged) {
+          if (dom.canonicalNotes.length || dom.olderNotes.length)
+            failures.push(`${phase}: source notes duplicate the turn log`);
+          if (!dom.canonicalFailure) failures.push(`${phase}: failure flag lost`);
+          if (
+            JSON.stringify(fake.log.toolReads) !==
+            JSON.stringify(sources.map(([id]) => `${id}/call_${id}`))
+          )
+            failures.push(
+              `${phase}: original call/message IDs are missing, duplicated, or out of order`,
+            );
+        } else {
+          const names = dom.canonicalNotes.map(
+            (note) => sources.find(([, name]) => note.endsWith(name))?.[1],
+          );
+          if (JSON.stringify(names) !== JSON.stringify(sources.map(([, name]) => name)))
+            failures.push(
+              `${phase}: canonical source notes omit or reorder earlier mixed-prose tools`,
+            );
+          if (dom.olderNotes.length)
+            failures.push(`${phase}: earlier prose still owns source notes`);
+        }
+      },
+    );
+  }
+  const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+  if (evidence)
+    writeFileSync(
+      join(evidence, "mixed-prose-readback.json"),
+      JSON.stringify({ readbacks, failures }, null, 2),
+    );
+  expect(failures).toEqual([]);
+}, 45_000);
+
+test("execution turn renderer moves open work to newest prose and keeps one completed fallback", async () => {
+  const sourceCalls = [
+    { ...toolCall("open1", "bash", "synthetic first step", "done"), messageID: "step1" },
+    { ...toolCall("open2", "edit", "synthetic failed step", "error"), messageID: "step2" },
+    { ...toolCall("after", "read", "synthetic trailing step", "done"), messageID: "step3" },
+  ];
+  const turnWork = (anchor: string, open: boolean, count = 2) => ({
+    anchor,
+    turn: "after:idle1",
+    calls: sourceCalls.slice(0, count),
+    counts: { commands: 1, edits: 1, edited: 0, failed: 1, total: count },
+    complete: true,
+    open,
+    more: null,
+  });
+  await scenario(
+    "execution-turn-transition",
+    (fake) => {
+      fake.busy = true;
+      fake.activity = {
+        state: "tool",
+        tool: "bash",
+        label: "synthetic display only",
+        running: 1,
+        since: Date.now(),
+        observedAt: Date.now(),
+      };
+      fake.messages = [
+        { id: "owner", kind: "owner", text: "Synthetic request" },
+        { id: "step1", kind: "dot", text: "", extra: { tools: ["bash"] } },
+        {
+          id: "notice",
+          kind: "notice",
+          text: "Synthetic permission notice",
+          extra: { requestNotice: 71 },
+        },
+        { id: "steer", kind: "owner", text: "Synthetic same-turn steer" },
+        { id: "step2", kind: "dot", text: "", extra: { tools: ["edit"] } },
+        { id: "empty", kind: "dot", text: "" },
+      ];
+      fake.turns = Object.fromEntries(fake.messages.map(({ id }) => [id, "after:idle1"]));
+      fake.work = [turnWork("step2", true)];
+      const permission = requestCard(71, {
+        detail: { kind: "permission", action: "read", resources: ["synthetic.txt"], save: [] },
+      });
+      fake.data.requests = [permission];
+      fake.noticeReceipts.set(71, permission);
+      fake.pending = [{ id: "queued", status: "sent", delivery: "queue" }];
+    },
+    async ({ fake, js, until, temporary, state }) => {
+      await until(
+        `!!t.box()&&!!document.querySelector('.messages > .execution-details')&&!!document.querySelector('[data-request="71"]')&&!!document.querySelector('[data-request-notice="71"]')`,
+        "open turn with permission and notice",
+      );
+      await js(`t.box().focus(),t.type('Synthetic draft kept'),true`);
+      const keys = fake.turns;
+      if (!keys) throw new Error("Missing synthetic turn-key fixture");
+      const phases: { phase: string; view: unknown }[] = [];
+      const inspect = async (phase: string) => {
+        const view = await js(`({
+        turnDisclosures:document.querySelectorAll('.messages-inner [aria-label="Execution details"]').length+document.querySelectorAll('.messages > .execution-details [aria-label="Execution details"]').length,
+        rowDisclosures:document.querySelectorAll('.messages-inner [aria-label="Execution details"]').length,
+        bubbleDisclosures:document.querySelectorAll('.messages > .execution-details [aria-label="Execution details"]').length,
+        liveStatusDisclosures:document.querySelectorAll('[data-activity] [aria-label="Execution details"]').length,
+        older:t.msg('prose1')?.querySelectorAll('[aria-label="Execution details"]').length??0,
+        newest:t.msg('prose2')?.querySelectorAll('[aria-label="Execution details"]').length??0,
+        owner:document.querySelectorAll('.message.owner [aria-label="Execution details"]').length,
+        compact:[...document.querySelectorAll('[data-activity-only]')].map(e=>e.getAttribute('data-message')),
+        logCalls:[...document.querySelectorAll('[data-tool-call]')].map(e=>e.getAttribute('data-tool-call')),
+        logHosts:[...document.querySelectorAll('[data-work-log]')].map(e=>e.closest('[data-message]')?.getAttribute('data-message')??'bubble'),
+        failed:document.querySelector('.messages').textContent.includes('Execution failed'),
+        notice:!!t.msg('notice'),steer:!!t.msg('steer'),permission:!!document.querySelector('[data-request="71"]'),
+        pending:!!document.querySelector('[data-pending][data-id="queued"]'),
+        blankRows:[...document.querySelectorAll('.row')].filter(e=>!e.children.length).length,draft:t.box().value
+      })`);
+        phases.push({ phase, view });
+        console.log("EXECUTION_TRANSITION_READBACK", JSON.stringify({ phase, view }));
+        return view;
+      };
+      await js(
+        `document.querySelector('.messages > .execution-details [aria-label="Execution details"]').click(),true`,
+      );
+      await until(
+        `document.querySelectorAll('[data-tool-call]').length===2`,
+        "bubble contains both original calls",
+      );
+      expect(await inspect("open-no-prose")).toMatchObject({
+        turnDisclosures: 1,
+        rowDisclosures: 0,
+        bubbleDisclosures: 1,
+        owner: 0,
+        compact: [],
+        logCalls: ["open1", "open2"],
+        logHosts: ["bubble"],
+        failed: true,
+      });
+      fake.messages.push({ id: "prose1", kind: "dot", text: "First synthetic reply" });
+      keys.prose1 = "after:idle1";
+      fake.work = [turnWork("prose1", true)];
+      await until(
+        `!!t.msg('prose1')?.querySelector('[aria-label="Execution details"]')&&!document.querySelector('.messages > .execution-details')`,
+        "open log moves to first prose",
+      );
+      await js(`t.click('Execution details',t.msg('prose1')),true`);
+      await until(
+        `document.querySelectorAll('[data-tool-call]').length===2`,
+        "prose contains both original calls",
+      );
+      expect(await inspect("first-prose")).toMatchObject({
+        turnDisclosures: 1,
+        rowDisclosures: 1,
+        bubbleDisclosures: 0,
+        older: 1,
+        owner: 0,
+        compact: [],
+        logHosts: ["prose1"],
+      });
+      fake.messages.push(
+        { id: "prose2", kind: "dot", text: "Newest synthetic reply" },
+        { id: "step3", kind: "dot", text: "", extra: { tools: ["read"] } },
+      );
+      keys.prose2 = keys.step3 = "after:idle1";
+      fake.work = [turnWork("prose2", true, 3)];
+      await until(
+        `!!t.msg('prose2')?.querySelector('[aria-label="Execution details"]')&&!t.msg('prose1')?.querySelector('[aria-label="Execution details"]')`,
+        "only newest prose owns open log",
+      );
+      await js(`t.click('Execution details',t.msg('prose2')),true`);
+      await until(
+        `document.querySelectorAll('[data-tool-call]').length===3`,
+        "newest prose includes trailing tool call",
+      );
+      expect(await inspect("newest-prose")).toMatchObject({
+        turnDisclosures: 1,
+        bubbleDisclosures: 0,
+        older: 0,
+        newest: 1,
+        owner: 0,
+        compact: [],
+        logCalls: ["open1", "open2", "after"],
+        logHosts: ["prose2"],
+        failed: true,
+      });
+      await js(`t.click('Execution details',t.msg('prose2')),true`);
+      fake.busy = false;
+      fake.activity = {
+        state: "idle",
+        tool: null,
+        label: null,
+        running: 0,
+        since: null,
+        observedAt: Date.now(),
+      };
+      fake.messages.push(
+        { id: "owner2", kind: "owner", text: "Synthetic completed no-prose turn" },
+        { id: "fallback1", kind: "dot", text: "", extra: { tools: ["read"] } },
+        { id: "fallback2", kind: "dot", text: "", extra: { tools: ["bash"] } },
+        { id: "empty2", kind: "dot", text: "" },
+      );
+      for (const id of ["owner2", "fallback1", "fallback2", "empty2"]) keys[id] = "after:idle2";
+      fake.work = [
+        turnWork("prose2", false, 3),
+        {
+          anchor: "fallback2",
+          turn: "after:idle2",
+          calls: [
+            {
+              ...toolCall("fallback1", "read", "synthetic fallback first", "done"),
+              messageID: "fallback1",
+            },
+            {
+              ...toolCall("fallback2", "bash", "synthetic fallback last", "done"),
+              messageID: "fallback2",
+            },
+          ],
+          counts: { commands: 1, edits: 0, edited: 0, failed: 0, total: 2 },
+          complete: true,
+          open: false,
+          more: null,
+        },
+      ];
+      await until(
+        `!!t.msg('fallback2')?.querySelector('[aria-label="Execution details"]')&&!document.querySelector('[data-activity]')`,
+        "one completed no-prose fallback and no active bubble",
+      );
+      await js(`t.click('Execution details',t.msg('fallback2')),true`);
+      await until(
+        `document.querySelectorAll('[data-tool-call]').length===2`,
+        "both fallback calls remain accessible once",
+      );
+      expect(await inspect("completed-fallback")).toMatchObject({
+        turnDisclosures: 2,
+        rowDisclosures: 2,
+        bubbleDisclosures: 0,
+        liveStatusDisclosures: 0,
+        older: 0,
+        newest: 1,
+        owner: 0,
+        compact: ["fallback2"],
+        logCalls: ["fallback1", "fallback2"],
+        logHosts: ["fallback2"],
+      });
+      const preserved = {
+        notice: true,
+        steer: true,
+        permission: true,
+        pending: true,
+        blankRows: 0,
+        draft: "Synthetic draft kept",
+      };
+      for (const entry of phases) expect(entry.view).toMatchObject(preserved);
+      expect(fake.data.answers).toEqual([]);
+      expect(fake.log.posts).toEqual([]);
+      expect(fake.stops).toEqual([]);
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        const page = await smokePage(temporary);
+        try {
+          await js(`t.msg('fallback2').scrollIntoView({block:'center'}),true`);
+          await delay(150);
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("Missing completed fallback screenshot");
+          writeFileSync(
+            join(evidence, "completed-fallback-dark.png"),
+            Buffer.from(shot.data, "base64"),
+          );
+        } finally {
+          page.close();
+        }
+        writeFileSync(
+          join(evidence, "transition-readback.json"),
+          JSON.stringify(
+            {
+              phases,
+              recorded: (await state()).recorded,
+              posts: fake.log.posts,
+              answers: fake.data.answers,
+              stops: fake.stops,
+            },
+            null,
+            2,
+          ),
+        );
+      }
+    },
+  );
+}, 30_000);
+
+test("execution info owner regression records intrinsic layout before ownership assertions", async () => {
+  // These are display strings only. The fake daemon never executes commands or patches.
+  const command = "synthetic_" + "x".repeat(590);
+  const output = Array.from(
+    { length: 80 },
+    (_, i) => `synthetic output ${i}: ${"o".repeat(100)}`,
+  ).join("\n");
+  await scenario(
+    "execution-info-owner-red",
+    (fake) => {
+      fake.messages = [
+        { id: "msg_owner1", kind: "owner", text: "Synthetic first request" },
+        { id: "msg_notice", kind: "notice", text: "Synthetic preserved notice" },
+        { id: "msg_peer", kind: "peer", text: "Synthetic peer row" },
+        { id: "msg_prose", kind: "dot", text: "Synthetic earlier reply" },
+        { id: "msg_owner2", kind: "owner", text: "Synthetic tool-only request" },
+        { id: "msg_long", kind: "dot", text: "", extra: { tools: ["bash"] } },
+        { id: "msg_unlisted", kind: "dot", text: "", extra: { tools: ["read"] } },
+        { id: "msg_empty", kind: "dot", text: "" },
+      ];
+      const call = {
+        ...toolCall("long", "bash", command, "done", [
+          { path: "synthetic.txt", additions: 1, deletions: 1 },
+        ]),
+        messageID: "msg_long",
+      };
+      // Older-daemon response: no turn map, and a proven log anchored on a non-dot.
+      // It must remain accessible in a standalone compact row, never in the owner's meta.
+      fake.work = [
+        {
+          anchor: "msg_owner2",
+          calls: [call],
+          counts: { commands: 1, edits: 0, edited: 1, failed: 0, total: 1 },
+          complete: true,
+          open: false,
+          more: null,
+        },
+      ];
+      fake.details.set("msg_long/long", {
+        ...call,
+        input: command,
+        output,
+        error: null,
+        patches: [
+          {
+            path: "synthetic.txt",
+            additions: 1,
+            deletions: 1,
+            patch:
+              "--- a/synthetic.txt\n+++ b/synthetic.txt\n@@ -1 +1 @@\n-old\n+" +
+              "d".repeat(400) +
+              "\n",
+          },
+        ],
+        truncated: false,
+      });
+    },
+    async ({ fake, js, until, temporary, state }) => {
+      // The owner-anchored log is a row of its own after the owner's message, not in its bubble.
+      const host = `document.querySelector('[data-execution-for="msg_owner2"]')`;
+      await until(
+        `!!${host}?.querySelector('[aria-label="Execution details"]')`,
+        "the owner log's own row",
+      );
+      const page = await smokePage(temporary);
+      const measurements: unknown[] = [];
+      const failures: string[] = [];
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      const measure = () =>
+        js(`(() => {
+        const owner = ${host};
+        const panel = document.querySelector('[data-work-log="msg_owner2"]')?.closest('.execution-content');
+        const row = (panel ?? owner).closest('.row');
+        const messages = document.querySelector('.messages');
+        const rect = e => { const r=e.getBoundingClientRect(); return {left:r.left,right:r.right,top:r.top,width:r.width,height:r.height}; };
+        const output = panel?.querySelectorAll('.tool-text pre')[1];
+        const input = panel?.querySelector('.tool-text pre');
+        const diff = panel?.querySelector('.diff-body');
+        return { width:innerWidth, height:innerHeight, sidebar:rect(document.querySelector('.sidebar')),
+          row:rect(row), meta:rect((panel ?? owner).closest('.meta') ?? owner.querySelector('.meta')),
+          panel:panel ? {...rect(panel),clientWidth:panel.clientWidth,scrollWidth:panel.scrollWidth,clientHeight:panel.clientHeight,scrollHeight:panel.scrollHeight}:null,
+          messages:{...rect(messages),clientWidth:messages.clientWidth,scrollWidth:messages.scrollWidth},
+          documentWidth:document.documentElement.scrollWidth,
+          output:output ? {clientWidth:output.clientWidth,scrollWidth:output.scrollWidth,clientHeight:output.clientHeight,scrollHeight:output.scrollHeight,lines:output.textContent.split('\\n').length}:null,
+          input:input ? {clientWidth:input.clientWidth,scrollWidth:input.scrollWidth,whiteSpace:getComputedStyle(input).whiteSpace,wordBreak:getComputedStyle(input).wordBreak}:null,
+          diff:diff ? {clientWidth:diff.clientWidth,scrollWidth:diff.scrollWidth}:null,
+          ownerDisclosures:document.querySelectorAll('.message.owner [aria-label="Execution details"]').length,
+          rows:[...document.querySelectorAll('[data-message]')].map(e=>({id:e.dataset.message,activityOnly:e.hasAttribute('data-activity-only'),disclosures:e.querySelectorAll('[aria-label="Execution details"]').length})),
+          blankRows:[...document.querySelectorAll('.row')].filter(e=>!e.children.length).length,
+          notice:!!t.msg('msg_notice'),peer:!!t.msg('msg_peer') };
+      })()`);
+      const capture = async (name: string) => {
+        if (!evidence) return;
+        const image = await page.send("Page.captureScreenshot", {
+          format: "png",
+          fromSurface: true,
+          captureBeyondViewport: false,
+        });
+        if (!image.data) throw new Error("Missing execution-info screenshot");
+        writeFileSync(join(evidence, name), Buffer.from(image.data, "base64"));
+      };
+      try {
+        for (const width of [640, 1100]) {
+          await page.send("Emulation.setDeviceMetricsOverride", {
+            width,
+            height: 900,
+            deviceScaleFactor: 1,
+            mobile: false,
+          });
+          await page.send("Emulation.setEmulatedMedia", {
+            features: [{ name: "prefers-color-scheme", value: "dark" }],
+          });
+          await js(`document.querySelector('.messages').scrollTop=0,true`);
+          await delay(150);
+          const before = (await measure()) as Measured;
+          await js(`t.click('Execution details',${host}),true`);
+          await until(
+            `!!document.querySelector('[data-work-log="msg_owner2"]')`,
+            "owner execution panel",
+          );
+          await js(
+            `document.querySelector('[data-tool-call="long"] .tool-call-head').click(),true`,
+          );
+          await until(
+            `!!document.querySelector('[data-tool-call="long"] .diff-add')`,
+            "synthetic command/output/diff detail",
+          );
+          await js(
+            `Array.from(document.querySelectorAll('[data-tool-call="long"] .link-button')).find(b=>b.textContent.startsWith('Show more'))?.click(),true`,
+          );
+          await delay(150);
+          const expanded = (await measure()) as Measured;
+          // Preserve both widths and screenshots BEFORE a RED assertion can abort the run.
+          await capture(`owner-expanded-${width}-dark.png`);
+          if (width === 640 || evidence) {
+            await page.send("Emulation.setEmulatedMedia", {
+              features: [{ name: "prefers-color-scheme", value: "light" }],
+            });
+            await delay(100);
+            await capture(`owner-expanded-${width}-normal.png`);
+          }
+          await js(`t.click('Execution details',${host}),true`);
+          await until(`!document.querySelector('.execution-content')`, "collapsed execution panel");
+          await delay(150);
+          const collapsed = (await measure()) as Measured;
+          const geometry = {
+            panelInsideRow:
+              expanded.panel.left >= expanded.row.left + 19 &&
+              expanded.panel.right <= expanded.row.right - 19,
+            noMessagesOverflow: expanded.messages.scrollWidth <= expanded.messages.clientWidth,
+            noDocumentOverflow: expanded.documentWidth <= expanded.width,
+            sidebarStable: JSON.stringify(before.sidebar) === JSON.stringify(expanded.sidebar),
+            boundedAggregate: expanded.panel.height <= Math.min(expanded.height * 0.6, 560) + 1,
+            outputScrolls:
+              expanded.output.lines === 80 &&
+              expanded.output.scrollHeight > expanded.output.clientHeight,
+            inputWrapsOrScrolls:
+              expanded.input.scrollWidth > expanded.input.clientWidth ||
+              (expanded.input.whiteSpace === "pre-wrap" &&
+                expanded.input.wordBreak === "break-word"),
+            collapseRestores:
+              Math.abs(before.row.height - collapsed.row.height) <= 1 &&
+              Math.abs(before.meta.width - collapsed.meta.width) <= 1 &&
+              JSON.stringify(before.sidebar) === JSON.stringify(collapsed.sidebar) &&
+              collapsed.panel === null,
+          };
+          measurements.push({ width, before, expanded, collapsed, geometry });
+          for (const [name, passed] of Object.entries(geometry))
+            if (!passed) failures.push(`${width}: ${name}`);
+          if (expanded.ownerDisclosures !== 0)
+            failures.push(`${width}: execution disclosure is inside owner bubble`);
+          if (expanded.rows.some((r) => r.id === "msg_long"))
+            failures.push(`${width}: listed tool step duplicates the owner's log as an orphan row`);
+          if (!expanded.rows.some((r) => r.id === "msg_unlisted" && r.activityOnly))
+            failures.push(`${width}: unrelated unlisted tool step has no own compact row`);
+          if (expanded.blankRows !== 0) failures.push(`${width}: blank virtual row remains`);
+          if (!expanded.notice || !expanded.peer) failures.push(`${width}: notice/peer row lost`);
+        }
+        const cleanup = await state();
+        const result = {
+          measurements,
+          failures,
+          toolReads: fake.log.toolReads,
+          posts: fake.log.posts,
+          recorded: cleanup.recorded,
+          violations: cleanup.violations,
+        };
+        console.log("EXECUTION_OWNER_LAYOUT_READBACK", JSON.stringify(result));
+        if (evidence)
+          writeFileSync(
+            join(evidence, "owner-layout-readback.json"),
+            JSON.stringify(result, null, 2),
+          );
+        expect(failures).toEqual([]);
+      } finally {
+        page.close();
+      }
+    },
+  );
+}, 45_000);
+
 test("a busy dot shows what it is doing, and its turn's calls fold under its reply", async () => {
   await scenario(
     "work",
@@ -1618,9 +2317,20 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         { id: "msg_update3", kind: "dot", text: "", extra: { tools: ["dot_update"] } },
         { id: "msg_update4", kind: "dot", text: "", extra: { tools: ["dot_update"] } },
       ];
+      // Three turns by OpenCode's idles: an earlier tool-only one, then a reply's, then a follow-up's.
+      fake.turns = {
+        msg_tool_only: "head:msg_tool_only",
+        ...Object.fromEntries(
+          ["msg_owner", "msg_reply", "msg_update1", "msg_update2"].map((id) => [id, "after:i1"]),
+        ),
+        ...Object.fromEntries(
+          ["msg_followup", "msg_update3", "msg_update4"].map((id) => [id, "after:i2"]),
+        ),
+      };
       fake.work = [
         {
           anchor: "msg_update2",
+          turn: "after:i1",
           calls: [
             toolCall("c1", "bash", "bun test", "done"),
             toolCall("c2", "edit", "src/a.ts", "done", [
@@ -1635,6 +2345,7 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         },
         {
           anchor: "msg_update4",
+          turn: "after:i2",
           calls: [toolCall("c4", "dot_update", "Follow-up state", "done")],
           counts: { commands: 0, edits: 0, edited: 0, failed: 0, total: 1 },
           complete: true,
@@ -1750,11 +2461,12 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
         `!!document.querySelector("[data-work-log='msg_update2']")`,
         "the folded row's work log",
       );
+      // The turn's log lists every step's calls, so the steps' own notes don't repeat them.
       expect(
         await js(
           `({ first: !!t.msg("msg_reply").querySelector('[data-work-log="msg_update2"]'), later: !!t.msg("msg_reply").querySelector('[data-work-log="msg_update4"]'), secondStillCollapsed: t.msg("msg_followup").querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"), updates: [...t.msg("msg_reply").querySelectorAll(".execution-content > .note")].filter((note) => note.textContent.includes("dot_update")).length })`,
         ),
-      ).toEqual({ first: true, later: false, secondStillCollapsed: "false", updates: 2 });
+      ).toEqual({ first: true, later: false, secondStillCollapsed: "false", updates: 0 });
       expect(
         await js(`(() => {
           const log = document.querySelector("[data-work-log='msg_update2']");
@@ -1962,6 +2674,13 @@ test("a work cursor longer than 8,192 characters loads earlier calls; one past 1
         `[...document.querySelectorAll("[data-work-log='msg_reply'] .link-button")].find((b) => b.textContent === "Load earlier calls").click(), true`,
       );
       await until(`document.querySelectorAll("[data-tool-call]").length === 2`, "the earlier call");
+      const pagination = await js(`({
+        calls:[...document.querySelectorAll('[data-tool-call]')].map(e=>e.getAttribute('data-tool-call')),
+        summary:document.querySelector('[data-work-log="msg_reply"] .work-summary').textContent,
+        more:[...document.querySelectorAll('[data-work-log="msg_reply"] .link-button')].some(b=>b.textContent==='Load earlier calls')
+      })`);
+      console.log("EXECUTION_PAGINATION_READBACK", JSON.stringify(pagination));
+      expect(pagination).toEqual({ calls: ["c1", "c9"], summary: "Ran 2 commands", more: false });
       const [signed = 0] = fake.log.workReads;
       expect(fake.log.workReads).toHaveLength(1);
       expect(signed).toBeGreaterThan(8_192);

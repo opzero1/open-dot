@@ -56,6 +56,7 @@ import {
   emptyDraft,
   firstLines,
   groupActivity,
+  groupTurns,
   fenced,
   fencePage,
   imageLimits,
@@ -262,7 +263,14 @@ interface Toast {
 }
 
 type Row =
-  | { kind: "message"; key: string; message: MessageView; activity: MessageView[] }
+  | {
+      kind: "message";
+      key: string;
+      message: MessageView;
+      sources: MessageView[];
+      log: WorkLogView | undefined;
+    }
+  | { kind: "execution"; key: string; log: WorkLogView; sessionID: string; after: string }
   | { kind: "pending"; key: string; pending: PendingView; sent?: Sent | undefined }
   | { kind: "attempt"; key: string; attempt: Attempt; sent?: Sent | undefined };
 
@@ -1092,21 +1100,27 @@ const App = () => {
   }, [capturing]);
 
   // Rows: the messages shown, then the owner's pending sends, then sends with an unknown outcome.
-  const rows = useMemo<Row[]>(() => {
-    const logs = selected ? work.get(selected)?.logs : undefined;
-    const groups = new Map<string, string>();
-    let turn = 0;
-    for (const message of shown) {
-      groups.set(message.id, `${message.sessionID}:${turn}`);
-      if (logs?.has(message.id)) turn++;
-    }
-    const listed: Row[] = groupActivity(
-      shown,
-      (message) => (message.kind === "dot" && !message.hidden ? groups.get(message.id) : undefined),
-      activityOnly,
-    )
-      .filter(({ message }) => showHidden || !message.hidden)
-      .map(({ message, activity }) => ({ kind: "message", key: message.id, message, activity }));
+  const busy = dot?.busy ?? false;
+  const { rows, bubble } = useMemo(() => {
+    const state = selected ? work.get(selected) : undefined;
+    const grouped = groupTurns(shown, state, busy, activityOnly);
+    const listed: Row[] = grouped.rows.flatMap((row): Row[] =>
+      row.kind === "execution"
+        ? state
+          ? [
+              {
+                kind: "execution",
+                key: `x:${row.after}:${row.log.anchor ?? row.log.turn ?? ""}`,
+                log: row.log,
+                sessionID: state.sessionID,
+                after: row.after,
+              },
+            ]
+          : []
+        : showHidden || !row.message.hidden
+          ? [{ ...row, key: row.message.id }]
+          : [],
+    );
     const ids = new Set(shown.map((message) => message.id));
     if (!conversation?.detached)
       for (const pending of conversation?.pending ?? [])
@@ -1124,8 +1138,8 @@ const App = () => {
         attempt,
         sent: sent.get(attempt.messageID),
       });
-    return listed;
-  }, [shown, showHidden, conversation, sent, unknownHere, selected, work]);
+    return { rows: listed, bubble: grouped.bubble };
+  }, [shown, showHidden, conversation, sent, unknownHere, selected, work, busy]);
 
   const delivered = conversation
     ? deliveredID(applyIntents(conversation.latest, mine ?? new Map()), conversation.pending)
@@ -1552,6 +1566,7 @@ const App = () => {
               key={`${dot.name}:${conversation.sessionID}`}
               dot={dot.name}
               rows={rows}
+              bubble={bubble}
               conversation={conversation}
               delivered={delivered}
               busy={dot.busy}
@@ -2123,6 +2138,7 @@ const MessageList = ({
   requests,
   ask,
   rows,
+  bubble,
   conversation,
   delivered,
   busy,
@@ -2147,6 +2163,8 @@ const MessageList = ({
   requests: Requests;
   ask: (value: Ask) => void;
   rows: Row[];
+  /** The running turn's details while it has no reply to go beneath. */
+  bubble: { log: WorkLogView | undefined; steps: MessageView[] };
   conversation: Conversation;
   delivered: string | undefined;
   busy: boolean;
@@ -2420,15 +2438,8 @@ const MessageList = ({
                   ask={ask}
                   dot={dot}
                   message={row.message}
-                  activity={row.activity}
-                  logs={
-                    work?.sessionID === row.message.sessionID
-                      ? [row.message, ...row.activity].flatMap((message) => {
-                          const log = work.logs.get(message.id);
-                          return log ? [log] : [];
-                        })
-                      : []
-                  }
+                  sources={row.sources}
+                  logs={row.log && work?.sessionID === row.message.sessionID ? [row.log] : []}
                   busy={busy}
                   delivered={row.message.id === delivered}
                   blocked={blocked(row.message.id)}
@@ -2437,6 +2448,15 @@ const MessageList = ({
                   onRestore={onRestore}
                   onRetry={unconfirmed(row.message.id) ? () => onRetry(row.message) : undefined}
                 />
+              ) : row.kind === "execution" ? (
+                // A log whose turn has no dot message here to go beneath, never the owner's.
+                <div className="message dot" data-execution-for={row.after}>
+                  <div className="meta">
+                    <ExecutionDetails failed={row.log.counts.failed > 0}>
+                      <WorkLog dot={dot} sessionID={row.sessionID} log={row.log} running={busy} />
+                    </ExecutionDetails>
+                  </div>
+                </div>
               ) : row.kind === "pending" ? (
                 <PendingRow
                   dot={dot}
@@ -2462,9 +2482,17 @@ const MessageList = ({
           );
         })}
       </div>
-      {busy && work?.open && work.sessionID === conversation.sessionID ? (
-        <ExecutionDetails failed={work.open.counts.failed > 0}>
-          <WorkLog dot={dot} sessionID={conversation.sessionID} log={work.open} running />
+      {busy && work?.sessionID === conversation.sessionID && (bubble.log || bubble.steps.length) ? (
+        <ExecutionDetails failed={(bubble.log?.counts.failed ?? 0) > 0}>
+          {bubble.log ? (
+            <WorkLog dot={dot} sessionID={conversation.sessionID} log={bubble.log} running />
+          ) : (
+            bubble.steps.map((source) => (
+              <div key={source.id} className="note">
+                {time(source.time)} · {source.tools.join(", ")}
+              </div>
+            ))
+          )}
         </ExecutionDetails>
       ) : null}
       {busy ? (
@@ -2916,7 +2944,7 @@ const MessageRow = ({
   requests,
   ask,
   message,
-  activity,
+  sources: given,
   logs,
   busy,
   delivered,
@@ -2930,7 +2958,8 @@ const MessageRow = ({
   requests: Requests;
   ask: (value: Ask) => void;
   message: MessageView;
-  activity: MessageView[];
+  /** The messages whose tools this row's execution details show, itself included or not. */
+  sources: MessageView[];
   logs: WorkLogView[];
   busy: boolean;
   delivered: boolean;
@@ -2962,7 +2991,7 @@ const MessageRow = ({
     [dot, message.id, message.sessionID, listed, onOpenImage],
   );
   const onlyActivity = activityOnly(message);
-  const sources = [message, ...activity].toSorted((a, b) => a.time - b.time);
+  const sources = given.toSorted((a, b) => a.time - b.time);
   const hasExecution = logs.length > 0 || sources.some((source) => source.tools.length > 0);
   if (onlyActivity && !hasExecution) return null;
   return (
@@ -3059,13 +3088,16 @@ const MessageRow = ({
           {!onlyActivity ? <span>{time(message.time)}</span> : null}
           {hasExecution && !message.hidden ? (
             <ExecutionDetails failed={logs.some((log) => log.counts.failed > 0)}>
-              {sources
-                .filter((source) => source.tools.length)
-                .map((source) => (
-                  <div key={source.id} className="note">
-                    {time(source.time)} · {source.tools.join(", ")}
-                  </div>
-                ))}
+              {/* The turn's log lists every step's calls; each step's own note only without it. */}
+              {logs.length
+                ? null
+                : sources
+                    .filter((source) => source.tools.length)
+                    .map((source) => (
+                      <div key={source.id} className="note">
+                        {time(source.time)} · {source.tools.join(", ")}
+                      </div>
+                    ))}
               {logs.map((log) => (
                 <WorkLog
                   key={log.anchor ?? "open"}

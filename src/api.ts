@@ -1156,8 +1156,10 @@ export interface WorkPosition {
 }
 
 export interface WorkLog {
-  /** The message the log goes beneath, or null for a running turn with no reply yet. */
+  /** The turn's last shown dot reply, else its last dot step: never an input. Null with none. */
   anchor: string | null;
+  /** The turn's key, as `turns` gives each of its messages: see `turnKeys`. */
+  turn: string;
   /** The turn's newest calls, oldest first, as many as the response's budget holds. */
   calls: ToolCall[];
   /** Counts of every call the read saw, listed or not. */
@@ -1216,29 +1218,58 @@ export interface Traversed {
 type Message = Extract<WorkItem, { type: "message" }>;
 
 /**
+ * Which turn each item belongs to, by the idle before it: OpenCode records an idle whenever a
+ * session's busy period ends, so the items between two idles are one turn. `head` keys the items
+ * before the first idle the pages show: `start` only where OpenCode's history begins, `after:<idle>`
+ * where a read-back found the idle before them, else `head:<first item>`, which proves only that
+ * the same first item starts the same run. A revert can delete an idle and join two turns.
+ */
+export const turnKeys = (pages: readonly Traversed[], head: string) => {
+  const keys = new Map<string, string>();
+  let key = head;
+  for (const { items } of pages)
+    for (const item of items)
+      if (item.type === "idle") key = `after:${item.id}`;
+      else keys.set(item.id, key);
+  return keys;
+};
+
+/** `head` for pages whose first item has no proven start: see `turnKeys`. */
+const headKey = (pages: readonly Traversed[], start: string | undefined) =>
+  start ?? `head:${pages.flatMap((page) => page.items)[0]?.id ?? ""}`;
+
+/**
  * The logs of the turns whose end the pages show, in order: a turn ends at an idle, or, on the
  * latest page, is still open. A turn whose end lies on a newer page is that page's to show.
- * `pages` run oldest first; `startKnown` says whether the first item begins a turn. Each log lists
- * its newest calls within one shared budget, newest turn first, and says where the rest continue.
+ * `pages` run oldest first; `head` is the first item's turn key, as `turnKeys` takes it. Each log
+ * lists its newest calls within one shared budget, newest turn first, and says where the rest
+ * continue.
  */
 export const groupWork = (
   pages: readonly Traversed[],
-  { startKnown, latest }: { startKnown: boolean; latest: boolean },
+  { head, latest }: { head: string; latest: boolean },
 ): WorkLog[] => {
-  const turns: { items: { item: WorkItem; page: number }[]; start: boolean; end: boolean }[] = [];
+  const turns: {
+    items: { item: WorkItem; page: number }[];
+    start: boolean;
+    end: boolean;
+    key: string;
+  }[] = [];
   let current: { item: WorkItem; page: number }[] = [];
-  let start = startKnown;
+  let start = head === "start" || head.startsWith("after:");
+  let key = head;
   for (const [page, { items }] of pages.entries())
     for (const item of items) {
       if (item.type !== "idle") {
         current.push({ item, page });
         continue;
       }
-      turns.push({ items: current, start, end: true });
+      turns.push({ items: current, start, end: true, key });
       current = [];
       start = true;
+      key = `after:${item.id}`;
     }
-  if (current.length) turns.push({ items: current, start, end: false });
+  if (current.length) turns.push({ items: current, start, end: false, key });
   const fits = callBudget();
   const logs = turns.toReversed().flatMap((turn): WorkLog[] => {
     if (!turn.end && !latest) return [];
@@ -1251,7 +1282,9 @@ export const groupWork = (
     );
     const shown = messages.filter(({ item }) => item.shown).map(({ item }) => item);
     const reply = shown.findLast((item) => item.role === "assistant");
-    const anchor = reply?.id ?? shown.at(-1)?.id ?? null;
+    // Never an input: a turn without a shown reply goes beneath its last dot step.
+    const anchor =
+      reply?.id ?? messages.findLast(({ item }) => item.role === "assistant")?.item.id ?? null;
     const first = turn.items[0];
     // A cut turn's reply may follow calls on older pages, so it gets a log to load them by.
     if (!calls.length && (turn.start || !reply || !first)) return [];
@@ -1282,6 +1315,7 @@ export const groupWork = (
     return [
       {
         anchor,
+        turn: turn.key,
         calls: calls.slice(from),
         counts: workCounts(calls),
         complete: turn.start && !partial,
@@ -1293,16 +1327,18 @@ export const groupWork = (
   return logs.toReversed();
 };
 
-/** Items after the page's last idle, and whether it had one: the tail of a turn read backwards. */
+/** Items after the page's last idle, and that idle's ID: the tail of a turn read backwards. */
 const afterIdle = (work: readonly WorkItem[]) => {
   const at = work.findLastIndex((item) => item.type === "idle");
-  return { items: work.slice(at + 1), found: at >= 0 };
+  return { items: work.slice(at + 1), idle: work[at]?.id };
 };
 
 interface ConversationPage {
   entries: Entry[];
   next: string | undefined;
   work: WorkLog[];
+  /** Each entry's turn key: see `turnKeys`. */
+  turns: Map<string, string>;
 }
 
 const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
@@ -1333,7 +1369,8 @@ const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
     }
     // A turn cut by the page's start: read back at most two more pages to find where it began,
     // when its part in sight has calls or a reply that their log would go beneath.
-    let startKnown = !next;
+    // The first item's turn key, once proven: only OpenCode's own history start or a seen idle.
+    let start = next ? undefined : "start";
     let more: string | undefined = next;
     const window = pages.toReversed().flatMap((page) => page.items);
     const firstIdle = window.findIndex((item) => item.type === "idle");
@@ -1346,7 +1383,7 @@ const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
           (item.calls.length > 0 || (item.role === "assistant" && item.shown)),
       )
     )
-      for (let reads = 0; reads < 2 && more && !startKnown; reads++) {
+      for (let reads = 0; reads < 2 && more && !start; reads++) {
         const earlier: { work?: readonly WorkItem[]; next: string | undefined } =
           yield* oc.messagePage(dot.sessionID, workPageLimit, more);
         if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
@@ -1354,11 +1391,20 @@ const readConversation = (db: Db, dot: Dot, limit: number, cursor?: string) =>
           return error(502, "History cursor did not advance.");
         const tail = afterIdle(earlier.work ?? []);
         pages.push({ items: tail.items, next: earlier.next });
-        startKnown = tail.found || !earlier.next;
+        start = tail.idle ? `after:${tail.idle}` : earlier.next ? undefined : "start";
         more = earlier.next;
       }
-    const logs = groupWork(pages.toReversed(), { startKnown, latest: cursor === undefined });
-    return { entries, next, work: logs };
+    const traversed = pages.toReversed();
+    const head = headKey(traversed, start);
+    const logs = groupWork(traversed, { head, latest: cursor === undefined });
+    const keys = turnKeys(traversed, head);
+    const turns = new Map(
+      entries.flatMap((entry) => {
+        const key = keys.get(entry.id);
+        return key ? [[entry.id, key] as const] : [];
+      }),
+    );
+    return { entries, next, work: logs, turns };
   });
 
 type LatestConversation = (
@@ -1398,9 +1444,17 @@ const conversation = (
       return new Response(page.clone().body, { status: page.status, headers: page.headers });
     if (rebound(db, dot)) return error(409, "The dot's conversation changed. Refresh.");
     const { entries, next } = page;
+    const messages = visibleMessages(db, dot, entries);
     return Response.json({
-      messages: visibleMessages(db, dot, entries),
-      // Each turn's tool calls, beneath the message named by `anchor`.
+      messages,
+      // Each message's turn, so the app shows a turn's calls once, in that turn only.
+      turns: Object.fromEntries(
+        messages.flatMap((message) => {
+          const key = page.turns.get(message.id);
+          return key ? [[message.id, key]] : [];
+        }),
+      ),
+      // Each turn's tool calls, beneath the message named by `anchor`, in the turn named `turn`.
       work: page.work.map((log) => {
         const more = log.more && encodeWork(token, dot, log.more);
         // A position too long to carry is withheld, and the log says it is partial.

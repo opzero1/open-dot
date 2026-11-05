@@ -850,10 +850,12 @@ export const isDiff = (language: string | undefined, code: string) =>
 
 export interface WorkState {
   sessionID: string;
-  /** Logs by the message they go beneath. */
+  /** Logs by the message the daemon put them beneath. */
   logs: Map<string, WorkLogView>;
-  /** The latest page's running turn that has no message to go beneath yet. */
+  /** The latest page's running turn. */
   open: WorkLogView | undefined;
+  /** Each loaded message's turn key, from the newest read that showed it. */
+  turns: Map<string, string>;
 }
 
 export const groupActivity = <T>(
@@ -889,26 +891,151 @@ export const pageWork = (page: Pick<PageView, "work">): WorkLogView[] =>
   Array.isArray(page.work) ? page.work.filter((log) => fits(log, workLogShape)) : [];
 
 /**
- * Takes a page's logs into what's kept: a newer read of a turn replaces the older one, a latest
- * page sets the running turn, and only logs under loaded messages stay, so memory stays bounded.
+ * Takes a page's logs and turn keys into what's kept: a newer read of a turn replaces the older
+ * one, a latest page sets the running turn, and only what belongs to loaded messages stays, so
+ * memory stays bounded. A page without a well-formed key for a message takes that message's key
+ * away: an older read's key is never kept against a newer one that couldn't place it.
  */
 export const mergeWork = (
   current: WorkState | undefined,
-  page: Pick<PageView, "work" | "sessionID">,
+  page: Pick<PageView, "work" | "sessionID"> & Partial<Pick<PageView, "turns" | "messages">>,
   latest: boolean,
   loaded: ReadonlySet<string>,
 ): WorkState => {
-  const base =
+  const base: WorkState =
     current?.sessionID === page.sessionID
       ? current
-      : { sessionID: page.sessionID, logs: new Map<string, WorkLogView>(), open: undefined };
+      : { sessionID: page.sessionID, logs: new Map(), open: undefined, turns: new Map() };
   const logs = new Map([...base.logs].filter(([anchor]) => loaded.has(anchor)));
   let open = latest ? undefined : base.open;
+  // A taken log is its turn's newest snapshot: it replaces any other log kept for the same key,
+  // whichever message that one went beneath. A log without a key replaces only its anchor's.
+  const replace = (taken: WorkLogView) => {
+    if (taken.turn === undefined) return;
+    for (const [anchor, other] of logs) if (other.turn === taken.turn) logs.delete(anchor);
+    if (open !== taken && open?.turn === taken.turn) open = undefined;
+  };
   for (const log of pageWork(page)) {
-    if (log.anchor === null) open = latest ? log : open;
-    else if (loaded.has(log.anchor)) logs.set(log.anchor, log);
+    if (log.open) {
+      if (!latest) continue;
+      open = log;
+      replace(log);
+    } else if (log.anchor !== null && loaded.has(log.anchor)) {
+      replace(log);
+      logs.set(log.anchor, log);
+    }
   }
-  return { sessionID: page.sessionID, logs, open };
+  const turns = new Map([...base.turns].filter(([id]) => loaded.has(id)));
+  const given: unknown = page.turns;
+  const keys = typeof given === "object" && given !== null ? new Map(Object.entries(given)) : null;
+  for (const message of page.messages ?? []) {
+    const key: unknown = keys?.get(message.id);
+    if (typeof key === "string" && key && loaded.has(message.id)) turns.set(message.id, key);
+    else turns.delete(message.id);
+  }
+  return { sessionID: page.sessionID, logs, open, turns };
+};
+
+/**
+ * A conversation row: a message with the log and the tool-bearing `sources` its execution details
+ * show, oldest first, or a log alone. Each message with tools is a source of exactly one row or
+ * of the typing bubble; a row with no log and no source shows no execution details.
+ */
+export type TurnRow =
+  | { kind: "message"; message: MessageView; sources: MessageView[]; log: WorkLogView | undefined }
+  | { kind: "execution"; log: WorkLogView; after: string };
+
+/**
+ * Where each turn's execution details go, once per turn. With turn keys, a turn's tool-only steps
+ * and its log go to its newest loaded visible reply; with none yet, a running turn's go to the
+ * typing bubble and a finished turn's to its newest step, one compact row. Without a key, nothing
+ * is joined: a log stays beneath the dot message the daemon named, else in a row of its own after
+ * its anchor, never inside the owner's bubble; a step it lists has no row, and any other step has
+ * its own. A step with no text and no tools has no row. Owner, peer, notice and hidden messages
+ * always keep their own rows, and each step keeps its own ID and time.
+ */
+export const groupTurns = (
+  messages: readonly MessageView[],
+  work: WorkState | undefined,
+  busy: boolean,
+  activityOnly: (message: MessageView) => boolean,
+): { rows: TurnRow[]; bubble: { log: WorkLogView | undefined; steps: MessageView[] } } => {
+  const turnOf = (message: MessageView) =>
+    work?.sessionID === message.sessionID ? work.turns.get(message.id) : undefined;
+  const keyOf = (message: MessageView) =>
+    message.kind === "dot" && !message.hidden ? turnOf(message) : undefined;
+  const replies = new Map<string, MessageView>();
+  const steps = new Map<string, MessageView[]>();
+  // Every message of the turn with tools, replies included: the newest reply shows them all.
+  const tooled = new Map<string, MessageView[]>();
+  const last = new Map<string, string>();
+  for (const message of messages) {
+    const any = turnOf(message);
+    if (any !== undefined) last.set(any, message.id);
+    const key = keyOf(message);
+    if (key === undefined) continue;
+    if (message.tools.length) tooled.set(key, [...(tooled.get(key) ?? []), message]);
+    if (!activityOnly(message)) replies.set(key, message);
+    else if (message.tools.length) steps.set(key, [...(steps.get(key) ?? []), message]);
+  }
+  const openTurn = busy ? work?.open?.turn : undefined;
+  const bubbled = (key: string) => key === openTurn && !replies.has(key);
+  const byID = new Map(messages.map((message) => [message.id, message]));
+  const beneath = new Map<string, WorkLogView>();
+  const alone = new Map<string, WorkLogView[]>();
+  let bubble: WorkLogView | undefined;
+  const place = (log: WorkLogView, at: string | undefined) => {
+    if (at) alone.set(at, [...(alone.get(at) ?? []), log]);
+  };
+  const logs = work ? [...work.logs.values(), ...(work.open ? [work.open] : [])] : [];
+  for (const log of logs) {
+    const key = log.turn;
+    const running = busy && log === work?.open;
+    if (key !== undefined && last.has(key)) {
+      const host = replies.get(key) ?? steps.get(key)?.at(-1);
+      if (bubbled(key) || (running && !host)) bubble = log;
+      else if (host) beneath.set(host.id, log);
+      else place(log, last.get(key));
+      continue;
+    }
+    // An older daemon's log, or a turn none of whose messages is loaded: where the daemon put it.
+    const anchor = log.anchor === null ? undefined : byID.get(log.anchor);
+    if (anchor?.kind === "dot" && !anchor.hidden) beneath.set(anchor.id, log);
+    else if (running) bubble = log;
+    else place(log, anchor?.id);
+  }
+  const listed = new Set(
+    [...beneath.values(), ...[...alone.values()].flat(), ...(bubble ? [bubble] : [])].flatMap(
+      (log) => log.calls.map((call) => call.messageID),
+    ),
+  );
+  const rows: TurnRow[] = [];
+  for (const message of messages) {
+    const key = keyOf(message);
+    const own = beneath.get(message.id);
+    const self = message.tools.length ? [message] : [];
+    if (!activityOnly(message))
+      rows.push({
+        kind: "message",
+        message,
+        // An older reply of a turn keeps its row but shows no execution details of its own.
+        sources:
+          key === undefined ? self : replies.get(key) === message ? (tooled.get(key) ?? []) : [],
+        log: own,
+      });
+    else if (!message.tools.length && !own) {
+      // Nothing to show.
+    } else if (key !== undefined) {
+      const turn = steps.get(key) ?? [];
+      if (!replies.has(key) && !bubbled(key) && turn.at(-1) === message)
+        rows.push({ kind: "message", message, sources: turn, log: own });
+    } else if (own || !listed.has(message.id))
+      rows.push({ kind: "message", message, sources: self, log: own });
+    for (const log of alone.get(message.id) ?? [])
+      rows.push({ kind: "execution", log, after: message.id });
+  }
+  const open = openTurn !== undefined && bubbled(openTurn) ? (steps.get(openTurn) ?? []) : [];
+  return { rows, bubble: { log: bubble, steps: open } };
 };
 
 const editTools: ReadonlySet<string> = new Set(["edit", "write", "apply_patch", "multiedit"]);

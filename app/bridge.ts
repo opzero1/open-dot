@@ -147,6 +147,8 @@ export interface WorkCounts {
 /** One turn's tool calls, beneath the message `anchor` names, or none yet while it runs. */
 export interface WorkLogView {
   anchor: string | null;
+  /** The turn's key, as `PageView.turns` gives its messages; absent from an older daemon. */
+  turn?: string;
   calls: ToolCallView[];
   /** Counts of every call the daemon read, listed or not. */
   counts: WorkCounts;
@@ -185,6 +187,11 @@ export interface PageView {
   messages: MessageView[];
   /** Each turn's tool calls; absent from a daemon older than the work log. */
   work?: WorkLogView[];
+  /**
+   * Each message's turn, from OpenCode's idles: equal keys are one turn. Absent from an older
+   * daemon, and for a message whose turn the read couldn't place.
+   */
+  turns?: Record<string, string>;
   sessionID: string;
   next: string | null;
   pending: PendingView[];
