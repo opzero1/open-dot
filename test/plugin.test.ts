@@ -1997,6 +1997,36 @@ test("issue42 phase 3: ranked notes cap the list, and the ledger leads recall an
   }
 });
 
+test("automatic recall keeps an original owner message when observations fill every slot", async () => {
+  const db = openDatabase(databasePath());
+  filler(db);
+  archived(db, "msg_budget", "The Lisbon offsite budget is now 40k euros, not 30k.");
+  observed(db, "The Lisbon offsite budget needs a catering estimate.");
+  observed(db, "The Lisbon offsite budget includes transport.");
+  observed(db, "The Lisbon offsite budget will be reviewed next month.");
+  saveArchiveSettings(db, "jojo", { archive: true, autoRecall: true, ledger: true }, 1);
+  const loaded = await load(dot.directory, [
+    ownerAsk("msg_ask", "What is the Lisbon offsite budget?"),
+  ]);
+  try {
+    const tail = await loaded.injected(dot.sessionID);
+    const entries = recalledData(tail);
+    expect(entries).toHaveLength(3);
+    expect(entries?.find((entry) => entry.message === "msg_budget")).toMatchObject({
+      message: "msg_budget",
+      sessionID: dot.sessionID,
+      from: "owner",
+      date: new Date(5).toISOString(),
+      matched: ["offsite", "lisbon", "budget"],
+      excerpt: "The Lisbon offsite budget is now 40k euros, not 30k.",
+    });
+    expect(Buffer.byteLength(recalledPart(tail))).toBeLessThanOrEqual(autoRecallBytes);
+  } finally {
+    await loaded.cleanup?.();
+    db.$client.close();
+  }
+});
+
 test("issue42 phase 3: a forget, the ledger turned off or a native compaction strip observed recall at once", async () => {
   const db = openDatabase(databasePath());
   filler(db);
