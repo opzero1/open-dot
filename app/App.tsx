@@ -74,13 +74,14 @@ import {
   unlistedTapback,
   unreadSince,
   workerActions,
+  workerTitle,
   type WorkState,
   logCounts,
   turnCalls,
   workSummary,
 } from "./chat";
 import { Feed } from "./Feed";
-import { RequestList, useRequests } from "./Requests";
+import { RequestList, RequestNotice, type Requests, useRequests } from "./Requests";
 import { Instructions } from "./Instructions";
 import { DiffBlock, Markdown } from "./Markdown";
 import { Memory } from "./Memory";
@@ -222,13 +223,21 @@ const Thumb = ({
 
 const needsCount = (dot: DotView) =>
   dot.workers.reduce((sum, worker) => sum + worker.needs.length, 0) +
-  dot.sessions.reduce((sum, item) => sum + item.needs.length, 0);
+  dot.sessions.reduce((sum, item) => sum + item.needs.length, 0) +
+  (dot.threads ?? []).reduce((sum, item) => sum + item.needs.length, 0);
 
 interface Menu {
   message: MessageView;
   x: number;
   y: number;
   details?: boolean;
+}
+
+interface SelectedReply {
+  message: MessageView;
+  text: string;
+  x: number;
+  y: number;
 }
 
 interface Toast {
@@ -318,6 +327,8 @@ const App = () => {
   };
   // Messages a selection spans in the open chat, which history trimming keeps.
   const selectionKeep = useRef<ReadonlySet<string>>(new Set());
+  const composer = useRef<HTMLTextAreaElement>(null);
+  const quoteCaret = useRef<{ dot: string; text: string } | undefined>(undefined);
 
   const conversation = selected ? conversations.get(selected) : undefined;
   const dot = dots.find((item) => item.name === selected);
@@ -331,6 +342,15 @@ const App = () => {
       ),
     [updateDrafts],
   );
+
+  useLayoutEffect(() => {
+    const pending = quoteCaret.current;
+    if (!pending || pending.dot !== selected || pending.text !== draft.text || !composer.current)
+      return;
+    quoteCaret.current = undefined;
+    composer.current.focus();
+    composer.current.setSelectionRange(draft.text.length, draft.text.length);
+  }, [selected, draft.text]);
 
   const setComposerError = useCallback((name: string, text: string | undefined) => {
     setComposerErrors((current) =>
@@ -1418,7 +1438,7 @@ const App = () => {
                   setDotInfo({
                     role: "dialog",
                     title: `About ${dot.name}`,
-                    text: `${dot.purpose || "No description set."}\n\nStatus: ${dot.busy ? "Working" : "Idle"}\nWorkers: ${dot.workers.length}\nNeeds you: ${needsCount(dot)}`,
+                    text: `${dot.purpose || "No description set."}\n\nStatus: ${dot.busy ? "Working" : "Idle"}\nWorkers: ${dot.workers.length + (dot.threads?.length ?? 0)}\nNeeds you: ${needsCount(dot)}`,
                     buttons: [{ label: "Close" }],
                   })
                 }
@@ -1444,6 +1464,8 @@ const App = () => {
               />
             ) : null}
             <MessageList
+              requests={requests}
+              ask={setAsk}
               key={`${dot.name}:${conversation.sessionID}`}
               dot={dot.name}
               rows={rows}
@@ -1464,6 +1486,26 @@ const App = () => {
               onRetry={(message) => retry(dot.name, message.id)}
               onPending={(pending, change) => changePending(dot.name, pending, change)}
               onCopyText={(text) => void bridge.copyText(text)}
+              onReplySelection={(selection) => {
+                const current = conversationsRef.current.get(dot.name);
+                const message = current?.messages.find((item) => item.id === selection.message.id);
+                if (
+                  selectedRef.current !== dot.name ||
+                  current?.sessionID !== selection.message.sessionID ||
+                  !message ||
+                  message.hidden ||
+                  message.text !== selection.message.text
+                )
+                  return;
+                const existing = draftsRef.current.get(dot.name) ?? emptyDraft();
+                const quote = selection.text
+                  .split("\n")
+                  .map((line) => `> ${line}`)
+                  .join("\n");
+                const text = `${existing.text}${existing.text ? "\n\n" : ""}${quote}\n\n`;
+                quoteCaret.current = { dot: dot.name, text };
+                setDraft(dot.name, (value) => editDraft(value, text, Date.now()));
+              }}
               onForget={(attempt) => {
                 setConfirm({
                   text: "Stop tracking this message? open-dot never confirmed it, and it won't be sent again.",
@@ -1522,6 +1564,7 @@ const App = () => {
               ) : null}
               <div className="composer-row">
                 <textarea
+                  ref={composer}
                   value={draft.text}
                   rows={1}
                   placeholder={`Message ${dot.name}`}
@@ -1836,8 +1879,13 @@ const SentPreview = ({ dot, sent }: { dot: string; sent: Captured }) => (
   </>
 );
 
+const replyContent = (node: Node | null | undefined) =>
+  (node instanceof Element ? node : node?.parentElement)?.closest("[data-reply-content]");
+
 const MessageList = ({
   dot,
+  requests,
+  ask,
   rows,
   conversation,
   delivered,
@@ -1856,9 +1904,12 @@ const MessageList = ({
   onRetry,
   onPending,
   onCopyText,
+  onReplySelection,
   onForget,
 }: {
   dot: string;
+  requests: Requests;
+  ask: (value: Ask) => void;
   rows: Row[];
   conversation: Conversation;
   delivered: string | undefined;
@@ -1877,6 +1928,7 @@ const MessageList = ({
   onRetry: (message: MessageView) => void;
   onPending: (pending: PendingView, change: "steer" | "cancel") => void;
   onCopyText: (text: string) => void;
+  onReplySelection: (selection: SelectedReply) => void;
   onForget: (attempt: Attempt) => void;
 }) => {
   const scroller = useRef<HTMLDivElement>(null);
@@ -1888,6 +1940,7 @@ const MessageList = ({
   // The rows a selection starts and ends in, by key, so prepends and polls can't shift it; every
   // row between them stays rendered, and history trimming keeps their messages.
   const selection = useRef<[string, string] | undefined>(undefined);
+  const [replySelection, setReplySelection] = useState<SelectedReply>();
 
   const rangeExtractor = useCallback((range: Range) => {
     const indexes = new Set(defaultRangeExtractor(range));
@@ -1933,6 +1986,33 @@ const MessageList = ({
         }
       }
       keep.current = ids;
+      if (document.activeElement?.closest("[data-selection-reply]")) return;
+      const range = current?.rangeCount ? current.getRangeAt(0) : undefined;
+      const start = replyContent(range?.startContainer);
+      const end = replyContent(range?.endContainer);
+      const id = start?.closest<HTMLElement>("[data-message]")?.dataset.message;
+      const row = rowsRef.current.find((item) => item.kind === "message" && item.message.id === id);
+      const text = current?.toString() ?? "";
+      if (
+        !range ||
+        !start ||
+        start !== end ||
+        !scroller.current?.contains(start) ||
+        !text.trim() ||
+        row?.kind !== "message" ||
+        row.message.hidden ||
+        range.cloneContents().querySelector("button, input, textarea, select")
+      ) {
+        setReplySelection(undefined);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      setReplySelection({
+        message: row.message,
+        text,
+        x: Math.max(8, Math.min(rect.left, window.innerWidth - 150)),
+        y: Math.max(8, rect.top - 36),
+      });
     };
     document.addEventListener("selectionchange", update);
     return () => {
@@ -1979,6 +2059,7 @@ const MessageList = ({
   });
 
   const onScroll = () => {
+    setReplySelection(undefined);
     const element = scroller.current;
     if (!element) return;
     atBottom.current =
@@ -2000,6 +2081,33 @@ const MessageList = ({
       data-first={conversation.messages[0]?.id}
       data-detached={conversation.detached ? "" : undefined}
     >
+      {replySelection ? (
+        <div
+          className="selection-reply"
+          data-selection-reply
+          role="toolbar"
+          aria-label="Selected text"
+          style={{ left: replySelection.x, top: replySelection.y }}
+          onPointerDown={(event) => event.preventDefault()}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") setReplySelection(undefined);
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              onReplySelection(replySelection);
+              setReplySelection(undefined);
+              document.getSelection()?.removeAllRanges();
+            }}
+          >
+            Reply
+          </button>
+          <button type="button" onClick={() => onCopyText(replySelection.text)}>
+            Copy
+          </button>
+        </div>
+      ) : null}
       {olderError ? (
         <div className="older-error" role="status" data-older-error>
           Couldn't load older messages: {olderError}
@@ -2041,6 +2149,8 @@ const MessageList = ({
             >
               {row.kind === "message" ? (
                 <MessageRow
+                  requests={requests}
+                  ask={ask}
                   dot={dot}
                   message={row.message}
                   activity={row.activity}
@@ -2475,6 +2585,8 @@ const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
 
 const MessageRow = ({
   dot,
+  requests,
+  ask,
   message,
   activity,
   logs,
@@ -2487,6 +2599,8 @@ const MessageRow = ({
   onRetry,
 }: {
   dot: string;
+  requests: Requests;
+  ask: (value: Ask) => void;
   message: MessageView;
   activity: MessageView[];
   logs: WorkLogView[];
@@ -2531,6 +2645,15 @@ const MessageRow = ({
       data-activity-only={onlyActivity || undefined}
       data-blocked={blocked ? "" : undefined}
       onContextMenu={(event) => {
+        const selectedText = document.getSelection();
+        if (
+          selectedText &&
+          !selectedText.isCollapsed &&
+          selectedText.toString() &&
+          event.currentTarget.contains(selectedText.anchorNode) &&
+          event.currentTarget.contains(selectedText.focusNode)
+        )
+          return;
         event.preventDefault();
         open(event.clientX, event.clientY);
       }}
@@ -2546,12 +2669,24 @@ const MessageRow = ({
       ) : null}
       {message.feed ? <div className="feed-card">{message.feed.title}</div> : null}
       <div className="bubble">
-        {message.kind === "owner" ? (
+        {message.kind === "notice" ? (
+          <RequestNotice
+            dot={dot}
+            reference={message.requestNotice}
+            text={message.text}
+            requests={requests}
+            ask={ask}
+          />
+        ) : message.kind === "owner" ? (
           message.text ? (
-            <div className="plain">{message.text}</div>
+            <div className="plain" data-reply-content>
+              {message.text}
+            </div>
           ) : null
         ) : message.text ? (
-          <Markdown text={message.text} media={media} />
+          <div data-reply-content>
+            <Markdown text={message.text} media={media} />
+          </div>
         ) : null}
         {message.attachments.length ? (
           <div className="thumbs">
@@ -2578,26 +2713,6 @@ const MessageRow = ({
           </div>
         ) : null}
       </div>
-      {hasExecution && !message.hidden ? (
-        <ExecutionDetails failed={logs.some((log) => log.counts.failed > 0)}>
-          {sources
-            .filter((source) => source.tools.length)
-            .map((source) => (
-              <div key={source.id} className="note">
-                {time(source.time)} · {source.tools.join(", ")}
-              </div>
-            ))}
-          {logs.map((log) => (
-            <WorkLog
-              key={log.anchor ?? "open"}
-              dot={dot}
-              sessionID={message.sessionID}
-              log={log}
-              running={busy}
-            />
-          ))}
-        </ExecutionDetails>
-      ) : null}
       {reactions.length ? (
         <div className="reactions">
           {reactions.map((reaction) => (
@@ -2611,9 +2726,29 @@ const MessageRow = ({
           ))}
         </div>
       ) : null}
-      {!onlyActivity ? (
+      {!onlyActivity || hasExecution ? (
         <div className="meta">
-          <span>{time(message.time)}</span>
+          {!onlyActivity ? <span>{time(message.time)}</span> : null}
+          {hasExecution && !message.hidden ? (
+            <ExecutionDetails failed={logs.some((log) => log.counts.failed > 0)}>
+              {sources
+                .filter((source) => source.tools.length)
+                .map((source) => (
+                  <div key={source.id} className="note">
+                    {time(source.time)} · {source.tools.join(", ")}
+                  </div>
+                ))}
+              {logs.map((log) => (
+                <WorkLog
+                  key={log.anchor ?? "open"}
+                  dot={dot}
+                  sessionID={message.sessionID}
+                  log={log}
+                  running={busy}
+                />
+              ))}
+            </ExecutionDetails>
+          ) : null}
           {delivered ? <span className="delivered">Delivered</span> : null}
           {onRetry ? (
             <span className="unconfirmed" data-unconfirmed>
@@ -2627,7 +2762,7 @@ const MessageRow = ({
               </button>
             </span>
           ) : null}
-          {message.hidden ? (
+          {onlyActivity ? null : message.hidden ? (
             <button type="button" disabled={blocked} onClick={() => onRestore(message)}>
               Restore
             </button>
@@ -2835,7 +2970,9 @@ const MessageMenu = ({
   );
 };
 
-type WorkerTarget = { kind: "worker" | "request"; id: number; title: string };
+type WorkerTarget =
+  | { kind: "worker" | "request"; id: number; title: string }
+  | { kind: "threads"; id: string; dot: string; title: string };
 
 const WorkerPanel = ({
   target,
@@ -2844,7 +2981,7 @@ const WorkerPanel = ({
 }: {
   target: WorkerTarget;
   onClose: () => void;
-  onOpen: () => void;
+  onOpen: (() => void) | undefined;
 }) => {
   const [view, setView] = useState<WorkerConversation>();
   const [error, setError] = useState<string>();
@@ -2854,14 +2991,22 @@ const WorkerPanel = ({
     let live = true;
     let timer: ReturnType<typeof setTimeout>;
     const read = async () => {
-      const result = await bridge
-        .call(target.kind === "worker" ? "workerConversation" : "requestConversation", target.id)
-        .catch(() => ({ ok: false as const, error: "Couldn't read this conversation." }));
+      const result = await (
+        target.kind === "threads"
+          ? bridge.call("threadConversation", target.dot, target.id)
+          : bridge.call(
+              target.kind === "worker" ? "workerConversation" : "requestConversation",
+              target.id,
+            )
+      ).catch(() => ({ ok: false as const, error: "Couldn't read this conversation." }));
       if (!live) return;
       if (result.ok) {
         setView(result.value);
         setError(undefined);
-      } else setError(result.error);
+      } else {
+        setError(result.error);
+        if (target.kind === "threads") setView(undefined);
+      }
       timer = setTimeout(() => void read(), 5_000);
     };
     void read();
@@ -2869,7 +3014,7 @@ const WorkerPanel = ({
       live = false;
       clearTimeout(timer);
     };
-  }, [target.kind, target.id]);
+  }, [target]);
   return (
     <section
       className="worker-panel"
@@ -2887,9 +3032,11 @@ const WorkerPanel = ({
         <IconButton ref={close} icon="close" label="Close worker panel" onClick={onClose} />
       </header>
       <p className="note">
-        Read-only recent conversation. Replying and attachments are available in the terminal.
+        {target.kind === "threads"
+          ? "Read-only recent conversation. Lifecycle actions remain in Threads."
+          : "Read-only recent conversation. Replying and attachments are available in the terminal."}
       </p>
-      <IconButton icon="terminal" label="Open in terminal" onClick={onOpen} />
+      {onOpen ? <IconButton icon="terminal" label="Open in terminal" onClick={onOpen} /> : null}
       {error ? (
         <p className="item-error" role="status">
           {view ? "Not up to date. " : ""}
@@ -2966,7 +3113,14 @@ const Workers = ({
   const [busy, setBusy] = useState(new Set<number>());
   const [selected, setSelected] = useState<WorkerTarget>();
   const trigger = useRef<HTMLButtonElement | null>(null);
-  if (!dot.workers.length && !dot.sessions.length && !selected) return null;
+  if (
+    !dot.workers.length &&
+    !dot.sessions.length &&
+    !dot.threads?.length &&
+    !dot.threadsError &&
+    !selected
+  )
+    return null;
   const pick = (target: WorkerTarget, button: HTMLButtonElement) => {
     trigger.current = button;
     setSelected(target);
@@ -3011,7 +3165,37 @@ const Workers = ({
   return (
     <aside className="worker-sidebar" aria-label="Workers">
       <h2>Workers</h2>
+      {dot.threadsError ? (
+        <p className="warning" role="status">
+          {dot.threadsError}
+        </p>
+      ) : null}
       <div className="workers">
+        {(dot.threads ?? []).map((worker) => (
+          <div key={worker.sessionID} className="worker" data-thread={worker.sessionID}>
+            <button
+              type="button"
+              className="worker-select"
+              aria-label={`View Threads worker: ${workerTitle(worker.title)}`}
+              title={worker.title}
+              aria-pressed={selected?.kind === "threads" && selected.id === worker.sessionID}
+              onClick={(event) =>
+                pick(
+                  {
+                    kind: "threads",
+                    dot: dot.name,
+                    id: worker.sessionID,
+                    title: workerTitle(worker.title),
+                  },
+                  event.currentTarget,
+                )
+              }
+            >
+              <span className="worker-task">{workerTitle(worker.title)}</span>
+              {state(worker.needs, worker.waiting, worker.state)}
+            </button>
+          </div>
+        ))}
         {dot.workers.map((worker) => {
           const actions = workerActions(worker.state);
           return (
@@ -3024,13 +3208,17 @@ const Workers = ({
               <button
                 type="button"
                 className="worker-select"
-                aria-label={`View worker: ${worker.task}`}
+                aria-label={`View worker: ${workerTitle(worker.task)}`}
+                title={worker.task}
                 aria-pressed={selected?.kind === "worker" && selected.id === worker.id}
                 onClick={(event) =>
-                  pick({ kind: "worker", id: worker.id, title: worker.task }, event.currentTarget)
+                  pick(
+                    { kind: "worker", id: worker.id, title: workerTitle(worker.task) },
+                    event.currentTarget,
+                  )
                 }
               >
-                <span className="worker-task">{worker.task}</span>
+                <span className="worker-task">{workerTitle(worker.task)}</span>
                 {state(
                   worker.needs,
                   worker.waiting,
@@ -3059,16 +3247,21 @@ const Workers = ({
             <button
               type="button"
               className="worker-select"
-              aria-label={`View session: ${item.title ?? item.sessionID}`}
+              aria-label={`View session: ${workerTitle(item.title ?? item.sessionID)}`}
+              title={item.title ?? item.sessionID}
               aria-pressed={selected?.kind === "request" && selected.id === item.request}
               onClick={(event) =>
                 pick(
-                  { kind: "request", id: item.request, title: item.title ?? item.sessionID },
+                  {
+                    kind: "request",
+                    id: item.request,
+                    title: workerTitle(item.title ?? item.sessionID),
+                  },
                   event.currentTarget,
                 )
               }
             >
-              <span className="worker-task">{item.title ?? item.sessionID}</span>
+              <span className="worker-task">{workerTitle(item.title ?? item.sessionID)}</span>
               {state(item.needs, item.waiting, item.source)}
             </button>
           </div>
@@ -3079,12 +3272,15 @@ const Workers = ({
           key={`${selected.kind}:${selected.id}`}
           target={selected}
           onClose={close}
-          onOpen={() =>
-            void (
-              selected.kind === "worker"
-                ? bridge.openWorker(selected.id)
-                : bridge.openRequest(selected.id)
-            ).then(opened)
+          onOpen={
+            selected.kind === "threads"
+              ? undefined
+              : () =>
+                  void (
+                    selected.kind === "worker"
+                      ? bridge.openWorker(selected.id)
+                      : bridge.openRequest(selected.id)
+                  ).then(opened)
           }
         />
       ) : null}

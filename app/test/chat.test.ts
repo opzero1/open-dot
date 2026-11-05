@@ -38,6 +38,7 @@ import {
   unlistedTapback,
   unreadSince,
   workerActions,
+  workerTitle,
   activityLine,
   elapsed,
   firstLines,
@@ -48,6 +49,25 @@ import {
   workSummary,
   groupActivity,
 } from "../chat";
+
+test("worker titles remove only anchored work attribution and preserve meaningful names and casing", () => {
+  for (const name of ["Alice Chen", "Bashir", "Élodie Martin", "The owner", "User"]) {
+    const full = `${name} asked me to fix the build\nKeep the full task in its original source.`;
+    expect(workerTitle(full)).toBe("Fix the build");
+    expect(full).toContain(name);
+  }
+  expect(workerTitle("Nora requested us to review the change")).toBe("Review the change");
+  expect(workerTitle("  \n\n iOS build checks\nMore detail  ")).toBe("iOS build checks");
+  expect(workerTitle("Alice asked to join the project")).toBe("Alice asked to join the project");
+  expect(workerTitle("Review Alice and Bashir's changes")).toBe(
+    "Review Alice and Bashir's changes",
+  );
+  expect(workerTitle("Explicit Title from Threads")).toBe("Explicit Title from Threads");
+  expect(workerTitle("  ")).toBe("Worker");
+  const long = workerTitle("x".repeat(120));
+  expect(long.length).toBeLessThanOrEqual(88);
+  expect(long).toBe(`${"x".repeat(85)}…`);
+});
 
 test("links open only as http, https or mailto, without credentials or hidden characters", () => {
   expect(safeExternalURL("https://example.com/a?b=1#c")).toBe("https://example.com/a?b=1#c");

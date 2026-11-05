@@ -102,18 +102,54 @@ button:disabled {
 }
 
 .execution-details {
-  margin-top: 4px;
+  display: contents;
+}
+
+.execution-details > .icon-button {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  padding: 3px;
+  border: none;
+  background: transparent;
+}
+
+.execution-details > .icon-button::before {
+  content: "";
+  position: absolute;
+  inset: -3px;
+}
+
+.execution-details > .icon-button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.meta .execution-content {
+  order: 1;
+  flex-basis: 100%;
+  min-width: 0;
+}
+
+.typing > .execution-details > .icon-button {
+  margin-left: 6px;
 }
 
 .execution-content {
+  --execution-radius: 8px;
+  --execution-padding: 8px;
+  --execution-border: 1px;
   margin-top: 6px;
-  padding: 8px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  padding: var(--execution-padding);
+  border: var(--execution-border) solid var(--line);
+  border-radius: var(--execution-radius);
 }
 
-.message[data-activity-only] {
-  margin-block: 4px;
+.execution-content .tool-text pre {
+  border-radius: max(
+    0px,
+    calc(var(--execution-radius) - var(--execution-padding) - var(--execution-border))
+  );
 }
 
 .message[data-activity-only] > .bubble {
@@ -362,6 +398,34 @@ button:disabled {
   align-items: flex-end;
 }
 
+.selection-reply {
+  --selection-radius: 8px;
+  --selection-padding: 3px;
+  --selection-border: 1px;
+  position: fixed;
+  z-index: 9;
+  display: flex;
+  gap: 2px;
+  padding: var(--selection-padding);
+  border: var(--selection-border) solid var(--line);
+  border-radius: var(--selection-radius);
+  background: var(--bg);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+}
+
+.selection-reply > button {
+  border: none;
+  border-radius: max(
+    0px,
+    calc(var(--selection-radius) - var(--selection-padding) - var(--selection-border))
+  );
+}
+
+.selection-reply > button:hover,
+.selection-reply > button:focus-visible {
+  background: var(--panel);
+}
+
 .message.owner .bubble {
   background: var(--bubble);
   border-radius: 14px;
@@ -369,10 +433,68 @@ button:disabled {
   max-width: 80%;
 }
 
-.message.notice .bubble,
 .message.peer .bubble {
   border-left: 3px solid var(--line);
   padding-left: 12px;
+}
+
+.message.notice > .bubble {
+  width: min(100%, 560px);
+}
+
+.request-notice {
+  --notice-radius: 12px;
+  --notice-padding: 12px;
+  --notice-border: 1px;
+  --notice-inner-radius: max(
+    0px,
+    calc(var(--notice-radius) - var(--notice-padding) - var(--notice-border))
+  );
+  padding: var(--notice-padding);
+  border: var(--notice-border) solid var(--line);
+  border-radius: var(--notice-radius);
+  background: var(--panel);
+}
+
+.request-notice > button {
+  border-radius: var(--notice-inner-radius);
+}
+
+.notice-request-details > .request-card {
+  --request-radius: var(--notice-inner-radius);
+}
+
+.notice-origin,
+.notice-action {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.notice-title,
+.notice-action {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.request-notice > button,
+.request-notice > details {
+  margin-top: 8px;
+}
+
+.request-notice > details > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.request-notice pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow: auto;
+  font-size: 11px;
 }
 
 .message.hidden {
@@ -398,12 +520,17 @@ button:disabled {
 
 .meta {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
   min-height: 20px;
 }
 
 .meta .more {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 20px;
   border: none;
   opacity: 0;
 }
@@ -815,12 +942,19 @@ button:disabled {
 }
 
 .menu {
+  --menu-radius: 10px;
+  --menu-padding: 6px;
+  --menu-border: 1px;
+  --menu-inner-radius: max(
+    0px,
+    calc(var(--menu-radius) - var(--menu-padding) - var(--menu-border))
+  );
   position: fixed;
   width: 248px;
   background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 6px;
+  border: var(--menu-border) solid var(--line);
+  border-radius: var(--menu-radius);
+  padding: var(--menu-padding);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   display: flex;
   flex-direction: column;
@@ -829,6 +963,7 @@ button:disabled {
 
 .menu > button {
   border: none;
+  border-radius: var(--menu-inner-radius);
   text-align: left;
   padding: 4px 8px;
 }
@@ -856,13 +991,13 @@ button:disabled {
 
 .emoji-row button {
   border: none;
+  border-radius: var(--menu-inner-radius);
   font-size: 18px;
   padding: 2px 4px;
 }
 
 .emoji-row .chosen {
   background: var(--accent);
-  border-radius: 6px;
 }
 
 .danger {
@@ -1679,10 +1814,26 @@ button:disabled {
 }
 
 .request-card {
-  border: 1px solid var(--border, #8884);
-  border-radius: 8px;
-  padding: 8px 10px;
+  --request-radius: 8px;
+  --request-padding-x: 10px;
+  --request-padding-y: 8px;
+  --request-border: 1px;
+  border: var(--request-border) solid var(--border, #8884);
+  border-radius: var(--request-radius);
+  padding: var(--request-padding-y) var(--request-padding-x);
   margin-bottom: 8px;
+}
+
+.request-actions > button,
+.request-actions > input,
+.request-form input:not([type="radio"]):not([type="checkbox"]),
+.request-form textarea,
+.request-form select {
+  border-radius: max(
+      0px,
+      calc(var(--request-radius) - var(--request-padding-x) - var(--request-border))
+    ) /
+    max(0px, calc(var(--request-radius) - var(--request-padding-y) - var(--request-border)));
 }
 
 .request-head {

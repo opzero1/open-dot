@@ -276,6 +276,9 @@ const requestCard = (id: number, change: Record<string, unknown> = {}) => ({
   ...change,
 });
 
+const noticeStatus = (id: number) =>
+  `document.querySelector('[data-request-notice="${id}"] > [role="status"]')?.textContent`;
+
 const worker = (id: number, state: string, needs: string[] = []) => ({
   id,
   state,
@@ -309,8 +312,15 @@ class FakeDaemon {
   reactions = new Map<string, string>();
   pending: { id: string; status: string; delivery: string | null }[] = [];
   receipts = new Map<string, string>();
+  noticeReceipts = new Map<number, ReturnType<typeof requestCard> | number>();
+  noticeReads: number[] = [];
+  noticeHold: Promise<void> | undefined;
+  pendingFailure = false;
   failing = new Set<string>();
   workers: object[] = [];
+  threads: object[] = [];
+  threadsError: string | null = null;
+  threadFailure = false;
   sessions: object[] = [];
   busy = false;
   // The work log the latest page carries, the activity it reports and each call's detail.
@@ -442,6 +452,8 @@ class FakeDaemon {
           busy: this.busy,
           avatar: this.avatar ? { revision: this.avatar.revision } : null,
           workers: this.workers,
+          threads: this.threads,
+          threadsError: this.threadsError,
           sessions: this.sessions,
         },
         ...[...this.others.keys()].map((name) => ({
@@ -647,6 +659,29 @@ class FakeDaemon {
       return Response.json({ ok: true });
     }
     const conversation = /^\/(workers|requests)\/(\d+)\/conversation$/.exec(path);
+    if (path === "/dots/jojo/threads/ses_thread1/conversation" && method === "GET") {
+      this.log.conversations.push(path);
+      return this.threadFailure
+        ? json({ error: "Thread transcript unavailable" }, 503)
+        : json({
+            title: "Public worker",
+            sessionID: "ses_thread1",
+            directory: "/work/thread1",
+            state: "working",
+            more: true,
+            messages: [
+              {
+                id: "msg_thread",
+                role: "assistant",
+                text: "Checked **the build**.",
+                time: now,
+                tools: [],
+                attachments: 0,
+                truncated: false,
+              },
+            ],
+          });
+    }
     if (conversation && method === "GET") {
       this.log.conversations.push(path);
       return json({
@@ -754,6 +789,7 @@ class FakeDaemon {
       return json({ fact: saved });
     }
     if (path === "/requests/pending") {
+      if (this.pendingFailure) return json({ error: "Pending requests unavailable" }, 503);
       // Oldest first after `after`, `limit` a page, as the daemon pages them.
       const after = Number(url.searchParams.get("after") ?? 0);
       const limit = Number(url.searchParams.get("limit") ?? 50);
@@ -769,6 +805,16 @@ class FakeDaemon {
         requests: page,
         next: rows.length > limit ? (page.at(-1)?.id ?? null) : null,
       });
+    }
+    const receipt = /^\/dots\/jojo\/requests\/(\d+)$/.exec(path)?.[1];
+    if (receipt && method === "GET") {
+      const id = Number(receipt);
+      this.noticeReads.push(id);
+      if (id === 71) await this.noticeHold;
+      const card = this.noticeReceipts.get(id);
+      return typeof card === "object"
+        ? json({ request: card, attempts: [] })
+        : json({ error: "Unavailable" }, card ?? 404);
     }
     const opening = /^\/requests\/(\d+)\/open$/.exec(path)?.[1];
     if (opening && method === "POST") {
@@ -1182,6 +1228,66 @@ const launch = async (
 
 type App = Awaited<ReturnType<typeof launch>>;
 
+const smokePage = async (temporary: string) => {
+  const portFile = join(temporary, "..", "app-data", "DevToolsActivePort");
+  for (let tick = 0; tick < 100 && !existsSync(portFile); tick++) await delay(100);
+  const port = Number(readFileSync(portFile, "utf8").split("\n")[0]);
+  const targets = (await (
+    await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(10_000) })
+  ).json()) as { type: string; webSocketDebuggerUrl: string }[];
+  const target = targets.find((item) => item.type === "page");
+  if (!target) throw new Error("No isolated smoke page");
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.close();
+      reject(new Error("Smoke page connection timed out"));
+    }, 10_000);
+    socket.addEventListener(
+      "open",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+    socket.addEventListener(
+      "error",
+      () => {
+        clearTimeout(timer);
+        reject(new Error("Smoke page connection failed"));
+      },
+      { once: true },
+    );
+  });
+  let id = 0;
+  return {
+    close: () => socket.close(),
+    send: (method: string, params: object): Promise<{ data?: string }> =>
+      new Promise((resolve, reject) => {
+        const next = ++id;
+        const timer = setTimeout(() => {
+          socket.removeEventListener("message", receive);
+          reject(new Error(`Smoke ${method} timed out`));
+        }, 10_000);
+        function receive(event: MessageEvent) {
+          const answer = JSON.parse(String(event.data)) as {
+            id?: number;
+            result?: { data?: string };
+            error?: object;
+          };
+          if (answer.id !== next) return;
+          clearTimeout(timer);
+          socket.removeEventListener("message", receive);
+          if (answer.error) reject(new Error(JSON.stringify(answer.error)));
+          else resolve(answer.result ?? {});
+        }
+        socket.addEventListener("message", receive);
+        socket.send(JSON.stringify({ id: next, method, params }));
+      }),
+  };
+};
+
 const openInboxPane = async (
   { js, until }: Pick<App, "js" | "until">,
   pane: "feed" | "needs" = "feed",
@@ -1274,6 +1380,7 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
     (fake) => {
       fake.busy = true;
       fake.messages = [
+        { id: "msg_tool_only", kind: "dot", text: "", extra: { tools: ["dot_update"] } },
         { id: "msg_owner", kind: "owner", text: "Fix it" },
         {
           id: "msg_reply",
@@ -1401,18 +1508,23 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
       ).toEqual({ dots: 3, state: "jojo is working", details: false, timer: false });
       expect(
         await js(
-          `({ rows: document.querySelectorAll("[data-message]").length, timestamps: document.querySelectorAll("[data-message] .meta").length, activityOnly: document.querySelectorAll("[data-activity-only]").length, raw: t.list().textContent.includes("dot_update"), logs: document.querySelectorAll("[data-work-log]").length, failed: t.msg("msg_reply").querySelector('[role="status"]').textContent, expanded: t.msg("msg_reply").querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"), liveRaw: document.querySelector("[data-activity]").textContent.includes("bash") })`,
+          `({ rows: document.querySelectorAll("[data-message]").length, timestamps: document.querySelectorAll("[data-message]:not([data-activity-only]) > .meta > span:first-child").length, activityOnly: document.querySelectorAll("[data-activity-only]").length, raw: t.list().textContent.includes("dot_update"), logs: document.querySelectorAll("[data-work-log]").length, failed: t.msg("msg_reply").querySelector('[role="status"]').textContent, expanded: t.msg("msg_reply").querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"), liveRaw: document.querySelector("[data-activity]").textContent.includes("bash") })`,
         ),
       ).toEqual({
-        rows: 3,
+        rows: 4,
         timestamps: 3,
-        activityOnly: 0,
+        activityOnly: 1,
         raw: false,
         logs: 0,
         failed: "Execution failed",
         expanded: "false",
         liveRaw: false,
       });
+      expect(
+        await js(
+          `(() => { const row = t.msg('msg_tool_only'); const meta = row.querySelector('.meta'); return { height: meta.getBoundingClientRect().height, timestamp: !!meta.querySelector(':scope > span'), actions: !!meta.querySelector('.more'), button: !!meta.querySelector('[aria-label="Execution details"]'), content: !!row.querySelector('.execution-content') }; })()`,
+        ),
+      ).toEqual({ height: 20, timestamp: false, actions: false, button: true, content: false });
       await js(
         `t.click("Execution details", t.msg("msg_reply")), t.click("Execution details", document.querySelector("[data-activity]")), true`,
       );
@@ -4485,6 +4597,1027 @@ test("About you: text typed for a fact rejected or deleted before or during its 
   );
 }, 170_000);
 
+test("code Copy uses an accessible icon and exact bytes, with success only after clipboard true", async () => {
+  const code = "const text = '<fixture>';\n\t// Unicode: π\n  keepTrailingSpaces();  ";
+  const diff = "--- a/fixture.ts\n+++ b/fixture.ts\n@@ -1 +1 @@\n-old\n+new";
+  await scenario(
+    "code-copy",
+    (fake) => {
+      fake.messages = [
+        {
+          id: "code",
+          kind: "dot",
+          text: `\`\`\`ts\n${code}\n\`\`\`\n\n\`\`\`diff\n${diff}\n\`\`\``,
+        },
+      ];
+    },
+    async ({ fake, js, until, state, temporary }) => {
+      const button = `t.msg('code').querySelector('.code-block:not(.diff) button.copy')`;
+      const diffButton = `t.msg('code').querySelector('.code-block.diff button.copy')`;
+      await until(`!!${button} && !!${diffButton}`, "both shared code Copy icons");
+      const initial = await js(
+        `(() => { const b=${button}; const s=getComputedStyle(b); return { label:b.getAttribute('aria-label'),title:b.title,width:b.getBoundingClientRect().width,height:b.getBoundingClientRect().height,icon:b.querySelector('svg').getAttribute('aria-hidden'),path:b.querySelector('path').getAttribute('d'),visibleText:[...b.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE).map(n=>n.textContent).join('').trim(),status:b.parentElement.querySelector('[role="status"]').textContent }; })()`,
+      );
+      expect(initial).toMatchObject({
+        label: "Copy code",
+        title: "Copy code",
+        width: 30,
+        height: 30,
+        icon: "true",
+        visibleText: "",
+        status: "",
+      });
+      await js(`${button}.click(), true`);
+      await until(
+        `${button}.title === 'Copied' && ${button}.parentElement.querySelector('[role="status"]').textContent === 'Copied'`,
+        "actual successful private smoke clipboard result",
+      );
+      expect((await state()).recorded.clipboard).toContainEqual({ text: code });
+      expect(await js(`${button}.getAttribute('aria-label')`)).toBe("Copy code");
+      const copyPath = await js(
+        `document.querySelector('.code-block.diff button.copy path').getAttribute('d')`,
+      );
+      expect(await js(`${button}.querySelector('path').getAttribute('d')`)).not.toEqual(copyPath);
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        expect(await js(`matchMedia('(prefers-color-scheme: dark)').matches`)).toBe(true);
+        const page = await smokePage(temporary);
+        try {
+          await delay(100);
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("No fenced header screenshot data");
+          writeFileSync(join(evidence, "code-copy-dark.png"), Buffer.from(shot.data, "base64"));
+        } finally {
+          page.close();
+        }
+      }
+      await until(
+        `${button}.title === 'Copy code' && ${button}.parentElement.querySelector('[role="status"]').textContent === ''`,
+        "bounded success feedback reset",
+        3,
+      );
+      await js(`${diffButton}.click(), true`);
+      await until(`${diffButton}.title === 'Copied'`, "the same Copy control on diff rendering");
+      expect((await state()).recorded.clipboard).toContainEqual({ text: diff });
+      // Only Markdown's dynamic bridge lookup is stubbed. Preload IPC and the live app are untouched.
+      await js(
+        `(() => { window.copyOriginalGlobal = globalThis; window.copyInputs=[]; window.copyCompletions=[]; const scoped=Object.create(window); Object.defineProperty(scoped,'openDot',{value:{...window.openDot,copyText:(text)=>{window.copyInputs.push(text);return new Promise((resolve,reject)=>window.copyCompletions.push({resolve,reject}));}}}); window.globalThis=scoped; return true; })()`,
+      );
+      try {
+        await js(`${button}.click(), true`);
+        expect(await js(`${button}.title`)).toBe("Copy code");
+        await js(`window.copyCompletions[0].resolve(false), true`);
+        await delay(100);
+        expect(
+          await js(
+            `({title:${button}.title,status:${button}.parentElement.querySelector('[role="status"]').textContent,path:${button}.querySelector('path').getAttribute('d')})`,
+          ),
+        ).toEqual({ title: "Copy code", status: "", path: copyPath });
+        await js(
+          `${button}.click(), window.copyCompletions[1].reject(new Error('Controlled clipboard failure')), true`,
+        );
+        await delay(100);
+        expect(await js(`${button}.title`)).toBe("Copy code");
+        expect(
+          await js(`${button}.parentElement.querySelector('[role="status"]').textContent`),
+        ).toBe("");
+        await js(
+          `${button}.click(), ${button}.click(), window.copyCompletions[3].resolve(false), window.copyCompletions[2].resolve(true), true`,
+        );
+        await delay(100);
+        expect(await js(`${button}.title`)).toBe("Copy code");
+        expect(await js(`window.copyInputs`)).toEqual([code, code, code, code]);
+        if (evidence)
+          writeFileSync(
+            join(evidence, "code-copy-readback.json"),
+            JSON.stringify(
+              {
+                initial,
+                exactCode: code,
+                exactDiff: diff,
+                controlledInputs: await js(`window.copyInputs`),
+                clipboard: (await state()).recorded.clipboard,
+                falseAndErrorTitle: await js(`${button}.title`),
+                staleSuccessIgnored: true,
+              },
+              null,
+              2,
+            ),
+          );
+      } finally {
+        await js(
+          `window.globalThis=window.copyOriginalGlobal, delete window.copyOriginalGlobal, delete window.copyCompletions, delete window.copyInputs, true`,
+        );
+      }
+      expect(fake.log.posts).toEqual([]);
+      expect(fake.log.opens).toEqual([]);
+    },
+  );
+}, 30_000);
+
+test("selection Reply appends exact multiline text, preserves draft and image, and clears across scope changes without sending", async () => {
+  const selected = "First selected line\nSecond selected line";
+  const draft = "Keep my original draft";
+  const expected = `${draft}\n\n> First selected line\n> Second selected line\n\n`;
+  await scenario(
+    "selection-reply",
+    (fake) => {
+      fake.messages = [
+        { id: "sel", kind: "owner", text: `Before\n${selected}\nAfter` },
+        { id: "other", kind: "dot", text: "Another message" },
+      ];
+      fake.others.set("dio", {
+        messages: [{ id: "dio1", kind: "dot", text: "Different dot message" }],
+        hold: undefined,
+        reads: 0,
+      });
+    },
+    async ({ fake, js, until, press, state, temporary, menu }) => {
+      await until(
+        `!!t.msg('sel')?.querySelector('[data-reply-content]')`,
+        "selectable message text",
+      );
+      await js(`t.type(${JSON.stringify(draft)}), t.paste('selection.png'), true`);
+      await until(
+        `document.querySelectorAll('.draft-thumb').length === 1`,
+        "the initial draft image",
+      );
+      const select = async () => {
+        await js(
+          `(() => { document.activeElement?.blur(); const text = t.msg('sel').querySelector('[data-reply-content]').firstChild; const from = text.textContent.indexOf('First selected line'); const range = document.createRange(); range.setStart(text, from); range.setEnd(text, from + ${selected.length}); const selection = document.getSelection(); selection.removeAllRanges(); selection.addRange(range); document.dispatchEvent(new Event('selectionchange')); return true; })()`,
+        );
+        await until(`!!document.querySelector('[data-selection-reply]')`, "the selection toolbar");
+        expect(await js(`document.getSelection().toString()`)).toBe(selected);
+      };
+      await select();
+      const semantics = await js(
+        `(() => { const box = document.querySelector('[data-selection-reply]'); const o = getComputedStyle(box), i = getComputedStyle(box.querySelector('button')); const keyboard = new KeyboardEvent('keydown', { key:'c', code:'KeyC', metaKey:true, bubbles:true, cancelable:true }); const content = t.msg('sel').querySelector('[data-reply-content]'); content.dispatchEvent(keyboard); const context = new MouseEvent('contextmenu', { bubbles:true, cancelable:true, clientX:200, clientY:200 }); content.dispatchEvent(context); return { outer: parseFloat(o.borderTopLeftRadius), padding: parseFloat(o.paddingTop), border: parseFloat(o.borderTopWidth), inner: parseFloat(i.borderTopLeftRadius), copyPrevented:keyboard.defaultPrevented, contextPrevented:context.defaultPrevented, messageMenu:!!document.querySelector('.menu'), selected:document.getSelection().toString() }; })()`,
+      );
+      expect(semantics).toEqual({
+        outer: 8,
+        padding: 3,
+        border: 1,
+        inner: 4,
+        copyPrevented: false,
+        contextPrevented: false,
+        messageMenu: false,
+        selected,
+      });
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      const capture = async (name: string) => {
+        if (!evidence) return;
+        expect(await js(`matchMedia('(prefers-color-scheme: dark)').matches`)).toBe(true);
+        const page = await smokePage(temporary);
+        try {
+          await delay(100);
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("No selection capture data");
+          writeFileSync(join(evidence, name), Buffer.from(shot.data, "base64"));
+        } finally {
+          page.close();
+        }
+      };
+      await capture("selection-toolbar-dark.png");
+      await press("[data-selection-reply]", "Copy");
+      await until(
+        `document.getSelection().toString() === ${JSON.stringify(selected)}`,
+        "copy to retain the selection",
+      );
+      expect((await state()).recorded.clipboard).toContainEqual({ text: selected });
+      await press("[data-selection-reply]", "Reply");
+      await until(
+        `t.box().value === ${JSON.stringify(expected)} && document.activeElement === t.box() && t.box().selectionStart === t.box().value.length && t.box().selectionEnd === t.box().value.length && !document.querySelector('[data-selection-reply]')`,
+        "append, textarea focus and end caret",
+      );
+      expect(await js(`document.querySelectorAll('.draft-thumb').length`)).toBe(1);
+      expect(fake.log.posts).toEqual([]);
+      await capture("selection-composer-dark.png");
+      if (evidence)
+        writeFileSync(
+          join(evidence, "selection-readback.json"),
+          JSON.stringify(
+            {
+              semantics,
+              expected,
+              actual: await js(
+                `({ text:t.box().value, images:document.querySelectorAll('.draft-thumb').length, active:document.activeElement===t.box(), start:t.box().selectionStart, end:t.box().selectionEnd })`,
+              ),
+              posts: fake.log.posts,
+            },
+            null,
+            2,
+          ),
+        );
+      await select();
+      await js(`t.list().dispatchEvent(new Event('scroll')), true`);
+      await until(`!document.querySelector('[data-selection-reply]')`, "scroll dismissal");
+      await select();
+      await js(
+        `(() => { const range = document.createRange(); range.setStart(t.msg('sel').querySelector('[data-reply-content]').firstChild, 0); range.setEnd(t.msg('other').querySelector('[data-reply-content] p').firstChild, 3); const s=document.getSelection(); s.removeAllRanges(); s.addRange(range); document.dispatchEvent(new Event('selectionchange')); return true; })()`,
+      );
+      await until(
+        `!document.querySelector('[data-selection-reply]')`,
+        "cross-message selection rejection",
+      );
+      await select();
+      await openInboxPane({ js, until }, "needs");
+      await until(`!document.querySelector('[data-selection-reply]')`, "pane navigation dismissal");
+      await js(`window.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'})), true`);
+      await until(`!!t.msg('sel') && !!t.box()`, "return to the original chat");
+      await select();
+      await js(`document.querySelector('[data-dot="dio"]').click(), true`);
+      await until(
+        `t.box()?.placeholder === 'Message dio' && !document.querySelector('[data-selection-reply]')`,
+        "dot navigation dismissal",
+      );
+      expect(await js(`t.box().value`)).toBe("");
+      await js(`document.querySelector('[data-dot="jojo"]').click(), true`);
+      await until(
+        `!!t.msg('sel') && t.box().value === ${JSON.stringify(expected)}`,
+        "the original dot draft",
+      );
+      await select();
+      fake.messages[0] = {
+        id: "sel",
+        kind: "owner",
+        text: "Updated message, stale selection must not insert",
+      };
+      await until(
+        `t.msg('sel').querySelector('[data-reply-content]').textContent === 'Updated message, stale selection must not insert'`,
+        "fresh source text before stale selection click",
+      );
+      if (await js(`!!document.querySelector('[data-selection-reply]')`))
+        await press("[data-selection-reply]", "Reply");
+      expect(await js(`t.box().value`)).toBe(expected);
+      await js(`document.getSelection().removeAllRanges(), true`);
+      await menu("other", "Reply");
+      await until(
+        `!!document.querySelector('.quote-bar')`,
+        "ordinary unselected message context menu",
+      );
+      fake.messages[0] = { id: "sel", kind: "owner", text: `Before\n${selected}\nAfter` };
+      await until(
+        `t.msg('sel').querySelector('[data-reply-content]').textContent.includes('First selected line')`,
+        "restored fixture selection text",
+      );
+      await select();
+      fake.sessionID = "ses_selection_next";
+      await until(
+        `!document.querySelector('[data-selection-reply]') && !document.querySelector('.quote-bar')`,
+        "session rebind dismissal",
+      );
+      expect(await js(`t.box().value`)).toBe(expected);
+      expect(fake.log.posts).toEqual([]);
+      expect(await js(`document.querySelectorAll('.draft-thumb').length`)).toBe(1);
+    },
+  );
+}, 60_000);
+
+test("Threads workers without requests appear scoped and read-only, and failed transcripts discard stale content", async () => {
+  await scenario(
+    "threads-ui",
+    (fake) => {
+      fake.messages = [{ id: "msg_reply", kind: "dot", text: "Normal assistant reply." }];
+      fake.others.set("dio", { messages: [], hold: undefined, reads: 0 });
+      fake.workers = [
+        {
+          ...worker(9, "done"),
+          task: "Alice Chen asked me to fix the build\nFull unchanged task evidence",
+        },
+      ];
+      fake.threads = [
+        {
+          sessionID: "ses_thread1",
+          title: "Public worker",
+          state: "working",
+          needs: [],
+          waiting: [],
+          answered: null,
+        },
+        {
+          sessionID: "ses_thread2",
+          title: "Finished report",
+          state: "last outcome: succeeded",
+          needs: [],
+          waiting: [],
+          answered: null,
+        },
+        {
+          sessionID: "ses_idle1",
+          title: "No reported outcome",
+          state: "idle, no outcome reported",
+          needs: [],
+          waiting: [],
+          answered: null,
+        },
+      ];
+    },
+    async ({ fake, js, until, temporary }) => {
+      await until(
+        `document.querySelectorAll('[data-thread]').length === 3`,
+        "request-free Threads workers",
+      );
+      expect(fake.data.requests).toEqual([]);
+      expect(
+        await js(
+          `({ label:document.querySelector('[data-worker="9"] .worker-task').textContent, title:document.querySelector('[data-worker="9"] .worker-select').title, aria:document.querySelector('[data-worker="9"] .worker-select').getAttribute('aria-label') })`,
+        ),
+      ).toEqual({
+        label: "Fix the build",
+        title: "Alice Chen asked me to fix the build\nFull unchanged task evidence",
+        aria: "View worker: Fix the build",
+      });
+      expect(fake.workers).toEqual([
+        {
+          ...worker(9, "done"),
+          task: "Alice Chen asked me to fix the build\nFull unchanged task evidence",
+        },
+      ]);
+      expect(
+        await js(
+          `[...document.querySelectorAll('[data-thread]')].map((row) => row.querySelector('button > span:last-child').textContent)`,
+        ),
+      ).toEqual(["working", "last outcome: succeeded", "idle, no outcome reported"]);
+      expect(await js(`document.querySelectorAll('[data-thread] button').length`)).toBe(3);
+      const width = await js(`document.querySelector('.sidebar').getBoundingClientRect().width`);
+      await until(
+        `!!document.querySelector('[data-thread="ses_thread1"] button[aria-label="View Threads worker: Public worker"]')`,
+        "the observed Threads row control",
+      );
+      await js(
+        `document.querySelector('[data-thread="ses_thread1"] button[aria-label="View Threads worker: Public worker"]').click(), true`,
+      );
+      await until(
+        `!!document.querySelector('[data-worker-message="msg_thread"] strong')`,
+        "the scoped Threads transcript",
+      );
+      expect(fake.log.conversations).toContain("/dots/jojo/threads/ses_thread1/conversation");
+      const readback = await js(
+        `(() => { const panel = document.querySelector('[data-worker-panel]'); return { rows: document.querySelectorAll('[data-thread]').length, messages: panel.querySelectorAll('[data-worker-message]').length, buttons: [...panel.querySelectorAll('button')].map((button) => button.getAttribute('aria-label') || button.textContent.trim()), mutationFields: panel.querySelectorAll('input, textarea, select, [data-answer], [data-open-request]').length, status: panel.querySelector('.worker-details dd').textContent, selected: document.querySelector('[data-thread="ses_thread1"] button').getAttribute('aria-pressed') }; })()`,
+      );
+      expect(readback).toEqual({
+        rows: 3,
+        messages: 1,
+        buttons: ["Close worker panel"],
+        mutationFields: 0,
+        status: "working",
+        selected: "true",
+      });
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        expect(await js(`matchMedia('(prefers-color-scheme: dark)').matches`)).toBe(true);
+        const page = await smokePage(temporary);
+        try {
+          await delay(100);
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("No Threads screenshot data");
+          writeFileSync(join(evidence, "threads-dark.png"), Buffer.from(shot.data, "base64"));
+          writeFileSync(
+            join(evidence, "threads-dark-readback.json"),
+            JSON.stringify(readback, null, 2),
+          );
+        } finally {
+          page.close();
+        }
+      }
+      fake.threadFailure = true;
+      fake.threads = [];
+      fake.threadsError = "Threads workers unavailable. Refresh to try again.";
+      await until(
+        `document.querySelector('.worker-sidebar > [role="status"]')?.textContent === "Threads workers unavailable. Refresh to try again."`,
+        "visible discovery failure",
+      );
+      await until(
+        `document.querySelector('[data-worker-panel] .item-error')?.textContent.includes('Thread transcript unavailable') && !document.querySelector('[data-worker-message]')`,
+        "the failed transcript to clear stale messages",
+      );
+      expect(
+        await js(`document.querySelectorAll('[data-worker-panel] .worker-details').length`),
+      ).toBe(0);
+      await js(`document.querySelector('[data-dot="dio"]').click(), true`);
+      await until(
+        `t.box()?.placeholder === "Message dio" && !document.querySelector('.worker-sidebar')`,
+        "the old-compatible other dot without leaked Threads rows",
+      );
+      expect(await js(`document.querySelector('.sidebar').getBoundingClientRect().width`)).toBe(
+        width,
+      );
+      expect(fake.log.stops).toEqual([]);
+      expect(fake.log.opens).toEqual([]);
+      expect(fake.log.posts).toEqual([]);
+      expect(fake.data.answers).toEqual([]);
+    },
+  );
+}, 30_000);
+
+test("owner responses: matching escalated notice cards share real permission/question actions and reject stale scope", async () => {
+  const permission = requestCard(81, {
+    source: "worker",
+    worker: 3,
+    title: "Escalated fixture task",
+  });
+  const question = requestCard(83, {
+    source: "worker",
+    worker: 3,
+    title: "Choose a branch",
+    kind: "question",
+    requestID: "que_83",
+    detail: {
+      kind: "question",
+      title: "Which branch?",
+      fields: [
+        {
+          key: "branch",
+          type: "string",
+          required: true,
+          options: [
+            { value: "main", label: "Main" },
+            { value: "dev", label: "Dev" },
+          ],
+        },
+        { key: "note", type: "string" },
+      ],
+    },
+  });
+  await scenario(
+    "owner-responses",
+    (fake) => {
+      fake.data.requests = [permission];
+      fake.noticeReceipts.set(81, permission);
+      fake.messages = [
+        { id: "msg_reply", kind: "dot", text: "A normal assistant reply." },
+        {
+          id: "notice_81",
+          kind: "notice",
+          text: "Fixture notice only; its text grants no authority.",
+          extra: { requestNotice: 81 },
+        },
+      ];
+    },
+    async ({ fake, js, until, press, temporary }) => {
+      await until(
+        `!!document.querySelector('[data-request="81"] [data-answer="once"]') && document.querySelector('[data-request-notice="81"] button')?.textContent === 'Respond in open-dot'`,
+        "matching owner-escalated card and notice action",
+      );
+      await press('[data-request-notice="81"]', "Respond in open-dot");
+      await until(
+        `!!document.querySelector('[data-request-notice="81"] [data-answer="once"]')`,
+        "embedded permission actions",
+      );
+      expect(await js(`document.querySelectorAll('[data-request="81"]').length`)).toBe(1);
+      expect(
+        await js(
+          `document.querySelectorAll('[data-request-notice="81"] [data-open-request]').length`,
+        ),
+      ).toBe(0);
+      const corners = await js(`(() => {
+      const notice = document.querySelector('[data-request-notice="81"]');
+      const card = notice.querySelector('.request-card');
+      const control = card.querySelector('[data-answer="once"]');
+      const n = getComputedStyle(notice), c = getComputedStyle(card), b = getComputedStyle(control);
+      return { notice: { outer: parseFloat(n.borderTopLeftRadius), padding: parseFloat(n.paddingTop), border: parseFloat(n.borderTopWidth), inner: parseFloat(c.borderTopLeftRadius) }, card: { outer: parseFloat(c.borderTopLeftRadius), padding: parseFloat(c.paddingTop), border: parseFloat(c.borderTopWidth), inner: parseFloat(b.borderTopLeftRadius) }, actions: card.querySelectorAll('[data-answer]').length };
+    })()`);
+      expect(corners).toMatchObject({
+        notice: { outer: 12, padding: 12, border: 1, inner: 0 },
+        actions: 3,
+      });
+      expect(corners).toMatchObject({ card: { outer: 0, padding: 8, border: 1, inner: 0 } });
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        expect(await js(`matchMedia('(prefers-color-scheme: dark)').matches`)).toBe(true);
+        const page = await smokePage(temporary);
+        try {
+          await js(
+            `document.querySelector('[data-request-notice="81"]').scrollIntoView({ block: 'nearest' }), true`,
+          );
+          await delay(100);
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("No owner action screenshot data");
+          writeFileSync(join(evidence, "owner-action-dark.png"), Buffer.from(shot.data, "base64"));
+          writeFileSync(
+            join(evidence, "owner-action-readback.json"),
+            JSON.stringify(corners, null, 2),
+          );
+          await js(
+            `document.querySelector('[data-dot="jojo"]').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 120 })), true`,
+          );
+          await until(
+            `!!document.querySelector('.dot-menu')`,
+            "the existing dot menu for corner inspection",
+          );
+          const menu = await js(
+            `(() => { const box = document.querySelector('.dot-menu'); const outer = getComputedStyle(box), inner = getComputedStyle(box.querySelector('button')); return { outer: parseFloat(outer.borderTopLeftRadius), padding: parseFloat(outer.paddingTop), border: parseFloat(outer.borderTopWidth), inner: parseFloat(inner.borderTopLeftRadius) }; })()`,
+          );
+          expect(menu).toEqual({ outer: 10, padding: 6, border: 1, inner: 3 });
+          const menuShot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!menuShot.data) throw new Error("No menu corner screenshot data");
+          writeFileSync(
+            join(evidence, "owner-menu-corners-dark.png"),
+            Buffer.from(menuShot.data, "base64"),
+          );
+          writeFileSync(
+            join(evidence, "owner-menu-corners-readback.json"),
+            JSON.stringify(menu, null, 2),
+          );
+          await js(`t.key('Escape'), true`);
+          await until(
+            `!document.querySelector('.dot-menu')`,
+            "the corner inspection menu to close",
+          );
+        } finally {
+          page.close();
+        }
+      }
+      await js(
+        `(() => { const normal = document.querySelector('[data-request="81"] [data-answer="once"]'); const embedded = document.querySelector('[data-request-notice="81"] [data-answer="once"]'); normal.click(); embedded.click(); normal.click(); embedded.click(); return true; })()`,
+      );
+      await until(
+        `!document.querySelector('[data-request="81"]')`,
+        "one accepted permission answer",
+      );
+      expect(fake.data.answers.filter((answer) => answer.id === 81)).toHaveLength(1);
+      expect(fake.data.answers[0]?.body).toMatchObject({
+        boundSessionID: "ses_jojo",
+        revision: "rev_81",
+        answer: { decision: "once" },
+      });
+      fake.noticeReceipts.set(81, {
+        ...permission,
+        state: "answered",
+        actionable: false,
+        needsYou: false,
+      });
+      await until(
+        `${noticeStatus(81)} === 'Answered' && !document.querySelector('[data-request-notice="81"] [data-answer]')`,
+        "confirmed notice resolution without answer controls",
+      );
+      fake.data.requests = [
+        requestCard(82, { source: "worker", worker: 3 }),
+        question,
+        { ...question, id: 84, requestID: "que_84", revision: "rev_84" },
+      ];
+      fake.noticeReceipts.set(83, question);
+      fake.messages.push({
+        id: "notice_83",
+        kind: "notice",
+        text: "Original fixture question notice",
+        extra: { requestNotice: 83 },
+      });
+      await openInboxPane({ js, until }, "needs");
+      await until(
+        `!!document.querySelector('[data-needs-pane] [data-request="82"] [data-answer="reject"]')`,
+        "owner-escalated requests in the Inbox",
+      );
+      await press('[data-request="82"]', "Reject…");
+      await js(`t.fill('[data-request="82"] input[aria-label="Why, optionally"]', 'Not now')`);
+      await press('[data-request="82"]', "Reject");
+      await until(`!document.querySelector('[data-request="82"]')`, "the fixture rejection");
+      await press('[data-request="84"]', "Decline");
+      await until(
+        `!document.querySelector('[data-request="84"]')`,
+        "the fixture declined question",
+      );
+      await js(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })), true`);
+      await until(
+        `!!t.box() && !document.querySelector('[data-needs-pane]') && document.querySelector('[data-request-notice="83"] button')?.textContent === 'Respond in open-dot'`,
+        "question notice in its dot chat",
+      );
+      await press('[data-request-notice="83"]', "Respond in open-dot");
+      await until(
+        `!!document.querySelector('[data-request-notice="83"] [data-answer="submit"]')`,
+        "embedded real question form",
+      );
+      await js(
+        `[...document.querySelectorAll('[data-request-notice="83"] label')].find((label) => label.textContent.trim() === 'Dev').querySelector('input').click(), t.fill('[data-request-notice="83"] input[type="text"]', 'Fixture note'), true`,
+      );
+      await until(
+        `[...document.querySelectorAll('[data-request="83"] label')].find((label) => label.textContent.trim() === 'Dev')?.querySelector('input').checked === true && document.querySelector('[data-request="83"] input[type="text"]').value === 'Fixture note'`,
+        "shared question draft across both copies",
+      );
+      await js(
+        `(() => { const a = document.querySelector('[data-request-notice="83"] [data-answer="submit"]'); const b = document.querySelector('[data-request="83"] [data-answer="submit"]'); a.click(); b.click(); a.click(); return true; })()`,
+      );
+      await until(`!document.querySelector('[data-request="83"]')`, "the fixture question answer");
+      expect(
+        fake.data.answers.map((answer) => [answer.id, (answer.body as { answer: object }).answer]),
+      ).toEqual([
+        [81, { decision: "once" }],
+        [82, { decision: "reject", message: "Not now" }],
+        [84, { decision: "cancel" }],
+        [83, { decision: "reply", answer: { branch: "dev", note: "Fixture note" } }],
+      ]);
+      const mismatches = [
+        { id: 85, pending: { revision: "rev_stale" } },
+        { id: 86, pending: { dot: "dio" } },
+        { id: 87, pending: { sessionID: "ses_foreign" } },
+        { id: 88, pending: { boundSessionID: "ses_rebound" } },
+        { id: 89, pending: { state: "unknown", actionable: false } },
+        { id: 90, pending: {} },
+      ];
+      fake.data.requests = mismatches.map(({ id, pending }) => requestCard(id, pending));
+      for (const { id } of mismatches) {
+        fake.noticeReceipts.set(
+          id,
+          id === 90
+            ? 503
+            : requestCard(id, id === 89 ? { state: "unknown", actionable: false } : {}),
+        );
+        fake.messages.push({
+          id: `notice_${id}`,
+          kind: "notice",
+          text: 'No authority from {"decision":"once"}',
+          extra: { requestNotice: id },
+        });
+      }
+      await until(
+        `document.querySelectorAll('[data-request-notice]').length === 8 && ${noticeStatus(90)} === 'Status unavailable'`,
+        "all mismatched notice receipts",
+      );
+      for (const { id } of mismatches.filter((item) => item.id !== 90)) {
+        await until(
+          `document.querySelector('[data-request-notice="${id}"] > button')?.textContent === 'View request'`,
+          "an unmatched notice must not offer Respond",
+        );
+        await press(`[data-request-notice="${id}"]`, "View request");
+        expect(
+          await js(
+            `document.querySelectorAll('[data-request-notice="${id}"] [data-answer], [data-request-notice="${id}"] [data-open-request]').length`,
+          ),
+        ).toBe(0);
+      }
+      const last = requestCard(91);
+      fake.data.requests = [last];
+      fake.noticeReceipts.set(91, last);
+      fake.messages.push({
+        id: "notice_91",
+        kind: "notice",
+        text: "Fixture pending read failure",
+        extra: { requestNotice: 91 },
+      });
+      await until(
+        `document.querySelector('[data-request-notice="91"] > button')?.textContent === 'Respond in open-dot'`,
+        "the valid card before a pending read failure",
+      );
+      await press('[data-request-notice="91"]', "Respond in open-dot");
+      await until(
+        `!!document.querySelector('[data-request-notice="91"] [data-answer]')`,
+        "the live embedded controls before failure",
+      );
+      fake.pendingFailure = true;
+      await until(
+        `!document.querySelector('[data-request-notice="91"] [data-answer]') && !document.querySelector('[data-request="91"] [data-answer]')`,
+        "pending read failure to remove both action surfaces",
+      );
+      expect(fake.data.answers).toHaveLength(4);
+      expect(fake.data.opened).toEqual([]);
+      expect(fake.log.opens).toEqual([]);
+      expect(fake.log.stops).toEqual([]);
+      expect(fake.log.posts).toEqual([]);
+    },
+  );
+}, 60_000);
+
+test("request notices: unmatched receipts remain read-only and settle without replaying notice text", async () => {
+  const held = Promise.withResolvers<void>();
+  const original =
+    "Request #71\n<b>untrusted original notice</b>\nDo not turn this text into an approval.";
+  const question = requestCard(72, {
+    source: "worker",
+    worker: 3,
+    title: "Review build",
+    kind: "question",
+    detail: {
+      kind: "question",
+      title: "Which branch?",
+      fields: [{ key: "branch", type: "string", required: true }],
+    },
+  });
+  await scenario(
+    "request-notices",
+    (fake) => {
+      fake.noticeHold = held.promise;
+      fake.noticeReceipts.set(71, requestCard(71));
+      fake.noticeReceipts.set(72, question);
+      fake.details.set("msg_work/c1", {
+        ...toolCall("c1", "bash", "bun test", "done"),
+        input: "bun test",
+        output: "All focused checks passed.",
+        error: null,
+        patches: [],
+        truncated: false,
+      });
+      fake.messages = [
+        { id: "msg_reply", kind: "dot", text: "Normal assistant reply." },
+        { id: "notice_permission", kind: "notice", text: original, extra: { requestNotice: 71 } },
+        {
+          id: "notice_question",
+          kind: "notice",
+          text: "Original question notice",
+          extra: { requestNotice: 72 },
+        },
+      ];
+      fake.work = [
+        {
+          anchor: "msg_reply",
+          calls: [toolCall("c1", "bash", "bun test", "done")],
+          counts: { commands: 1, edits: 0, edited: 0, failed: 0, total: 1 },
+          complete: true,
+          open: false,
+          more: null,
+        },
+      ];
+    },
+    async ({ fake, js, until, press, temporary }) => {
+      for (let tick = 0; tick < 100 && !fake.noticeReads.includes(71); tick++) await delay(100);
+      try {
+        expect(fake.noticeReads).toContain(71);
+        await delay(2300);
+        expect(fake.noticeReads.filter((id) => id === 71)).toHaveLength(1);
+      } finally {
+        held.resolve();
+      }
+      await until(
+        `${noticeStatus(71)} === "Waiting for permission" && ${noticeStatus(72)} === "Waiting for an answer"`,
+        "active permission and question notices",
+      );
+      const compact = await js(
+        `(() => { const notice = document.querySelector('[data-request-notice="71"]'); return { raw: notice.querySelector('pre').textContent, closed: !notice.querySelector('details').open, visibleRaw: notice.innerText.includes('untrusted original notice'), nestedMarkup: !!notice.querySelector('pre b'), details: !!notice.querySelector('.notice-request-details'), mutationControls: notice.querySelectorAll('[data-answer], [data-open-request]').length }; })()`,
+      );
+      expect(compact).toEqual({
+        raw: original,
+        closed: true,
+        visibleRaw: false,
+        nestedMarkup: false,
+        details: false,
+        mutationControls: 0,
+      });
+      const inline = await js(`(() => {
+      const meta = t.msg('msg_reply').querySelector('.meta');
+      const button = meta.querySelector('[aria-label="Execution details"]');
+      const timestamp = meta.querySelector(':scope > span');
+      const bounds = button.getBoundingClientRect();
+      const stamp = timestamp.getBoundingClientRect();
+      const hit = getComputedStyle(button, '::before');
+      return { height: meta.getBoundingClientRect().height, width: bounds.width, buttonHeight: bounds.height, icon: button.querySelector('svg').getBoundingClientRect().width, inline: Math.abs(bounds.top + bounds.height / 2 - stamp.top - stamp.height / 2) < 1, timestamp: timestamp.textContent.length > 0, background: getComputedStyle(button).backgroundColor, border: getComputedStyle(button).borderWidth, wrapper: getComputedStyle(button.parentElement).display, hitWidth: hit.width, hitHeight: hit.height, content: !!meta.querySelector('.execution-content'), label: button.getAttribute('aria-label'), title: button.title };
+    })()`);
+      expect(inline).toEqual({
+        height: 20,
+        width: 20,
+        buttonHeight: 20,
+        icon: 14,
+        inline: true,
+        timestamp: true,
+        background: "rgba(0, 0, 0, 0)",
+        border: "0px",
+        wrapper: "contents",
+        hitWidth: "26px",
+        hitHeight: "26px",
+        content: false,
+        label: "Execution details",
+        title: "Execution details",
+      });
+      const evidence = process.env.OPEN_DOT_SMOKE_EVIDENCE;
+      if (evidence) {
+        expect(await js(`matchMedia('(prefers-color-scheme: dark)').matches`)).toBe(true);
+        await js(`t.scroll(0), true`);
+        const page = await smokePage(temporary);
+        try {
+          await page.send("Emulation.setFocusEmulationEnabled", { enabled: true });
+          await js(
+            `(() => { const button = t.msg('msg_reply').querySelector('[aria-label="Execution details"]'); window.smokeKeys = []; button.addEventListener('keydown', (event) => window.smokeKeys.push({ key: event.key, trusted: event.isTrusted })); button.focus(); return true; })()`,
+          );
+          for (const type of ["keyDown", "keyUp"])
+            await page.send("Input.dispatchKeyEvent", {
+              type,
+              key: "Enter",
+              code: "Enter",
+              windowsVirtualKeyCode: 13,
+            });
+          let enterExpanded = true;
+          try {
+            await until(
+              `t.msg('msg_reply').querySelector('[aria-label="Execution details"]').getAttribute('aria-expanded') === 'true' && !!t.msg('msg_reply').querySelector('.execution-content')`,
+              "Enter to expand inline details",
+              3,
+            );
+          } catch {
+            enterExpanded = false;
+            console.warn(
+              "Hidden fixture Enter delivery unverified; using explicit mouse/ARIA coverage, not claiming keyboard success.",
+            );
+            await js(`t.click('Execution details', t.msg('msg_reply'))`);
+            await until(
+              `!!t.msg('msg_reply').querySelector('.execution-content')`,
+              "mouse/ARIA expansion",
+              3,
+            );
+          }
+          expect(
+            await js(
+              `(() => { const row = t.msg('msg_reply'); return row.querySelector('.execution-content').getBoundingClientRect().top >= row.querySelector('[aria-label="Execution details"]').getBoundingClientRect().bottom; })()`,
+            ),
+          ).toBe(true);
+          await js(`t.msg('msg_reply').querySelector('.tool-call-head').click(), true`);
+          await until(
+            `!!t.msg('msg_reply').querySelector('.execution-content .tool-text pre')`,
+            "the expanded tool text corner",
+          );
+          const executionCorners = await js(
+            `(() => { const box = t.msg('msg_reply').querySelector('.execution-content'); const o = getComputedStyle(box), i = getComputedStyle(box.querySelector('.tool-text pre')); return { outer: parseFloat(o.borderTopLeftRadius), padding: parseFloat(o.paddingTop), border: parseFloat(o.borderTopWidth), inner: parseFloat(i.borderTopLeftRadius) }; })()`,
+          );
+          expect(executionCorners).toEqual({ outer: 8, padding: 8, border: 1, inner: 0 });
+          const inlineShot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!inlineShot.data) throw new Error("No expanded inline info screenshot data");
+          writeFileSync(
+            join(evidence, "inline-expanded-dark.png"),
+            Buffer.from(inlineShot.data, "base64"),
+          );
+          writeFileSync(
+            join(evidence, "inline-corners-readback.json"),
+            JSON.stringify(executionCorners, null, 2),
+          );
+          await js(
+            `t.msg('msg_reply').querySelector('[aria-label="Execution details"]').focus(), true`,
+          );
+          for (const type of ["keyDown", "keyUp"])
+            await page.send("Input.dispatchKeyEvent", {
+              type,
+              key: " ",
+              code: "Space",
+              windowsVirtualKeyCode: 32,
+            });
+          let spaceCollapsed = true;
+          try {
+            await until(
+              `t.msg('msg_reply').querySelector('[aria-label="Execution details"]').getAttribute('aria-expanded') === 'false' && !t.msg('msg_reply').querySelector('.execution-content')`,
+              "Space to collapse inline details",
+              3,
+            );
+          } catch {
+            spaceCollapsed = false;
+            console.warn(
+              "Hidden fixture Space delivery unverified; using explicit mouse/ARIA coverage, not claiming keyboard success.",
+            );
+            await js(`t.click('Execution details', t.msg('msg_reply'))`);
+            await until(
+              `!t.msg('msg_reply').querySelector('.execution-content')`,
+              "mouse/ARIA collapse",
+              3,
+            );
+          }
+          expect(
+            await js(`t.msg('msg_reply').querySelector('.meta').getBoundingClientRect().height`),
+          ).toBe(20);
+          await js(`t.scroll(0), true`);
+          await delay(100);
+          const shot = await page.send("Page.captureScreenshot", {
+            format: "png",
+            fromSurface: true,
+            captureBeyondViewport: false,
+          });
+          if (!shot.data) throw new Error("No notice screenshot data");
+          writeFileSync(join(evidence, "notice-dark.png"), Buffer.from(shot.data, "base64"));
+          writeFileSync(
+            join(evidence, "notice-dark-readback.json"),
+            JSON.stringify(
+              {
+                compact,
+                inline,
+                keyboard: {
+                  enterExpanded,
+                  spaceCollapsed,
+                  events: await js(`window.smokeKeys`),
+                  rendererFocused: await js(`document.hasFocus()`),
+                },
+              },
+              null,
+              2,
+            ),
+          );
+        } finally {
+          page.close();
+        }
+      }
+      for (const id of [71, 72]) {
+        await press(`[data-request-notice="${id}"]`, "View request");
+        await until(
+          `!!document.querySelector('[data-request-notice="${id}"] .request-card')`,
+          "read-only request expansion",
+        );
+        expect(
+          await js(
+            `(() => { const notice = document.querySelector('[data-request-notice="${id}"]'); return { actions: notice.querySelectorAll('[data-answer], [data-open-request], .request-actions button, [data-actionable]').length, enabledFields: notice.querySelectorAll('input:not(:disabled), textarea:not(:disabled), select:not(:disabled)').length }; })()`,
+          ),
+        ).toEqual({ actions: 0, enabledFields: 0 });
+      }
+      expect(
+        await js(`document.querySelectorAll('[data-request-notice="72"] input:disabled').length`),
+      ).toBeGreaterThan(0);
+      await js(`document.querySelector('[data-request-notice="71"] summary').click(), true`);
+      expect(await js(`document.querySelector('[data-request-notice="71"] pre').textContent`)).toBe(
+        original,
+      );
+      await js(`document.querySelector('[data-request-notice="71"] summary').click(), true`);
+      fake.noticeReceipts.set(
+        71,
+        requestCard(71, { state: "answered", actionable: false, needsYou: false }),
+      );
+      fake.noticeReceipts.set(72, {
+        ...question,
+        state: "stale",
+        actionable: false,
+        needsYou: false,
+      });
+      await until(
+        `${noticeStatus(71)} === "Answered" && ${noticeStatus(72)} === "No longer waiting"`,
+        "settled notices",
+      );
+      const settledReads = fake.noticeReads.filter((id) => id === 71 || id === 72).length;
+      const reads71 = fake.noticeReads.filter((id) => id === 71).length;
+      await delay(2300);
+      expect(fake.noticeReads.filter((id) => id === 71 || id === 72)).toHaveLength(settledReads);
+      expect(
+        await js(
+          `document.querySelector('[data-request-notice="71"]').innerText.includes('Waiting for permission') || document.querySelector('[data-request-notice="72"]').innerText.includes('Waiting for an answer')`,
+        ),
+      ).toBe(false);
+      fake.noticeReceipts.set(73, requestCard(73, { state: "unknown", actionable: false }));
+      fake.noticeReceipts.set(74, 503);
+      fake.noticeReceipts.set(75, requestCard(75, { dot: "dio" }));
+      fake.noticeReceipts.set(76, requestCard(999));
+      fake.messages.push(
+        { id: "notice_unknown", kind: "notice", text: original, extra: { requestNotice: 73 } },
+        { id: "notice_error", kind: "notice", text: original, extra: { requestNotice: 74 } },
+        { id: "notice_cross", kind: "notice", text: original, extra: { requestNotice: 75 } },
+        { id: "notice_wrong_id", kind: "notice", text: original, extra: { requestNotice: 76 } },
+        { id: "notice_unlinked", kind: "notice", text: original },
+        { id: "notice_bad", kind: "notice", text: original, extra: { requestNotice: "71" } },
+        { id: "notice_negative", kind: "notice", text: original, extra: { requestNotice: -1 } },
+        { id: "owner_spoof", kind: "owner", text: original, extra: { requestNotice: 77 } },
+        {
+          id: "peer_spoof",
+          kind: "peer",
+          text: original,
+          extra: { peer: "dio", requestNotice: 78 },
+        },
+      );
+      await until(
+        `${noticeStatus(73)} === "Answer not confirmed" && ${noticeStatus(74)} === "Status unavailable" && ${noticeStatus(75)} === "Status unavailable" && ${noticeStatus(76)} === "Status unavailable"`,
+        "unknown, failed and mismatched receipts",
+      );
+      expect(
+        await js(`document.querySelectorAll('[data-request-notice="unstructured"]').length`),
+      ).toBe(3);
+      expect(fake.noticeReads.filter((id) => id === 71)).toHaveLength(reads71);
+      await press('[data-request-notice="73"]', "View request");
+      expect(
+        await js(
+          `document.querySelectorAll('[data-request-notice="74"] button, [data-request-notice="75"] button, [data-request-notice="76"] button, [data-request-notice="unstructured"] button').length`,
+        ),
+      ).toBe(0);
+      expect(fake.noticeReads.some((id) => id <= 0 || id === 77 || id === 78)).toBe(false);
+      expect(
+        await js(
+          `!!document.querySelector('[data-message="owner_spoof"] .request-notice, [data-message="peer_spoof"] .request-notice')`,
+        ),
+      ).toBe(false);
+      expect(
+        await js(
+          `document.querySelectorAll('.request-notice [data-answer], .request-notice [data-open-request], .request-notice .request-actions button').length`,
+        ),
+      ).toBe(0);
+      expect(fake.data.answers).toEqual([]);
+      expect(fake.data.opened).toEqual([]);
+      expect(fake.log.posts).toEqual([]);
+      expect(fake.data.calls).toEqual([]);
+    },
+  );
+}, 60_000);
+
 test("request cards: answered from the chat and Needs you, Always only after its confirmation, and a sensitive one only in its terminal", async () => {
   await scenario(
     "requests",
@@ -4614,6 +5747,38 @@ test("request cards: answered from the chat and Needs you, Always only after its
       await delay(300);
       expect(fake.data.answers).toHaveLength(1);
       await press('[data-request="4"]', "Always…");
+      const changed = fake.data.requests.find((card) => card.id === 4);
+      if (!changed) throw new Error("No normal request to recheck");
+      changed.revision = "rev_changed";
+      changed.title = "Changed request";
+      await until(
+        `document.querySelector('[data-request="4"] .request-title')?.textContent === "Changed request"`,
+        "the normal request revision refresh",
+      );
+      await press("[role=alertdialog]", "Always allow");
+      await until(
+        `document.querySelector('[data-request="4"] [role=alert]')?.textContent === "The request changed, so nothing was sent."`,
+        "the stale revision guard",
+      );
+      expect(fake.data.answers).toHaveLength(1);
+      await press('[data-request="4"]', "Always…");
+      changed.state = "stale";
+      changed.actionable = false;
+      changed.title = "No longer actionable";
+      await until(
+        `document.querySelector('[data-request="4"] .request-title')?.textContent === "No longer actionable"`,
+        "the non-actionable refresh",
+      );
+      await press("[role=alertdialog]", "Always allow");
+      expect(fake.data.answers).toHaveLength(1);
+      changed.state = "escalated";
+      changed.actionable = true;
+      changed.revision = "rev_4";
+      await until(
+        `!!document.querySelector('[data-request="4"] [data-answer="always"]')`,
+        "the restored genuine request actions",
+      );
+      await press('[data-request="4"]', "Always…");
       await press("[role=alertdialog]", "Always allow");
       await until(`!document.querySelector('[data-request="4"]')`, "the Always card to go");
       expect(fake.data.answers[1]).toMatchObject({
@@ -4678,7 +5843,7 @@ test("request cards: answered from the chat and Needs you, Always only after its
       await until(`!document.querySelector("[data-needs-pane]") && !!t.box()`, "the chat");
     },
   );
-});
+}, 30_000);
 
 test("request cards: Show more reaches every pending card, in a dot's chat and in Needs you, and later reads keep it", async () => {
   await scenario(

@@ -319,6 +319,7 @@ export interface ThreadsWorker {
   readonly title: string;
   readonly directory: string;
   readonly hidden: boolean;
+  readonly outcome?: string | null;
 }
 
 const secretWords =
@@ -395,6 +396,7 @@ const ThreadsSnapshot = Schema.Struct({
         title: Schema.String,
         directory: Schema.String,
         hidden: Schema.Boolean,
+        outcome: Schema.optionalKey(Schema.NullOr(Schema.String)),
       }),
     ),
   }),

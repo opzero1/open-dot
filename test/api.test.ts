@@ -918,6 +918,8 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       purpose: "Second brain.",
       busy: true,
       avatar: null,
+      threads: [],
+      threadsError: null,
       workers: [
         {
           id: 1,
@@ -940,22 +942,222 @@ test("/dots lists each dot with whether it's busy and its unfinished workers", a
       ],
       sessions: [],
     },
-    { name: "polnareff", purpose: null, busy: false, avatar: null, workers: [], sessions: [] },
+    {
+      name: "polnareff",
+      purpose: null,
+      busy: false,
+      avatar: null,
+      threads: [],
+      threadsError: null,
+      workers: [],
+      sessions: [],
+    },
   ]);
+});
+
+test("Threads discovery lists request-free owned workers, excludes hidden and duplicate sessions, and reports RPC failure", async () => {
+  const visible = {
+    workerID: "ses_thread1",
+    coordinatorID: "ses_jojo",
+    title: "Public worker",
+    directory: "/work/thread1",
+    hidden: false,
+    outcome: "succeeded",
+  };
+  db.insert(workers)
+    .values({
+      dot: "jojo",
+      sessionID: "ses_db1",
+      task: "Stored worker",
+      directory: "/work/db1",
+      state: "running",
+      createdAt: 0,
+    })
+    .run();
+  db.insert(requests)
+    .values({
+      dot: "jojo",
+      source: "threads",
+      sessionID: visible.workerID,
+      title: visible.title,
+      directory: visible.directory,
+      kind: "permission",
+      requestID: "per_thread",
+      detail: { kind: "permission", action: "bash", resources: ["ls"] },
+      state: "escalated",
+      createdAt: 0,
+    })
+    .run();
+  fake.state.active.add(visible.workerID);
+  fake.state.threads.set("ses_jojo", [
+    visible,
+    { ...visible, workerID: "ses_thread2" },
+    { ...visible, workerID: "ses_idle1", outcome: null },
+    { ...visible, workerID: "ses_hidden1", hidden: true },
+    { ...visible, workerID: "ses_foreign1", coordinatorID: "ses_polnareff" },
+    { ...visible, workerID: "not-a-session" },
+    { ...visible, workerID: "ses_jojo" },
+    { ...visible, workerID: "ses_db1" },
+  ]);
+  const stored = db.select().from(workers).all();
+  const response = await call("/dots");
+  const listed = (await response.json()) as {
+    name: string;
+    threads: { sessionID: string; state: string; needs: string[] }[];
+    sessions: { sessionID: string }[];
+    threadsError: string | null;
+  }[];
+  const jojo = listed.find((dot) => dot.name === "jojo");
+  expect(jojo?.threads.map((worker) => [worker.sessionID, worker.state, worker.needs])).toEqual([
+    ["ses_thread1", "working", ["permission"]],
+    ["ses_thread2", "last outcome: succeeded", []],
+    ["ses_idle1", "idle, no outcome reported", []],
+  ]);
+  expect(jojo?.sessions).toEqual([]);
+  expect(jojo?.threadsError).toBeNull();
+  expect(fake.state.threadsCalls).toContainEqual({
+    directory: "/dots/jojo",
+    coordinatorID: "ses_jojo",
+  });
+  expect(db.select().from(workers).all()).toEqual(stored);
+  fake.state.threads.set("ses_jojo", "unavailable");
+  expect(await (await call("/dots")).json()).toContainEqual(
+    expect.objectContaining({
+      name: "jojo",
+      threads: [],
+      threadsError: "Threads workers unavailable. Refresh to try again.",
+    }),
+  );
+  const oc = await Effect.runPromise(Effect.provide(OpenCode, fake.layer));
+  const stalled = Layer.succeed(OpenCode, {
+    ...oc,
+    threadsWorkers: (_directory, coordinator) =>
+      coordinator === "ses_jojo" ? Effect.never : Effect.succeed([]),
+  });
+  const started = Date.now();
+  expect(await (await call("/dots", {}, stalled)).json()).toContainEqual(
+    expect.objectContaining({
+      name: "jojo",
+      threads: [],
+      threadsError: "Threads workers unavailable. Refresh to try again.",
+    }),
+  );
+  expect(Date.now() - started).toBeLessThan(5_000);
+}, 10_000);
+
+test("Threads conversation is bounded and rechecks exact visible ownership before and after history", async () => {
+  const visible = {
+    workerID: "ses_thread1",
+    coordinatorID: "ses_jojo",
+    title: "Public worker",
+    directory: "/work/thread1",
+    hidden: false,
+    outcome: "succeeded",
+  };
+  fake.state.threads.set("ses_jojo", [visible]);
+  fake.state.history.set(
+    visible.workerID,
+    Array.from({ length: 80 }, (_, index) =>
+      entry(
+        `msg_${index}`,
+        "assistant",
+        "x".repeat(9000),
+        Array.from({ length: 25 }, () => "t".repeat(220)),
+        [{ mime: "image/png", name: "fixture.png", data: "AA==" }],
+      ),
+    ),
+  );
+  const path = `/dots/jojo/threads/${visible.workerID}/conversation`;
+  const response = await call(path);
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as {
+    sessionID: string;
+    more: boolean;
+    state: string;
+    messages: { text: string; tools: string[]; attachments: number; truncated: boolean }[];
+  };
+  expect(body).toMatchObject({
+    sessionID: visible.workerID,
+    more: true,
+    state: "last outcome: succeeded",
+  });
+  expect(body.messages).toHaveLength(40);
+  expect(
+    body.messages.every(
+      (message) =>
+        message.text.length === 8000 &&
+        message.tools.length === 20 &&
+        message.tools.every((tool) => tool.length === 200) &&
+        message.attachments === 1 &&
+        message.truncated,
+    ),
+  ).toBe(true);
+  expect(fake.state.threadsCalls.filter((item) => item.coordinatorID === "ses_jojo")).toHaveLength(
+    2,
+  );
+  expect((await call(`/dots/polnareff/threads/${visible.workerID}/conversation`)).status).toBe(404);
+  expect((await call(path, { method: "POST" })).status).toBe(404);
+  fake.state.threads.set("ses_jojo", [{ ...visible, hidden: true }]);
+  expect((await call(path)).status).toBe(404);
+  fake.state.threads.set("ses_jojo", [visible]);
+  fake.state.onRecent = () => fake.state.threads.set("ses_jojo", [{ ...visible, hidden: true }]);
+  expect((await call(path)).status).toBe(409);
+  fake.state.threads.set("ses_jojo", [visible]);
+  fake.state.onRecent = () => {
+    db.update(dots).set({ sessionID: "ses_rebound" }).where(eq(dots.name, "jojo")).run();
+  };
+  expect((await call(path)).status).toBe(409);
+  db.update(dots).set({ sessionID: "ses_jojo" }).where(eq(dots.name, "jojo")).run();
+  fake.state.onRecent = () => {};
+  fake.state.threads.set("ses_jojo", "unavailable");
+  expect((await call(path)).status).toBe(503);
+  expect(db.select().from(workers).all()).toEqual([]);
+  expect(fake.state.answers).toEqual([]);
+  expect(fake.state.prompted).toEqual([]);
+  expect(fake.state.interrupted).toEqual([]);
 });
 
 test("messages say who wrote each one, and hide the mechanics", async () => {
   queued("msg_2", "Reminder: stretch.", {});
   queued("msg_3", "framed", { fromDot: "polnareff" });
   queued("msg_4", "From the app", { fromOwner: true });
+  queued("msg_8", "Request #71 waiting for permission", {});
+  queued("msg_9", "Request #75 waiting for permission", {});
+  for (const [id, noticeID, dot] of [
+    [71, "msg_2", "jojo"],
+    [72, "msg_3", "jojo"],
+    [73, "msg_4", "jojo"],
+    [74, "msg_1", "jojo"],
+    [75, "msg_9", "polnareff"],
+    [76, "msg_7", "jojo"],
+  ] as const)
+    db.insert(requests)
+      .values({
+        id,
+        noticeID,
+        dot,
+        source: "dot",
+        sessionID: `ses_${dot}`,
+        title: "Request",
+        directory: `/dots/${dot}`,
+        kind: "permission",
+        requestID: `per_${id}`,
+        detail: { kind: "permission", action: "bash", resources: ["ls"] },
+        state: "open",
+        createdAt: 0,
+      })
+      .run();
+  const stored = db.select().from(requests).all();
   fake.state.history.set("ses_jojo", [
-    entry("msg_1", "user", "Typed in OpenCode"),
+    entry("msg_1", "user", "Request #71 waiting for permission"),
     entry("msg_2", "user", "Reminder: stretch."),
     entry("msg_3", "user", "framed"),
     entry("msg_4", "user", "From the app"),
     entry("msg_5", "assistant", "", ["shell", "dot_delegate"]),
     entry("msg_6", "assistant", "", ["context_compact", "read"]),
     entry("msg_7", "assistant", "Done.", ["read"]),
+    entry("msg_8", "user", "Request #71 waiting for permission"),
+    entry("msg_9", "user", "Request #75 waiting for permission"),
   ]);
 
   const messages = await conversation();
@@ -966,7 +1168,13 @@ test("messages say who wrote each one, and hide the mechanics", async () => {
     "msg_4 owner",
     "msg_5 dot",
     "msg_7 dot",
+    "msg_8 notice",
+    "msg_9 notice",
   ]);
+  expect(messages[1]).toMatchObject({ text: "Reminder: stretch.", requestNotice: 71 });
+  for (const message of messages.filter((item) => item.id !== "msg_2"))
+    expect(message).not.toHaveProperty("requestNotice");
+  expect(db.select().from(requests).all()).toEqual(stored);
   expect(messages[2]).toMatchObject({ peer: "polnareff", text: "framed" });
   expect(messages[4]).toMatchObject({ tools: ["dot_delegate"] });
   expect(messages[5]).toMatchObject({ text: "Done.", tools: [] });

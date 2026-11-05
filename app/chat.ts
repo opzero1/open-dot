@@ -628,6 +628,20 @@ export const pendingActions = (pending: PendingView) => ({
   cancel: pending.status === "sending" || pending.status === "sent",
 });
 
+export const workerTitle = (task: string) => {
+  const first = task.trim().split(/\r?\n/)[0]?.trim() ?? "";
+  const title = first.replace(
+    /^(?:(?:[Tt]he\s+)?(?:[Oo]wner|[Uu]ser)|[\p{Lu}][\p{L}\p{M}'’-]*(?:\s+[\p{Lu}][\p{L}\p{M}'’-]*){0,3})\s+(?:asked|requested)(?:\s+(?:me|us|you))?\s+to\s+(?=(?:unblock|fix|implement|investigate|review|update|add|remove|verify|test|build|create|refactor|document|check|resolve|debug|ship|deploy)\b)/u,
+    "",
+  );
+  const label = title
+    ? title === first
+      ? title
+      : title.charAt(0).toUpperCase() + title.slice(1)
+    : "Worker";
+  return label.length <= 88 ? label : `${label.slice(0, 85).trimEnd()}…`;
+};
+
 /** A worker opens once its session exists, and stops (or tries again) until it's done. */
 export const workerActions = (state: string) => ({
   open: state !== "creating",

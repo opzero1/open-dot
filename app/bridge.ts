@@ -54,6 +54,15 @@ export interface DotView {
   avatar: Avatar | null;
   workers: WorkerView[];
   sessions: SessionView[];
+  threads?: {
+    sessionID: string;
+    title: string;
+    state: string;
+    needs: RequestKind[];
+    waiting: RequestKind[];
+    answered: string | null;
+  }[];
+  threadsError?: string | null;
 }
 
 export interface AttachmentView {
@@ -89,6 +98,7 @@ export interface MessageView {
   quote?: QuoteView;
   peer?: string | null;
   feed?: { title: string; url: string | null; source: string };
+  requestNotice?: number;
   /** A dot reply's remote media, checked by the renderer before use. */
   media?: unknown;
 }
@@ -786,6 +796,7 @@ export interface OwnerMutation {
 export interface Operations {
   workerConversation: [[id: number], WorkerConversation];
   requestConversation: [[id: number], WorkerConversation];
+  threadConversation: [[dot: string, sessionID: string], WorkerConversation];
   feed: [[], FeedPage];
   dismiss: [[id: number], true];
   dismissAll: [[ids: number[]], { dismissed: number[]; missing: number[] }];

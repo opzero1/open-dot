@@ -1108,6 +1108,10 @@ const build = (op: Operation, args: unknown[]): Built | undefined => {
       return isID(dot) ? { method: "GET", path: `/workers/${dot}/conversation` } : undefined;
     case "requestConversation":
       return isID(dot) ? { method: "GET", path: `/requests/${dot}/conversation` } : undefined;
+    case "threadConversation":
+      return base && typeof a === "string" && /^ses_[A-Za-z0-9]{1,64}$/.test(a)
+        ? { method: "GET", path: `${base}/threads/${segment(a)}/conversation` }
+        : undefined;
     case "feed":
       return { method: "GET", path: "/feed" };
     case "dismiss":
@@ -1396,6 +1400,7 @@ const operationNames = new Set<string>([
   "activity",
   "workerConversation",
   "requestConversation",
+  "threadConversation",
   "work",
   "toolDetail",
   "pendingRequests",

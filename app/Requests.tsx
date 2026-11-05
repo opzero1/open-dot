@@ -181,6 +181,19 @@ export const useRequests = (): Requests => {
     });
 
   const answer = (card: RequestCard, chosen: CardAnswer) => {
+    const current = latest.current.find((item) => item.id === card.id);
+    if (
+      error ||
+      !current?.actionable ||
+      current.dot !== card.dot ||
+      current.sessionID !== card.sessionID ||
+      current.boundSessionID !== card.boundSessionID ||
+      current.revision !== card.revision
+    ) {
+      note(card.id, "The request changed or couldn't be refreshed, so nothing was sent.");
+      void poll();
+      return;
+    }
     // A double click, or the same card in the chat and in Needs you, sends once.
     if (locks.current.has(card.id) || checking.has(card.id) || !card.boundSessionID) return;
     locks.current.add(card.id);
@@ -272,20 +285,151 @@ export const RequestList = ({
   );
 };
 
+export const RequestNotice = ({
+  dot,
+  reference,
+  text,
+  requests,
+  ask,
+}: {
+  dot: string;
+  reference: number | undefined;
+  text: string;
+  requests: Requests;
+  ask: AskOwner;
+}) => {
+  const [card, setCard] = useState<RequestCard>();
+  const [problem, setProblem] = useState<string>();
+  const [expanded, setExpanded] = useState(false);
+  const linked = Number.isSafeInteger(reference) && (reference ?? 0) > 0;
+  useEffect(() => {
+    setCard(undefined);
+    setProblem(undefined);
+    setExpanded(false);
+    if (!linked || reference === undefined) return undefined;
+    let live = true;
+    let reading = false;
+    let settled = false;
+    const read = async () => {
+      if (reading || settled) return;
+      reading = true;
+      try {
+        const result = await bridge.call("requestReceipt", dot, reference);
+        if (!live) return;
+        if (
+          !result.ok ||
+          result.value.request.id !== reference ||
+          result.value.request.dot !== dot
+        ) {
+          setProblem("Request status unavailable. No action can be taken from this notice.");
+          return;
+        }
+        setProblem(undefined);
+        setCard(result.value.request);
+        settled = ["answered", "stale"].includes(result.value.request.state);
+      } catch {
+        if (live)
+          setProblem("Request status unavailable. No action can be taken from this notice.");
+      } finally {
+        reading = false;
+      }
+    };
+    void read();
+    const timer = setInterval(() => void read(), 2_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [dot, reference, linked]);
+  const current = requests.cards.find((item) => item.id === reference && item.dot === dot);
+  const canAnswer =
+    !problem &&
+    !requests.error &&
+    card?.actionable === true &&
+    current?.actionable === true &&
+    current.sessionID === card.sessionID &&
+    current.boundSessionID === card.boundSessionID &&
+    current.revision === card.revision;
+  const status = problem
+    ? "Status unavailable"
+    : !card
+      ? linked
+        ? "Checking request…"
+        : "System notice"
+      : card.state === "open" || card.state === "escalated"
+        ? card.kind === "permission"
+          ? "Waiting for permission"
+          : "Waiting for an answer"
+        : card.state === "answered"
+          ? "Answered"
+          : card.state === "stale"
+            ? "No longer waiting"
+            : card.state === "queued" || card.state === "answering"
+              ? "Sending answer…"
+              : card.state === "unknown"
+                ? "Answer not confirmed"
+                : "Status unavailable";
+  const detail = card ? cardDetail(card) : undefined;
+  const action =
+    detail?.kind === "permission"
+      ? `${detail.action} · ${detail.resources.length} resource${detail.resources.length === 1 ? "" : "s"}`
+      : detail?.kind === "question"
+        ? detail.title
+        : undefined;
+  return (
+    <section className="request-notice" data-request-notice={linked ? reference : "unstructured"}>
+      <strong role="status">{status}</strong>
+      {card ? (
+        <>
+          <div className="notice-origin">{cardOrigin(card)}</div>
+          <div className="notice-title" title={card.title}>
+            {card.title}
+          </div>
+          {action ? <div className="notice-action">{action}</div> : null}
+          <button type="button" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+            {expanded ? "Hide request" : canAnswer ? "Respond in open-dot" : "View request"}
+          </button>
+          {expanded ? (
+            <div className="notice-request-details">
+              <RequestCardView
+                card={canAnswer && current ? current : card}
+                requests={requests}
+                ask={ask}
+                readOnly={!canAnswer}
+                embedded
+              />
+            </div>
+          ) : null}
+        </>
+      ) : null}
+      {problem ? <p className="warning">{problem}</p> : null}
+      <details>
+        <summary>Technical details</summary>
+        <pre>{text}</pre>
+      </details>
+    </section>
+  );
+};
+
 const RequestCardView = ({
   card,
   requests,
   ask,
+  readOnly = false,
+  embedded = false,
 }: {
   card: RequestCard;
   requests: Requests;
   ask: AskOwner;
+  readOnly?: boolean;
+  embedded?: boolean;
 }) => {
   const detail = cardDetail(card);
   const draft = requests.draft(card);
   const [problem, setProblem] = useState<string | null>(null);
   const busy = requests.sending.has(card.id) || requests.checking.has(card.id);
-  const live = card.actionable && !busy && card.boundSessionID !== null;
+  const live =
+    !readOnly && !requests.error && card.actionable && !busy && card.boundSessionID !== null;
   const status = cardStatus(card);
   const terminal = async () => setProblem(opened(await bridge.openRequest(card.id)));
   const send = (chosen: CardAnswer) => {
@@ -323,7 +467,7 @@ const RequestCardView = ({
   return (
     <article
       className="request-card"
-      data-request={card.id}
+      data-request={readOnly || embedded ? undefined : card.id}
       data-actionable={live ? "" : undefined}
       aria-label={`${card.kind === "permission" ? "Permission request" : "Question"} from ${cardOrigin(card)}`}
     >
@@ -457,9 +601,11 @@ const RequestCardView = ({
             </button>
           </>
         ) : null}
-        <button type="button" data-open-request={card.id} onClick={() => void terminal()}>
-          Open in terminal
-        </button>
+        {!readOnly && !embedded ? (
+          <button type="button" data-open-request={card.id} onClick={() => void terminal()}>
+            Open in terminal
+          </button>
+        ) : null}
       </div>
     </article>
   );

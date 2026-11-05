@@ -187,6 +187,8 @@ test("questions take a checked reply or a reject, and a question that may ask fo
     expect.stringContaining("is waiting on question #1"),
     expect.stringContaining("Needs your owner: question #2"),
   ]);
+  expect(toDot()[1]).toContain("must inspect it in that session in OpenCode");
+  expect(toDot()[1]).not.toContain("can answer the authenticated request card");
 
   fake.state.waiting.set(session, [{ ...form, id: "frm_3" }]);
   await tick();
@@ -466,6 +468,9 @@ test("unanswered past the grace period, a request needs the owner once, and is n
     reason: "Nobody answered it within two minutes.",
   });
   expect(toDot().filter((text) => text.startsWith("Needs your owner"))).toHaveLength(1);
+  expect(toDot().find((text) => text.startsWith("Needs your owner"))).toContain(
+    "this dot's Waiting for you section or Inbox → Needs your action",
+  );
   expect(queue({ decision: "once" })).toContain("with your owner");
   // Once the owner answers it in OpenCode, it no longer needs them.
   fake.state.waiting.delete(session);

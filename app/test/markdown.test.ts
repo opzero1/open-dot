@@ -93,9 +93,18 @@ test("fenced code gets a copy button, and a unified diff renders as added and re
   const code = render("```ts\nconst a = 1;\n```");
   expect(code).toContain('class="code-block"');
   expect(code).toContain('aria-label="Copy code"');
+  const copy = code.match(/<button[^>]*aria-label="Copy code"[\s\S]*?<\/button>/)?.[0] ?? "";
+  expect(copy).toContain('class="icon-button copy"');
+  expect(copy).toContain('title="Copy code"');
+  expect(copy).toContain('aria-hidden="true"');
+  expect(copy).toContain('<span class="sr-only">Copy code</span>');
+  expect(copy).not.toMatch(/>Copy</);
+  expect(copy).not.toContain("Copied");
+  expect(code).toContain('role="status"></span>');
   expect(code).toContain("const a = 1;");
   const diff = render("```diff\n--- a/x.ts\n+++ b/x.ts\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n```");
   expect(diff).toContain('class="code-block diff"');
+  expect(diff).toContain('class="icon-button copy" aria-label="Copy code" title="Copy code"');
   expect(diff).toMatch(/diff-del">.*-.*old/);
   expect(diff).toMatch(/diff-add">.*\+.*new/);
   // A malformed diff still shows its text, as plain code.

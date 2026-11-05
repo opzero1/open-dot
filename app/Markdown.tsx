@@ -28,6 +28,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import type { Bridge, Bytes, Result } from "./bridge";
 import { isDiff, mediaKey, type MediaView, safeExternalURL } from "./chat";
+import { IconButton } from "./icons";
 
 const bridge = (): Bridge | undefined => globalThis.openDot;
 
@@ -123,22 +124,42 @@ const textOf = (node: ElementContent | Element): string =>
 
 const Copy = ({ text }: { text: string }) => {
   const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const attempt = useRef(0);
+  useEffect(() => {
+    setCopied(false);
+    return () => {
+      attempt.current++;
+      clearTimeout(timer.current);
+    };
+  }, [text]);
   return (
-    <button
-      type="button"
-      className="copy"
-      aria-label="Copy code"
-      onClick={() => {
-        void bridge()
-          ?.copyText(text)
-          .then((done) => {
-            setCopied(done);
-            setTimeout(() => setCopied(false), 1500);
-          });
-      }}
-    >
-      {copied ? "Copied" : "Copy"}
-    </button>
+    <span>
+      <IconButton
+        icon={copied ? "save" : "copy"}
+        className="copy"
+        label="Copy code"
+        title={copied ? "Copied" : "Copy code"}
+        onClick={() => {
+          const current = ++attempt.current;
+          clearTimeout(timer.current);
+          setCopied(false);
+          void bridge()
+            ?.copyText(text)
+            .then((done) => {
+              if (current !== attempt.current) return;
+              setCopied(done);
+              if (done) timer.current = setTimeout(() => setCopied(false), 1500);
+            })
+            .catch(() => {
+              if (current === attempt.current) setCopied(false);
+            });
+        }}
+      />
+      <span className="sr-only" role="status">
+        {copied ? "Copied" : ""}
+      </span>
+    </span>
   );
 };
 

@@ -130,7 +130,13 @@ import {
   startDMCheck,
   updateApp,
 } from "./slack-setup";
-import { approveBinding, endBinding, openSupervisions, supervisionView } from "./supervise";
+import {
+  approveBinding,
+  endBinding,
+  openSupervisions,
+  sessionIDPattern,
+  supervisionView,
+} from "./supervise";
 import { activeGrants, grantView, revokeGrant } from "./grants";
 import {
   createTrigger,
@@ -147,6 +153,7 @@ import {
 import { dotUsage } from "./usage";
 import {
   type Dot,
+  dots,
   feed,
   type FeedItem,
   type FeedSnapshot,
@@ -248,6 +255,44 @@ const avatarView = (name: string) => {
   return revision ? { revision } : null;
 };
 
+const listedThreads = (db: Db, dot: Dot) =>
+  Effect.gen(function* () {
+    if (dot.sessionState !== "ready") return [];
+    const listed = yield* (yield* OpenCode)
+      .threadsWorkers(dot.directory, dot.sessionID)
+      .pipe(Effect.timeout("3 seconds"));
+    if (rebound(db, dot)) return [];
+    const excluded = new Set([
+      ...db
+        .select({ id: dots.sessionID })
+        .from(dots)
+        .all()
+        .map((row) => row.id),
+      ...db
+        .select({ id: workers.sessionID })
+        .from(workers)
+        .all()
+        .map((row) => row.id),
+    ]);
+    return listed.filter(
+      (worker) =>
+        worker.coordinatorID === dot.sessionID &&
+        !worker.hidden &&
+        sessionIDPattern.test(worker.workerID) &&
+        !excluded.has(worker.workerID),
+    );
+  });
+
+const threadState = (
+  worker: { workerID: string; outcome?: string | null },
+  active: ReadonlySet<string>,
+) =>
+  active.has(worker.workerID)
+    ? "working"
+    : worker.outcome
+      ? `last outcome: ${worker.outcome}`
+      : "idle, no outcome reported";
+
 const listAll = (db: Db) =>
   Effect.gen(function* () {
     const active = yield* (yield* OpenCode).activeSessions;
@@ -272,17 +317,45 @@ const listAll = (db: Db) =>
       )
       .all()
       .filter((row) => !sessions.has(row.sessionID));
+    const listed = yield* Effect.forEach(
+      listDots(db),
+      (dot) =>
+        listedThreads(db, dot).pipe(
+          Effect.map((threads) => ({ dot, threads, threadsError: null as string | null })),
+          Effect.catch(() =>
+            Effect.succeed({
+              dot,
+              threads: [],
+              threadsError: "Threads workers unavailable. Refresh to try again.",
+            }),
+          ),
+        ),
+      { concurrency: 3 },
+    );
     return Response.json(
-      listDots(db).map((dot) => ({
+      listed.map(({ dot, threads, threadsError }) => ({
         name: dot.name,
         purpose: dot.purpose,
         busy: active.has(dot.sessionID),
         avatar: avatarView(dot.name),
+        threadsError,
+        threads: threads.map((worker) => ({
+          sessionID: worker.workerID,
+          title: worker.title,
+          state: threadState(worker, active),
+          ...requestsView(
+            others.filter((row) => row.dot === dot.name && row.sessionID === worker.workerID),
+            now,
+          ),
+        })),
         workers: unfinished
           .filter((worker) => worker.dot === dot.name)
           .map((worker) => workerView(worker, rows, now)),
         sessions: sessionsView(
-          others.filter((row) => row.dot === dot.name),
+          others.filter(
+            (row) =>
+              row.dot === dot.name && !threads.some((worker) => worker.workerID === row.sessionID),
+          ),
           now,
         ),
       })),
@@ -953,6 +1026,16 @@ const hiddenIDs = (db: Db, dot: Dot, ids: string[]) =>
 const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
   const ids = entries.map((item) => item.id);
   const sent = messageSources(db, dot.sessionID, ids);
+  const notices = new Map(
+    (ids.length
+      ? db
+          .select({ id: requests.id, noticeID: requests.noticeID })
+          .from(requests)
+          .where(and(eq(requests.dot, dot.name), inArray(requests.noticeID, ids)))
+          .all()
+      : []
+    ).map((row) => [row.noticeID, row.id]),
+  );
   const saved = currentReactions(db, dot, ids);
   const hidden = hiddenIDs(db, dot, ids);
   const label = (item: Entry) => {
@@ -962,7 +1045,7 @@ const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
       // Hidden messages stay listed, so the app can still match its pending sends by ID.
       hidden: hidden.has(item.id),
       text: item.text,
-      tools: item.tools,
+      tools: [...item.tools],
       // Metadata only: the app loads each image's bytes on its own.
       attachments: item.files.map((file, index) => ({
         index,
@@ -996,7 +1079,11 @@ const visibleMessages = (db: Db, dot: Dot, entries: readonly Entry[]) => {
     // A reply to a feed item shows the owner's prompt and the item's card, not the framing.
     if (row?.fromOwner && row.feed)
       return [{ ...base, kind: "owner", text: row.feed.prompt, feed: row.feed.item }];
-    if (kind === "owner" || kind === "notice") return [{ ...base, kind }];
+    if (kind === "notice") {
+      const requestNotice = notices.get(item.id);
+      return [{ ...base, kind, ...(requestNotice === undefined ? {} : { requestNotice }) }];
+    }
+    if (kind === "owner") return [{ ...base, kind }];
     const inner = framed.exec(item.text)?.[1]?.replace(/<\\\/dot-message/gi, "</dot-message");
     return [{ ...base, kind: "peer", peer: row?.fromDot, text: inner ?? item.text }];
   };
@@ -2850,6 +2937,17 @@ const route = (
   if (decoded === undefined) return Effect.succeed(error(400, "Bad dot name."));
   const dot = findDot(db, decoded);
   if (!dot) return Effect.succeed(error(404, `There's no dot named "${name}".`));
+  if (
+    rest === "threads" &&
+    extra.length === 2 &&
+    extra[1] === "conversation" &&
+    request.method === "GET"
+  ) {
+    const sessionID = extra[0];
+    if (!sessionID || !sessionIDPattern.test(sessionID))
+      return Effect.succeed(error(404, "Not found"));
+    return connect(threadConversation(db, dot, sessionID, layer));
+  }
   if (rest === "messages" && extra.length === 0) {
     if (request.method === "POST") return connect(send(db, dot, request));
   }
@@ -3098,6 +3196,36 @@ const sessionConversation = (
         Effect.succeed(error(503, "Couldn't read this session's recent messages.")),
       ),
     ),
+  );
+
+const threadConversation = (
+  db: Db,
+  dot: Dot,
+  sessionID: string,
+  layer: Layer.Layer<OpenCode, OpenCodeError>,
+) =>
+  Effect.gen(function* () {
+    const owned = yield* listedThreads(db, dot);
+    const worker = owned.find((item) => item.workerID === sessionID);
+    if (!worker) return error(404, "This dot has no visible Threads worker with that session.");
+    const active = yield* (yield* OpenCode).activeSessions;
+    const response = yield* Effect.promise(() =>
+      sessionConversation(
+        {
+          title: worker.title,
+          directory: worker.directory,
+          sessionID: worker.workerID,
+          state: threadState(worker, active),
+        },
+        layer,
+      ),
+    );
+    const current = yield* listedThreads(db, dot);
+    if (!current.some((item) => item.workerID === sessionID))
+      return error(409, "The dot's Threads worker changed. Refresh the worker list.");
+    return response;
+  }).pipe(
+    Effect.catch(() => Effect.succeed(error(503, "Couldn't verify this dot's Threads workers."))),
   );
 
 /** Reads a worker's recent conversation, or opens/stops it on the owner's request. */
@@ -3484,12 +3612,12 @@ export const api = (
   };
   return Object.assign(handler, {
     refresh: async () => {
-      const dots = listDots(db).filter((dot) => dot.sessionState === "ready");
-      const names = new Set(dots.map((dot) => dot.name));
+      const readyDots = listDots(db).filter((dot) => dot.sessionState === "ready");
+      const names = new Set(readyDots.map((dot) => dot.name));
       for (const [name, cached] of pages)
         if (!names.has(name) && !cached.flight) pages.delete(name);
       await Promise.all(
-        dots.map(async (dot) => {
+        readyDots.map(async (dot) => {
           const previous = pages.get(dot.name);
           const cached = current(
             dot,

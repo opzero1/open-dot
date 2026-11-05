@@ -289,6 +289,7 @@ export const shapes: Record<Operation, Shape> = {
   },
   workerConversation,
   requestConversation: workerConversation,
+  threadConversation: workerConversation,
   work: { calls: [toolCall], counts: workCounts, complete: "b", "more?": "s" },
   toolDetail: {
     ...toolCall,
