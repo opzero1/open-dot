@@ -1,11 +1,16 @@
 /** @jsxImportSource react */
 // The window: a sidebar of dots and the selected dot's chat. Drafts, unread marks and image blobs
 // live only in this renderer's memory; the daemon owns every message.
-import { defaultRangeExtractor, type Range, useVirtualizer } from "@tanstack/react-virtual";
+import {
+  defaultRangeExtractor,
+  type Range as VirtualRange,
+  useVirtualizer,
+} from "@tanstack/react-virtual";
 import {
   type ClipboardEvent,
   type DragEvent,
   type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type RefObject,
   useCallback,
   useEffect,
@@ -19,6 +24,7 @@ import type {
   ActivityView,
   Attempt,
   DotView,
+  DraftImage,
   MessageView,
   PageView,
   PendingView,
@@ -32,6 +38,7 @@ import type {
 } from "./bridge";
 import {
   activityLine,
+  addRef,
   afterSend,
   applyIntents,
   backoff,
@@ -57,24 +64,31 @@ import {
   mergeOlder,
   mergeWork,
   messageMedia,
+  nativeRef,
   olderRead,
   pendingActions,
   pendingLabel,
   reactionOf,
   recentTapbacks,
   redoDraft,
+  refLimit,
+  refProblem,
   replaceMessage,
   returnAction,
+  sameRef,
   type Sent,
   sentLimit,
   settledBy,
   staleAfter,
   tapbacks,
+  threadsRef,
   undoDraft,
   unlistedTapback,
   unreadSince,
+  withRefs,
   workerActions,
   workerTitle,
+  type WorkerRef,
   type WorkState,
   logCounts,
   turnCalls,
@@ -294,6 +308,8 @@ const App = () => {
   }, [settingsOpen]);
   const [menu, setMenu] = useState<Menu>();
   const [viewer, setViewer] = useState<string>();
+  // An unsent image previewed from the message box: it stays in the draft and is never sent here.
+  const [preview, setPreview] = useState<{ dot: string; image: DraftImage; opener: HTMLElement }>();
   const [toast, setToast] = useState<Toast>();
   const [confirm, setConfirm] = useState<{ text: string; action: string; run: () => void }>();
   const [capturing, setCapturing] = useState<{ dot: string; message: MessageView }>();
@@ -350,7 +366,7 @@ const App = () => {
     quoteCaret.current = undefined;
     composer.current.focus();
     composer.current.setSelectionRange(draft.text.length, draft.text.length);
-  }, [selected, draft.text]);
+  }, [selected, draft.text, draft.refs]);
 
   const setComposerError = useCallback((name: string, text: string | undefined) => {
     setComposerErrors((current) =>
@@ -744,7 +760,12 @@ const App = () => {
     [dots, conversations, seen],
   );
 
-  const unsaved = [...editors.current.values()].filter((editor) => editor.dirty).length;
+  // Unsaved instruction edits and unsent message drafts: quitting asks before it discards them.
+  const unsaved =
+    [...editors.current.values()].filter((editor) => editor.dirty).length +
+    [...drafts.values()].filter(
+      (item) => item.text.trim() || item.images.length || item.quote || item.refs?.length,
+    ).length;
   useEffect(() => {
     const total = [...unread.values()].reduce((sum, count) => sum + count, 0);
     void bridge.setTray({ busy: dots.some((item) => item.busy), unread: total, unsaved });
@@ -753,6 +774,21 @@ const App = () => {
   // Looking at a chat marks it read; the Feed and a dot's other panes don't.
   const looking = pane === "chat" && !feedOpen && !needsOpen;
   lookingRef.current = looking;
+
+  const closePreview = () => {
+    const opener = preview?.opener;
+    setPreview(undefined);
+    if (opener?.isConnected) opener.focus();
+    else composer.current?.focus();
+  };
+  // A preview ends once its image leaves the draft, by a send or removal, or its chat isn't shown.
+  useEffect(() => {
+    if (!preview) return;
+    const shown = preview.dot === selected && looking;
+    if (shown && drafts.get(preview.dot)?.images.includes(preview.image)) return;
+    setPreview(undefined);
+    if (shown) composer.current?.focus();
+  }, [preview, drafts, selected, looking]);
   useEffect(() => {
     const last = conversation?.latest.at(-1)?.id;
     if (looking && selected && last && seen.get(selected) !== last && document.hasFocus())
@@ -888,6 +924,20 @@ const App = () => {
       );
       return;
     }
+    // References go only to the dot and session they were added in, as open-dot lists them now.
+    const binding = dotsRef.current.find((item) => item.name === name)?.sessionID;
+    const shownSession = conversationsRef.current.get(name)?.sessionID;
+    const stale = (captured.refs ?? [])
+      .map((ref) =>
+        shownSession === conversation.sessionID
+          ? refProblem(ref, name, binding, conversation.sessionID)
+          : `${name}'s conversation changed. Check it before sending.`,
+      )
+      .find((problem) => problem !== undefined);
+    if (stale) {
+      setComposerError(name, `Not sent. A worker reference can't go with this message: ${stale}`);
+      return;
+    }
     setComposerError(name, undefined);
     setSending((current) => new Set(current).add(name));
     let result: SendResult;
@@ -895,7 +945,7 @@ const App = () => {
       result = await bridge.send({
         dot: name,
         sessionID: conversation.sessionID,
-        text: captured.text,
+        text: withRefs(captured.text, captured.refs),
         ...(captured.quote ? { replyTo: captured.quote.id } : {}),
         images: captured.images,
       });
@@ -944,6 +994,36 @@ const App = () => {
       );
       setAttempts(await bridge.attempts());
     } else setComposerError(name, result.error);
+  };
+
+  /**
+   * Pins a worker to the dot's draft as context, once, and puts the caret at the end of the message
+   * box. It sends nothing: the owner types the request and sends it as usual.
+   */
+  const addReference = (name: string, ref: WorkerRef): boolean => {
+    const binding = dotsRef.current.find((item) => item.name === name)?.sessionID;
+    const problem =
+      selectedRef.current !== name
+        ? `Open ${name}'s chat to add its workers.`
+        : refProblem(ref, name, binding, conversationsRef.current.get(name)?.sessionID);
+    if (problem) {
+      showToast({ text: `Not added. ${problem}` });
+      return false;
+    }
+    const existing = draftsRef.current.get(name) ?? emptyDraft();
+    const refs = existing.refs ?? [];
+    if (refs.some((other) => sameRef(other, ref))) {
+      composer.current?.focus();
+      composer.current?.setSelectionRange(existing.text.length, existing.text.length);
+      return true;
+    }
+    if (refs.length >= refLimit) {
+      showToast({ text: `Not added. A message can reference at most ${refLimit} workers.` });
+      return false;
+    }
+    quoteCaret.current = { dot: name, text: existing.text };
+    setDraft(name, (current) => addRef(current, ref));
+    return true;
   };
 
   const attach = async (name: string, files: File[]) => {
@@ -1181,6 +1261,7 @@ const App = () => {
     confirm ||
     menu ||
     viewer ||
+    preview ||
     capturing ||
     dotMenu ||
     settingsOpen ||
@@ -1532,6 +1613,51 @@ const App = () => {
                   />
                 </div>
               ) : null}
+              {draft.refs?.length ? (
+                <div className="ref-chips" aria-label="Worker references">
+                  {draft.refs.map((ref) => {
+                    const label = workerTitle(ref.title);
+                    const problem = refProblem(
+                      ref,
+                      dot.name,
+                      dot.sessionID,
+                      conversation?.sessionID,
+                    );
+                    const identity = [
+                      ref.kind === "worker" ? `open-dot worker ${ref.workerID}` : "Threads worker",
+                      `Session ${ref.sessionID}`,
+                      `Coordinator ${ref.coordinatorID}`,
+                      ...(ref.kind === "worker" && ref.directory
+                        ? [`Directory ${ref.directory}`]
+                        : []),
+                    ].join("\n");
+                    return (
+                      <span
+                        key={`${ref.kind}:${ref.sessionID}:${ref.coordinatorID}`}
+                        className="ref-chip"
+                        role="group"
+                        aria-label={`Worker reference: ${label}${problem ? `. ${problem}` : ""}`}
+                        data-ref={ref.sessionID}
+                        data-stale={problem ? "" : undefined}
+                        title={`${ref.title}\n${identity}${problem ? `\n${problem}` : ""}`}
+                      >
+                        <span className="ref-label">{label}</span>
+                        <IconButton
+                          icon="close"
+                          label={`Remove reference to ${label}`}
+                          onClick={() => {
+                            setDraft(dot.name, (current) => ({
+                              ...current,
+                              refs: current.refs?.filter((other) => other !== ref),
+                            }));
+                            composer.current?.focus();
+                          }}
+                        />
+                      </span>
+                    );
+                  })}
+                </div>
+              ) : null}
               {draft.images.length ? (
                 <div className="draft-images">
                   {draft.images.map((image, index) => (
@@ -1539,6 +1665,7 @@ const App = () => {
                       key={index}
                       className="draft-thumb"
                       image={image}
+                      onOpen={(opener) => setPreview({ dot: dot.name, image, opener })}
                       onRemove={() =>
                         setDraft(dot.name, (current) => ({
                           ...current,
@@ -1593,7 +1720,13 @@ const App = () => {
         )}
       </main>
       {dot && looking ? (
-        <Workers key={dot.name} dot={dot} onConfirm={setConfirm} onToast={showToast} />
+        <Workers
+          key={dot.name}
+          dot={dot}
+          onConfirm={setConfirm}
+          onToast={showToast}
+          onAdd={(ref) => addReference(dot.name, ref)}
+        />
       ) : null}
       {menu && selected && menuMessage ? (
         <MessageMenu
@@ -1662,6 +1795,7 @@ const App = () => {
           <img src={viewer} alt="" />
         </div>
       ) : null}
+      {preview ? <DraftPreview image={preview.image} onClose={closePreview} /> : null}
       {confirm ? (
         <div className="modal" role="alertdialog">
           <div className="modal-box">
@@ -1841,6 +1975,54 @@ const DotMenu = ({
   );
 };
 
+/** An unsent image at full size, fitted to the window, read from its own bytes. */
+const DraftPreview = ({ image, onClose }: { image: DraftImage; onClose: () => void }) => {
+  // The effect that makes the URL releases it, so no render that React discards leaves one behind.
+  const [url, setUrl] = useState<string>();
+  useEffect(() => {
+    const made = URL.createObjectURL(new Blob([new Uint8Array(image.data)], { type: image.mime }));
+    setUrl(made);
+    return () => {
+      URL.revokeObjectURL(made);
+      setUrl(undefined);
+    };
+  }, [image]);
+  const close = useRef<HTMLButtonElement>(null);
+  useEffect(() => close.current?.focus(), []);
+  return (
+    <div
+      className="viewer fit"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Preview of ${image.name}`}
+      data-draft-preview
+      onClick={onClose}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          onClose();
+        } else if (event.key === "Tab") {
+          event.preventDefault();
+          close.current?.focus();
+        }
+      }}
+    >
+      {url ? <img src={url} alt={image.name} onClick={(event) => event.stopPropagation()} /> : null}
+      <IconButton
+        ref={close}
+        icon="close"
+        label="Close preview"
+        className="viewer-close"
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose();
+        }}
+      />
+    </div>
+  );
+};
+
 const keepSentLimit = (sent: Map<string, Sent>) =>
   sent.size <= sentLimit
     ? sent
@@ -1876,11 +2058,63 @@ const SentPreview = ({ dot, sent }: { dot: string; sent: Captured }) => (
         ))}
       </div>
     ) : null}
+    {sent.refs?.length ? (
+      <div className="ref-chips" aria-label="Worker references">
+        {sent.refs.map((ref) => (
+          <span
+            key={`${ref.kind}:${ref.sessionID}:${ref.coordinatorID}`}
+            className="ref-chip"
+            title={`${ref.title}\nSession ${ref.sessionID}`}
+          >
+            <span className="ref-label">{workerTitle(ref.title)}</span>
+          </span>
+        ))}
+      </div>
+    ) : null}
   </>
 );
 
 const replyContent = (node: Node | null | undefined) =>
   (node instanceof Element ? node : node?.parentElement)?.closest("[data-reply-content]");
+
+/**
+ * A selection's boundary moved inward past positions that select nothing, onto the selected content
+ * it touches: a triple-click can end at offset 0 of the next block, outside the message's text,
+ * without selecting any of it. Only boundaries, empty text and element edges are crossed, never a
+ * character or a childless element such as an image, so the points select exactly what they did.
+ */
+const settleBoundary = (container: Node, offset: number, forward: boolean): [Node, number] => {
+  let node = container;
+  let at = offset;
+  for (let step = 0; step < 10_000; step++) {
+    const size = node instanceof CharacterData ? node.length : node.childNodes.length;
+    const next = forward ? at < size : at > 0;
+    if (next && node instanceof CharacterData) return [node, at];
+    const child = next ? node.childNodes[forward ? at : at - 1] : undefined;
+    if (child instanceof Text) {
+      if (child.length) return [child, forward ? 0 : child.length];
+      at += forward ? 1 : -1;
+    } else if (child) {
+      if (!child.childNodes.length) return [node, at];
+      node = child;
+      at = forward ? 0 : child.childNodes.length;
+    } else {
+      const parent = node.parentNode;
+      if (!parent) return [node, at];
+      at = Array.prototype.indexOf.call(parent.childNodes, node) + (forward ? 1 : 0);
+      node = parent;
+    }
+  }
+  return [node, at];
+};
+
+/** The range of the content a selection's range really selects, with its boundaries settled. */
+const selectedContent = (range: Range) => {
+  const inner = document.createRange();
+  inner.setStart(...settleBoundary(range.startContainer, range.startOffset, true));
+  inner.setEnd(...settleBoundary(range.endContainer, range.endOffset, false));
+  return inner;
+};
 
 const MessageList = ({
   dot,
@@ -1942,7 +2176,7 @@ const MessageList = ({
   const selection = useRef<[string, string] | undefined>(undefined);
   const [replySelection, setReplySelection] = useState<SelectedReply>();
 
-  const rangeExtractor = useCallback((range: Range) => {
+  const rangeExtractor = useCallback((range: VirtualRange) => {
     const indexes = new Set(defaultRangeExtractor(range));
     const span = selection.current;
     if (span) {
@@ -1987,7 +2221,10 @@ const MessageList = ({
       }
       keep.current = ids;
       if (document.activeElement?.closest("[data-selection-reply]")) return;
-      const range = current?.rangeCount ? current.getRangeAt(0) : undefined;
+      const selected = current?.rangeCount ? current.getRangeAt(0) : undefined;
+      // Judged by the content it selects, not where its boundaries happen to rest; the text is the
+      // selection's own, trailing newlines included.
+      const range = selected && selectedContent(selected);
       const start = replyContent(range?.startContainer);
       const end = replyContent(range?.endContainer);
       const id = start?.closest<HTMLElement>("[data-message]")?.dataset.message;
@@ -2679,8 +2916,8 @@ const MessageRow = ({
           />
         ) : message.kind === "owner" ? (
           message.text ? (
-            <div className="plain" data-reply-content>
-              {message.text}
+            <div data-reply-content>
+              <Markdown text={message.text} />
             </div>
           ) : null
         ) : message.text ? (
@@ -2749,7 +2986,16 @@ const MessageRow = ({
               ))}
             </ExecutionDetails>
           ) : null}
-          {delivered ? <span className="delivered">Delivered</span> : null}
+          {delivered ? (
+            <span
+              className="delivered"
+              role="img"
+              aria-label="Delivered to conversation; read status unavailable"
+              title="Delivered to the conversation history. This does not confirm the agent has read or consumed it."
+            >
+              <Icon icon="save" />
+            </span>
+          ) : null}
           {onRetry ? (
             <span className="unconfirmed" data-unconfirmed>
               Not confirmed yet{" "}
@@ -3101,18 +3347,115 @@ const WorkerPanel = ({
   );
 };
 
+/** A worker row's own menu: Add to chat, for the row and dot binding it opened on. */
+const WorkerMenu = ({
+  menu,
+  onAdd,
+  onClose,
+}: {
+  menu: { label: string; problem: string | undefined; x: number; y: number };
+  onAdd: () => void;
+  onClose: () => void;
+}) => {
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    (box.current?.querySelector<HTMLElement>("button:not(:disabled)") ?? box.current)?.focus();
+  }, []);
+  return (
+    <div
+      className="menu-backdrop"
+      onClick={onClose}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      <div
+        ref={box}
+        className="menu"
+        role="menu"
+        tabIndex={-1}
+        aria-label={`${menu.label} actions`}
+        style={{
+          left: Math.min(menu.x, window.innerWidth - 260),
+          top: Math.min(menu.y, window.innerHeight - 120),
+        }}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" || event.key === "Tab") {
+            event.preventDefault();
+            event.stopPropagation();
+            onClose();
+          }
+        }}
+      >
+        <button type="button" role="menuitem" disabled={menu.problem !== undefined} onClick={onAdd}>
+          Add to chat
+        </button>
+        {menu.problem ? <div className="menu-note">{menu.problem}</div> : null}
+      </div>
+    </div>
+  );
+};
+
 const Workers = ({
   dot,
   onConfirm,
   onToast,
+  onAdd,
 }: {
   dot: DotView;
   onConfirm: (confirm: { text: string; action: string; run: () => void }) => void;
   onToast: (toast: Toast) => void;
+  onAdd: (ref: WorkerRef) => boolean;
 }) => {
   const [busy, setBusy] = useState(new Set<number>());
   const [selected, setSelected] = useState<WorkerTarget>();
   const trigger = useRef<HTMLButtonElement | null>(null);
+  const [menu, setMenu] = useState<{
+    row: string;
+    ref: WorkerRef | string;
+    label: string;
+    x: number;
+    y: number;
+    button: HTMLButtonElement;
+  }>();
+  // The reference a row would make from what open-dot lists now, or why it can't.
+  const rowRef = (row: string): WorkerRef | string => {
+    const thread = dot.threads?.find((item) => `threads:${item.sessionID}` === row);
+    if (thread) return threadsRef(dot, thread);
+    const worker = dot.workers.find((item) => `worker:${item.id}` === row);
+    return worker ? nativeRef(dot, worker) : "This worker is no longer listed.";
+  };
+  const menuProps = (row: string, label: string) => ({
+    "aria-haspopup": "menu" as const,
+    "aria-keyshortcuts": "Shift+F10 ContextMenu",
+    onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.currentTarget.focus();
+      const button = event.currentTarget;
+      setMenu({ row, ref: rowRef(row), label, x: event.clientX, y: event.clientY, button });
+    },
+    onKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => {
+      if (event.key !== "ContextMenu" && !(event.key === "F10" && event.shiftKey)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const button = event.currentTarget;
+      const box = button.getBoundingClientRect();
+      setMenu({ row, ref: rowRef(row), label, x: box.left, y: box.bottom, button });
+    },
+  });
+  // A choice made later still adds only the worker, dot and binding the menu opened for.
+  const addFromMenu = () => {
+    if (!menu) return;
+    const opened = menu.ref;
+    const now = rowRef(menu.row);
+    setMenu(undefined);
+    if (typeof opened === "string") return;
+    if (typeof now === "string" || !sameRef(now, opened)) {
+      onToast({ text: "Not added. This worker changed since the menu opened; open it again." });
+      menu.button.focus();
+      return;
+    }
+    if (!onAdd(opened)) menu.button.focus();
+  };
   if (
     !dot.workers.length &&
     !dot.sessions.length &&
@@ -3179,6 +3522,7 @@ const Workers = ({
               aria-label={`View Threads worker: ${workerTitle(worker.title)}`}
               title={worker.title}
               aria-pressed={selected?.kind === "threads" && selected.id === worker.sessionID}
+              {...menuProps(`threads:${worker.sessionID}`, workerTitle(worker.title))}
               onClick={(event) =>
                 pick(
                   {
@@ -3211,6 +3555,7 @@ const Workers = ({
                 aria-label={`View worker: ${workerTitle(worker.task)}`}
                 title={worker.task}
                 aria-pressed={selected?.kind === "worker" && selected.id === worker.id}
+                {...menuProps(`worker:${worker.id}`, workerTitle(worker.task))}
                 onClick={(event) =>
                   pick(
                     { kind: "worker", id: worker.id, title: workerTitle(worker.task) },
@@ -3282,6 +3627,21 @@ const Workers = ({
                       : bridge.openRequest(selected.id)
                   ).then(opened)
           }
+        />
+      ) : null}
+      {menu ? (
+        <WorkerMenu
+          menu={{
+            label: menu.label,
+            problem: typeof menu.ref === "string" ? menu.ref : undefined,
+            x: menu.x,
+            y: menu.y,
+          }}
+          onAdd={addFromMenu}
+          onClose={() => {
+            setMenu(undefined);
+            menu.button.focus();
+          }}
         />
       ) : null}
     </aside>

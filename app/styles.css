@@ -648,13 +648,28 @@ button:disabled {
   height: 64px;
 }
 
-.draft-thumb button {
+.draft-thumb > .icon-button {
   position: absolute;
   top: -6px;
   right: -6px;
   border-radius: 50%;
   padding: 0 5px;
   background: var(--bg);
+}
+
+.thumb-open {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  cursor: zoom-in;
+}
+
+.thumb-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .reactions {
@@ -676,6 +691,16 @@ button:disabled {
 .delivered,
 .unconfirmed {
   color: var(--muted);
+}
+
+.delivered {
+  display: inline-flex;
+  align-items: center;
+}
+
+.delivered svg {
+  width: 14px;
+  height: 14px;
 }
 
 .typing {
@@ -920,6 +945,49 @@ button:disabled {
   color: var(--danger);
 }
 
+.ref-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.ref-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 240px;
+  font-size: 12px;
+  padding: 1px 2px 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+}
+
+.ref-chip .ref-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-chip[data-stale] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.ref-chip .icon-button {
+  width: 20px;
+  height: 20px;
+  padding: 3px;
+  border: none;
+  border-radius: 50%;
+}
+
+.ref-chip .icon-button svg {
+  width: 14px;
+  height: 14px;
+}
+
 .quote-text {
   flex: 1;
   overflow: hidden;
@@ -1029,6 +1097,24 @@ button:disabled {
   max-width: none;
 }
 
+.viewer.fit {
+  overflow: hidden;
+}
+
+.viewer.fit img {
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  object-fit: contain;
+}
+
+.viewer-close {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  border-radius: 50%;
+  background: var(--bg);
+}
+
 .modal {
   background: rgba(0, 0, 0, 0.3);
   display: grid;
@@ -1124,6 +1210,21 @@ button:disabled {
   border-left: 3px solid var(--line);
   padding-left: 12px;
   color: var(--muted);
+}
+
+.message.owner .markdown blockquote:not(.markdown-alert) {
+  border-left-color: var(--accent);
+  border-radius: 4px;
+  background: var(--panel);
+  padding: 6px 10px;
+}
+
+.message.owner .markdown blockquote > :first-child {
+  margin-top: 0;
+}
+
+.message.owner .markdown blockquote > :last-child {
+  margin-bottom: 0;
 }
 
 .markdown table {

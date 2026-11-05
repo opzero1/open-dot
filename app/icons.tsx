@@ -9,6 +9,7 @@ const icons = {
   copy: "M9 9h11v11H9zM5 15H4V4h11v1",
   open: "M14 4h6v6m0-6L10 14M10 4H4v16h16v-6",
   reply: "m9 5-6 6 6 6M3 11h10a7 7 0 0 1 7 7",
+  revert: "m9 14-5-5 5-5M4 9h10a6 6 0 0 1 0 12",
   reload: "M20 5v6h-6m6 0a8 8 0 1 0-2 7",
   save: "m5 12 4 4L19 6",
   progress: "M20 12a8 8 0 1 1-8-8",

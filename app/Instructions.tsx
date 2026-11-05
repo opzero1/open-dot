@@ -79,8 +79,9 @@ export const Instructions = ({
             </span>
           ) : null}
           <IconButton icon="reload" label="Reload" disabled={!!busy} onClick={reload} />
-          <button
-            type="button"
+          <IconButton
+            icon="revert"
+            label={busy === "reverting" ? "Reverting…" : "Revert"}
             disabled={!state.canRevert}
             title="Put back the version before the last save"
             onClick={() =>
@@ -90,11 +91,11 @@ export const Instructions = ({
                 buttons: [{ label: "Cancel" }, { label: "Revert", run: () => void revert() }],
               })
             }
-          >
-            {busy === "reverting" ? "Reverting…" : "Revert"}
-          </button>
-          <button
-            type="button"
+          />
+          <IconButton
+            icon="close"
+            label="Cancel"
+            title="Cancel unsaved changes"
             disabled={!state.dirty || !!busy}
             onClick={() =>
               ask({
@@ -113,9 +114,7 @@ export const Instructions = ({
                 ],
               })
             }
-          >
-            Cancel
-          </button>
+          />
           <IconButton
             icon="save"
             label={busy === "saving" ? "Saving…" : "Save"}

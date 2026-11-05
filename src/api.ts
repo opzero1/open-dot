@@ -213,6 +213,9 @@ const workerView = (worker: Worker, rows: readonly WorkerRequest[] = [], now = D
   const own = rows.filter((row) => row.source === "worker" && row.worker === worker.id);
   return {
     id: worker.id,
+    // The worker's session once OpenCode confirmed it, so the app can name it exactly.
+    sessionID: worker.state === "creating" ? null : worker.sessionID,
+    directory: worker.directory,
     state: worker.state,
     outcome: worker.outcome,
     task: worker.task.split("\n")[0],
@@ -336,6 +339,8 @@ const listAll = (db: Db) =>
       listed.map(({ dot, threads, threadsError }) => ({
         name: dot.name,
         purpose: dot.purpose,
+        // The ready session this listing read, the coordinator its Threads workers matched.
+        sessionID: dot.sessionState === "ready" ? dot.sessionID : null,
         busy: active.has(dot.sessionID),
         avatar: avatarView(dot.name),
         threadsError,

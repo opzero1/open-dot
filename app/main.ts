@@ -2488,14 +2488,17 @@ void app.whenReady().then(() => {
 });
 
 app.on("before-quit", (event) => {
-  // Unsaved instructions are only in the renderer: quitting asks once before it drops them.
+  // Unsaved instructions and unsent drafts are only in the renderer: quitting asks once before it
+  // drops them.
   if (!quitting && (trayState.unsaved ?? 0) > 0) {
     if (smoke) recorded.quitPrompts++;
     else {
       const choice = dialog.showMessageBoxSync({
         type: "warning",
-        message: "Quit and discard unsaved instructions?",
-        detail: "Your edits to a dot's instructions aren't saved. Quitting discards them.",
+        message: "Quit and discard unsaved work?",
+        detail:
+          "You have unsent messages or unsaved edits to a dot's instructions. " +
+          "Quitting discards them.",
         buttons: ["Cancel", "Discard and Quit"],
         defaultId: 0,
         cancelId: 0,
