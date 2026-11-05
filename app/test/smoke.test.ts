@@ -2697,6 +2697,20 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
         chat: true,
         focused: "Close worker panel",
       });
+      expect(
+        await js(`[...document.querySelectorAll('[data-worker] .icon-button, [data-worker-panel] [aria-label="Open in terminal"]')].map((button) => ({
+        label: button.getAttribute("aria-label"), title: button.title,
+        text: button.querySelector(".sr-only")?.textContent,
+        icon: !!button.querySelector("svg[aria-hidden='true']"),
+      }))`),
+      ).toEqual(
+        ["Stop", "Stop", "Stop again", "Open in terminal"].map((label) => ({
+          label,
+          title: label,
+          text: label,
+          icon: true,
+        })),
+      );
       expect(fake.log.conversations).toContain("/workers/2/conversation");
       expect(fake.log.opens).toEqual([]);
       await js(`t.key("Escape"), true`);
@@ -2726,6 +2740,8 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
       expect(fake.log.posts).toHaveLength(1);
       // A creating worker can still be stopped.
       await press('[data-worker="1"]', "Stop");
+      await until(`!!document.querySelector('[role="alertdialog"]')`, "the stop confirmation");
+      expect(fake.log.stops).toEqual([]);
       await press(".modal", "Stop");
       for (let tick = 0; tick < 50 && !fake.log.stops.length; tick++) await delay(100);
       expect(fake.log.stops).toEqual([1]);

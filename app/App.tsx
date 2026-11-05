@@ -2837,9 +2837,7 @@ const WorkerPanel = ({
       <p className="note">
         Read-only recent conversation. Replying and attachments are available in the terminal.
       </p>
-      <button type="button" onClick={onOpen}>
-        Open in terminal
-      </button>
+      <IconButton icon="terminal" label="Open in terminal" onClick={onOpen} />
       {error ? (
         <p className="item-error" role="status">
           {view ? "Not up to date. " : ""}
@@ -2973,8 +2971,9 @@ const Workers = ({
                 )}
               </button>
               {actions.stop ? (
-                <button
-                  type="button"
+                <IconButton
+                  icon="stop"
+                  label={worker.state === "stopping" ? "Stop again" : "Stop"}
                   disabled={busy.has(worker.id)}
                   onClick={() =>
                     onConfirm({
@@ -2983,9 +2982,7 @@ const Workers = ({
                       run: () => stop(worker.id),
                     })
                   }
-                >
-                  {worker.state === "stopping" ? "Stop again" : "Stop"}
-                </button>
+                />
               ) : null}
             </div>
           );

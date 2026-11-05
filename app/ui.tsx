@@ -17,6 +17,8 @@ const icons = {
   reload: "M20 5v6h-6m6 0a8 8 0 1 0-2 7",
   save: "m5 12 4 4L19 6",
   progress: "M20 12a8 8 0 1 1-8-8",
+  stop: "M6 6h12v12H6z",
+  terminal: "M3 4h18v16H3zM7 8l4 4-4 4m6 0h4",
   down: "M12 5v14m-6-6 6 6 6-6",
   settings:
     "M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1zM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
