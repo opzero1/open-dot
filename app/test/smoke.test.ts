@@ -663,6 +663,15 @@ class FakeDaemon {
             attachments: 1,
             truncated: false,
           },
+          ...[1, 2].map((entryNumber) => ({
+            id: `msg_worker_update${entryNumber}`,
+            role: "assistant",
+            text: "",
+            time: now + entryNumber,
+            tools: ["dot_update"],
+            attachments: 0,
+            truncated: false,
+          })),
         ],
       });
     }
@@ -1266,10 +1275,15 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
             ],
           },
         },
+        { id: "msg_update1", kind: "dot", text: "", extra: { tools: ["dot_update"] } },
+        { id: "msg_update2", kind: "dot", text: "", extra: { tools: ["dot_update"] } },
+        { id: "msg_followup", kind: "dot", text: "Follow-up reply in a separate known turn." },
+        { id: "msg_update3", kind: "dot", text: "", extra: { tools: ["dot_update"] } },
+        { id: "msg_update4", kind: "dot", text: "", extra: { tools: ["dot_update"] } },
       ];
       fake.work = [
         {
-          anchor: "msg_reply",
+          anchor: "msg_update2",
           calls: [
             toolCall("c1", "bash", "bun test", "done"),
             toolCall("c2", "edit", "src/a.ts", "done", [
@@ -1278,6 +1292,14 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
             toolCall("c3", "bash", "false", "error"),
           ],
           counts: { commands: 2, edits: 1, edited: 1, failed: 1, total: 3 },
+          complete: true,
+          open: false,
+          more: null,
+        },
+        {
+          anchor: "msg_update4",
+          calls: [toolCall("c4", "dot_update", "Follow-up state", "done")],
+          counts: { commands: 0, edits: 0, edited: 0, failed: 0, total: 1 },
           complete: true,
           open: false,
           more: null,
@@ -1325,34 +1347,62 @@ test("a busy dot shows what it is doing, and its turn's calls fold under its rep
       });
     },
     async ({ fake, js, until }) => {
-      await until(`!!document.querySelector("[data-work-log='msg_reply']")`, "the work log");
       await until(
-        `(document.querySelector("[data-activity]")?.textContent ?? "").includes("bun run check")`,
+        `!!t.msg("msg_reply")?.querySelector('[aria-label="Execution details"]') && !!t.msg("msg_followup")?.querySelector('[aria-label="Execution details"]')`,
+        "the separate turn disclosures",
+      );
+      await until(
+        `document.querySelector("[data-activity='tool'] > span")?.textContent === "jojo is working"`,
         "the activity line",
       );
       expect(
+        await js(
+          `({ rows: document.querySelectorAll("[data-message]").length, timestamps: document.querySelectorAll("[data-message] .meta").length, activityOnly: document.querySelectorAll("[data-activity-only]").length, raw: t.list().textContent.includes("dot_update"), logs: document.querySelectorAll("[data-work-log]").length, failed: t.msg("msg_reply").querySelector('[role="status"]').textContent, expanded: t.msg("msg_reply").querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"), liveRaw: document.querySelector("[data-activity]").textContent.includes("bash") })`,
+        ),
+      ).toEqual({
+        rows: 3,
+        timestamps: 3,
+        activityOnly: 0,
+        raw: false,
+        logs: 0,
+        failed: "Execution failed",
+        expanded: "false",
+        liveRaw: false,
+      });
+      await js(
+        `t.click("Execution details", t.msg("msg_reply")), t.click("Execution details", document.querySelector("[data-activity]")), true`,
+      );
+      await until(
+        `!!document.querySelector("[data-work-log='msg_update2']")`,
+        "the folded row's work log",
+      );
+      expect(
+        await js(
+          `({ first: !!t.msg("msg_reply").querySelector('[data-work-log="msg_update2"]'), later: !!t.msg("msg_reply").querySelector('[data-work-log="msg_update4"]'), secondStillCollapsed: t.msg("msg_followup").querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"), updates: [...t.msg("msg_reply").querySelectorAll(".execution-content > .note")].filter((note) => note.textContent.includes("dot_update")).length })`,
+        ),
+      ).toEqual({ first: true, later: false, secondStillCollapsed: "false", updates: 2 });
+      expect(
         await js(`(() => {
-          const log = document.querySelector("[data-work-log='msg_reply']");
+          const log = document.querySelector("[data-work-log='msg_update2']");
           const activity = document.querySelector("[data-activity]");
           const reply = t.msg("msg_reply");
           return {
             summary: log.querySelector(".work-summary").textContent,
-            collapsed: !log.querySelector("[data-tool-call]"),
+            calls: log.querySelectorAll("[data-tool-call]").length,
             underReply: reply.contains(log),
-            activity: activity.textContent,
+            activity: activity.querySelector(".execution-content").textContent.trim(),
             breaks: !!reply.querySelector(".markdown p br"),
             alert: !!reply.querySelector("blockquote.markdown-alert-warning .markdown-alert-title"),
           };
         })()`),
       ).toEqual({
-        summary: "▸ Ran 2 commands, edited 1 file, 1 failed",
-        collapsed: true,
+        summary: "Ran 2 commands, edited 1 file, 1 failed",
+        calls: 3,
         underReply: true,
         activity: expect.stringMatching(/^jojo is running bash: bun run check · 1:0\d$/),
         breaks: true,
         alert: true,
       });
-      await js(`document.querySelector("[data-work-log='msg_reply'] .work-summary").click(), true`);
       await until(`document.querySelectorAll("[data-tool-call]").length === 3`, "the calls");
       expect(
         await js(
@@ -1534,8 +1584,12 @@ test("a work cursor longer than 8,192 characters loads earlier calls; one past 1
       };
     },
     async ({ fake, js, until }) => {
+      await until(
+        `!!t.msg("msg_reply")?.querySelector('[aria-label="Execution details"]')`,
+        "the execution disclosure",
+      );
+      await js(`t.click("Execution details", t.msg("msg_reply")), true`);
       await until(`!!document.querySelector("[data-work-log='msg_reply']")`, "the work log");
-      await js(`document.querySelector("[data-work-log='msg_reply'] .work-summary").click(), true`);
       await js(
         `[...document.querySelectorAll("[data-work-log='msg_reply'] .link-button")].find((b) => b.textContent === "Load earlier calls").click(), true`,
       );
@@ -2686,6 +2740,9 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
           draft: t.box().value,
           chat: !!t.msg("m2"),
           focused: document.activeElement.getAttribute("aria-label"),
+          messageRows: panel.querySelectorAll("[data-worker-message]").length,
+          rawTools: panel.textContent.includes("bash") || panel.textContent.includes("dot_update"),
+          expanded: panel.querySelector('[aria-label="Execution details"]').getAttribute("aria-expanded"),
         };
       })()`),
       ).toEqual({
@@ -2696,7 +2753,21 @@ test("Copy and Share are all or nothing, and pending, attachment and worker rows
         draft: "Keep my draft",
         chat: true,
         focused: "Close worker panel",
+        messageRows: 1,
+        rawTools: false,
+        expanded: "false",
       });
+      await js(
+        `t.click("Execution details", document.querySelector("[data-worker-message]")), true`,
+      );
+      expect(
+        await js(
+          `({ names: document.querySelector('[data-worker-message] .execution-content').textContent.includes("bash") && document.querySelector('[data-worker-message] .execution-content').textContent.includes("dot_update"), sources: document.querySelectorAll('[data-worker-message] .execution-content .note').length })`,
+        ),
+      ).toEqual({ names: true, sources: 3 });
+      await js(
+        `t.click("Execution details", document.querySelector("[data-worker-message]")), true`,
+      );
       expect(
         await js(`[...document.querySelectorAll('[data-worker] .icon-button, [data-worker-panel] [aria-label="Open in terminal"]')].map((button) => ({
         label: button.getAttribute("aria-label"), title: button.title,

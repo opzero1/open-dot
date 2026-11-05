@@ -46,6 +46,7 @@ import {
   logCounts,
   turnCalls,
   workSummary,
+  groupActivity,
 } from "../chat";
 
 test("links open only as http, https or mailto, without credentials or hidden characters", () => {
@@ -229,6 +230,37 @@ const message = (id: string, fields: Partial<MessageView> = {}): MessageView => 
   time: 0,
   reactions: [],
   ...fields,
+});
+
+test("activity grouping keeps hidden, non-assistant and session boundaries and an info-only fallback", () => {
+  const info = { text: "", tools: ["dot_update"] };
+  const grouped = groupActivity(
+    [
+      message("first"),
+      message("update1", info),
+      message("last"),
+      message("update2", info),
+      message("hidden", { hidden: true }),
+      message("orphan1", info),
+      message("orphan2", info),
+      message("owner", { kind: "owner" }),
+      message("after-owner", info),
+      message("other-session", { ...info, sessionID: "ses_b" }),
+    ],
+    (item) => (item.kind === "dot" && !item.hidden ? item.sessionID : undefined),
+    (item) => item.kind === "dot" && !item.hidden && !item.text.trim(),
+  );
+  expect(
+    grouped.map(({ message: item, activity }) => [item.id, activity.map((source) => source.id)]),
+  ).toEqual([
+    ["first", []],
+    ["last", ["update1", "update2"]],
+    ["hidden", []],
+    ["orphan1", ["orphan2"]],
+    ["owner", []],
+    ["after-owner", []],
+    ["other-session", []],
+  ]);
 });
 
 test("the owner reacts only to the dot's visible messages", () => {

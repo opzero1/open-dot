@@ -101,6 +101,25 @@ button:disabled {
   margin-right: 6px;
 }
 
+.execution-details {
+  margin-top: 4px;
+}
+
+.execution-content {
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.message[data-activity-only] {
+  margin-block: 4px;
+}
+
+.message[data-activity-only] > .bubble {
+  display: none;
+}
+
 .delivery-status svg {
   width: 16px;
   height: 16px;
@@ -1488,6 +1507,10 @@ button:disabled {
 
 .link-button {
   text-decoration: underline;
+}
+
+.work-summary {
+  cursor: default;
 }
 
 .work-calls ul {

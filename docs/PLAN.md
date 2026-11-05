@@ -323,6 +323,8 @@ The notch's `mac/Tests` suites, deleted with `mac/`, map to these app tests. `ap
 
 ### Chat controls and worker viewing
 
+Execution names and command/call summaries are hidden behind an Execution details information icon. Consecutive assistant activity-only entries are collected under the last content-bearing assistant message in that same-session stretch, or one information icon if there is no text yet; they no longer create timestamp-only message blocks. Known work-log turn ends, owner, peer, notice, hidden-message and session boundaries are not crossed. Original work-log anchors, call identities, pagination and detail readers are preserved inside the disclosure. A failed execution remains visibly flagged, and permission cards are unchanged. Worker history uses the same compact disclosure and grouping for raw tool names. Real message timestamps remain visible; activity timestamps live inside the disclosure.
+
 The composer and pending message rows use labelled icon buttons for Send, Send now, Cancel and Copy. Sending uses a progress icon and Sent a checkmark, with accessible text and tooltips; Sent means admitted by OpenCode, never read or seen. Confirming and failed/unknown delivery remain visibly described and actionable. Share is no longer offered in message rows or the message menu; the underlying sharing bridge remains available.
 
 Thinking appears as an animated three-dot bubble, static with reduced motion. Its hover tooltip keeps the elapsed time for diagnosing a stuck turn, including the existing observed/not-updated qualifications; screen readers get a stable thinking status rather than a ticking timer. Tool activity remains textual, and Slack's separate thinking indicator is unchanged.

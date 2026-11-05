@@ -46,6 +46,7 @@ import {
   elapsed,
   emptyDraft,
   firstLines,
+  groupActivity,
   fenced,
   fencePage,
   imageLimits,
@@ -86,7 +87,7 @@ import { Memory } from "./Memory";
 import { Health, Library } from "./Panes";
 import { Slack } from "./SlackView";
 import { AvatarState, InstructionsState } from "./surfaces";
-import { type Ask, bridge, Dialog, Icon, IconButton, LocalThumb } from "./ui";
+import { type Ask, bridge, Dialog, ExecutionDetails, Icon, IconButton, LocalThumb } from "./ui";
 
 /** What the window shows for the selected dot; the Feed shows over any of them. */
 type Pane = "chat" | "memory" | "instructions" | "library" | "health" | "slack";
@@ -103,6 +104,15 @@ const paneNames: [Pane, string][] = [
 // Older pages a list too short to scroll loads on its own before it waits for Load older.
 const autoFillLimit = 10;
 const followThreshold = 48;
+
+const activityOnly = (message: MessageView) =>
+  message.kind === "dot" &&
+  !message.hidden &&
+  !message.text.trim() &&
+  !message.attachments.length &&
+  !message.quote &&
+  !message.feed &&
+  !message.reactions.length;
 
 // Daemon images become blob URLs, a bounded number at a time; evicted ones are revoked.
 const blobs = new Map<string, string>();
@@ -227,7 +237,7 @@ interface Toast {
 }
 
 type Row =
-  | { kind: "message"; key: string; message: MessageView }
+  | { kind: "message"; key: string; message: MessageView; activity: MessageView[] }
   | { kind: "pending"; key: string; pending: PendingView; sent?: Sent | undefined }
   | { kind: "attempt"; key: string; attempt: Attempt; sent?: Sent | undefined };
 
@@ -980,9 +990,20 @@ const App = () => {
 
   // Rows: the messages shown, then the owner's pending sends, then sends with an unknown outcome.
   const rows = useMemo<Row[]>(() => {
-    const listed: Row[] = shown
-      .filter((message) => showHidden || !message.hidden)
-      .map((message) => ({ kind: "message", key: message.id, message }));
+    const logs = selected ? work.get(selected)?.logs : undefined;
+    const groups = new Map<string, string>();
+    let turn = 0;
+    for (const message of shown) {
+      groups.set(message.id, `${message.sessionID}:${turn}`);
+      if (logs?.has(message.id)) turn++;
+    }
+    const listed: Row[] = groupActivity(
+      shown,
+      (message) => (message.kind === "dot" && !message.hidden ? groups.get(message.id) : undefined),
+      activityOnly,
+    )
+      .filter(({ message }) => showHidden || !message.hidden)
+      .map(({ message, activity }) => ({ kind: "message", key: message.id, message, activity }));
     const ids = new Set(shown.map((message) => message.id));
     if (!conversation?.detached)
       for (const pending of conversation?.pending ?? [])
@@ -1001,7 +1022,7 @@ const App = () => {
         sent: sent.get(attempt.messageID),
       });
     return listed;
-  }, [shown, showHidden, conversation, sent, unknownHere]);
+  }, [shown, showHidden, conversation, sent, unknownHere, selected, work]);
 
   const delivered = conversation
     ? deliveredID(applyIntents(conversation.latest, mine ?? new Map()), conversation.pending)
@@ -1994,10 +2015,14 @@ const MessageList = ({
                 <MessageRow
                   dot={dot}
                   message={row.message}
-                  log={
+                  activity={row.activity}
+                  logs={
                     work?.sessionID === row.message.sessionID
-                      ? work.logs.get(row.message.id)
-                      : undefined
+                      ? [row.message, ...row.activity].flatMap((message) => {
+                          const log = work.logs.get(message.id);
+                          return log ? [log] : [];
+                        })
+                      : []
                   }
                   busy={busy}
                   delivered={row.message.id === delivered}
@@ -2033,7 +2058,9 @@ const MessageList = ({
         })}
       </div>
       {busy && work?.open && work.sessionID === conversation.sessionID ? (
-        <WorkLog dot={dot} sessionID={conversation.sessionID} log={work.open} running />
+        <ExecutionDetails failed={work.open.counts.failed > 0}>
+          <WorkLog dot={dot} sessionID={conversation.sessionID} log={work.open} running />
+        </ExecutionDetails>
       ) : null}
       {busy ? <Activity dot={dot} sessionID={conversation.sessionID} /> : null}
       {latest ? (
@@ -2271,7 +2298,7 @@ const ToolRow = ({
   );
 };
 
-/** A turn's tool calls: collapsed to one line, expanded to each call. */
+/** A turn's tool calls, shown inside execution details. */
 const WorkLog = ({
   dot,
   sessionID,
@@ -2283,7 +2310,6 @@ const WorkLog = ({
   log: WorkLogView;
   running: boolean;
 }) => {
-  const [open, setOpen] = useState(false);
   const [earlier, setEarlier] = useState<ToolCallView[]>([]);
   const [more, setMore] = useState(log.more);
   const [complete, setComplete] = useState(log.complete);
@@ -2315,49 +2341,42 @@ const WorkLog = ({
   };
   return (
     <div className="work-log" data-work-log={log.anchor ?? "open"}>
-      <button
-        type="button"
-        className="work-summary"
-        aria-expanded={open}
-        onClick={() => setOpen(!open)}
-      >
-        <span aria-hidden="true">{open ? "▾" : "▸"}</span> {running && log.open ? "Working: " : ""}
+      <div className="work-summary">
+        {running && log.open ? "Working: " : ""}
         {workSummary(counts, complete)}
-      </button>
-      {open ? (
-        <div className="work-calls">
-          {!complete || more ? (
-            <div className="muted">
-              {!complete
-                ? more
-                  ? "Partial history: this turn's earlier calls aren't loaded yet. "
-                  : "Partial history: some of this turn's calls are missing. "
-                : ""}
-              {more ? (
-                <button
-                  type="button"
-                  className="link-button"
-                  disabled={loading}
-                  onClick={loadEarlier}
-                >
-                  {loading ? "Loading…" : "Load earlier calls"}
-                </button>
-              ) : null}
-            </div>
-          ) : null}
-          {problem ? <div className="status warning">{problem}</div> : null}
-          <ul>
-            {calls.map((call) => (
-              <ToolRow
-                key={`${call.messageID}/${call.callID}`}
-                dot={dot}
-                sessionID={sessionID}
-                call={call}
-              />
-            ))}
-          </ul>
-        </div>
-      ) : null}
+      </div>
+      <div className="work-calls">
+        {!complete || more ? (
+          <div className="muted">
+            {!complete
+              ? more
+                ? "Partial history: this turn's earlier calls aren't loaded yet. "
+                : "Partial history: some of this turn's calls are missing. "
+              : ""}
+            {more ? (
+              <button
+                type="button"
+                className="link-button"
+                disabled={loading}
+                onClick={loadEarlier}
+              >
+                {loading ? "Loading…" : "Load earlier calls"}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {problem ? <div className="status warning">{problem}</div> : null}
+        <ul>
+          {calls.map((call) => (
+            <ToolRow
+              key={`${call.messageID}/${call.callID}`}
+              dot={dot}
+              sessionID={sessionID}
+              call={call}
+            />
+          ))}
+        </ul>
+      </div>
     </div>
   );
 };
@@ -2423,10 +2442,20 @@ const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
             </span>
           ) : null}
         </>
+      ) : seen?.view.state === "tool" ? (
+        <>
+          <span>
+            {dot} is working{stale ? " · not updated" : ""}
+          </span>
+          <ExecutionDetails>
+            {activityLine(dot, seen.view)} · {duration}
+            {seen.view.since === null ? " observed" : ""}
+          </ExecutionDetails>
+        </>
       ) : (
         activityLine(dot, seen?.view)
       )}
-      {!thinking && from !== undefined ? (
+      {!thinking && seen?.view.state !== "tool" && from !== undefined ? (
         <span className="activity-time">
           {" "}
           · {duration}
@@ -2441,7 +2470,8 @@ const Activity = ({ dot, sessionID }: { dot: string; sessionID: string }) => {
 const MessageRow = ({
   dot,
   message,
-  log,
+  activity,
+  logs,
   busy,
   delivered,
   blocked,
@@ -2452,7 +2482,8 @@ const MessageRow = ({
 }: {
   dot: string;
   message: MessageView;
-  log: WorkLogView | undefined;
+  activity: MessageView[];
+  logs: WorkLogView[];
   busy: boolean;
   delivered: boolean;
   blocked: boolean;
@@ -2482,11 +2513,16 @@ const MessageRow = ({
         : undefined,
     [dot, message.id, message.sessionID, listed, onOpenImage],
   );
+  const onlyActivity = activityOnly(message);
+  const sources = [message, ...activity].toSorted((a, b) => a.time - b.time);
+  const hasExecution = logs.length > 0 || sources.some((source) => source.tools.length > 0);
+  if (onlyActivity && !hasExecution) return null;
   return (
     <div
       className={`message ${message.kind} ${message.hidden ? "hidden" : ""}`}
       data-message={message.id}
       data-kind={message.kind}
+      data-activity-only={onlyActivity || undefined}
       data-blocked={blocked ? "" : undefined}
       onContextMenu={(event) => {
         event.preventDefault();
@@ -2510,15 +2546,6 @@ const MessageRow = ({
           ) : null
         ) : message.text ? (
           <Markdown text={message.text} media={media} />
-        ) : null}
-        {message.tools.length ? (
-          <div className="tools">
-            {message.tools.map((tool, index) => (
-              <span key={index} className="tool">
-                {tool}
-              </span>
-            ))}
-          </div>
         ) : null}
         {message.attachments.length ? (
           <div className="thumbs">
@@ -2545,8 +2572,25 @@ const MessageRow = ({
           </div>
         ) : null}
       </div>
-      {log && !message.hidden ? (
-        <WorkLog dot={dot} sessionID={message.sessionID} log={log} running={busy} />
+      {hasExecution && !message.hidden ? (
+        <ExecutionDetails failed={logs.some((log) => log.counts.failed > 0)}>
+          {sources
+            .filter((source) => source.tools.length)
+            .map((source) => (
+              <div key={source.id} className="note">
+                {time(source.time)} · {source.tools.join(", ")}
+              </div>
+            ))}
+          {logs.map((log) => (
+            <WorkLog
+              key={log.anchor ?? "open"}
+              dot={dot}
+              sessionID={message.sessionID}
+              log={log}
+              running={busy}
+            />
+          ))}
+        </ExecutionDetails>
       ) : null}
       {reactions.length ? (
         <div className="reactions">
@@ -2561,41 +2605,43 @@ const MessageRow = ({
           ))}
         </div>
       ) : null}
-      <div className="meta">
-        <span>{time(message.time)}</span>
-        {delivered ? <span className="delivered">Delivered</span> : null}
-        {onRetry ? (
-          <span className="unconfirmed" data-unconfirmed>
-            Not confirmed yet{" "}
+      {!onlyActivity ? (
+        <div className="meta">
+          <span>{time(message.time)}</span>
+          {delivered ? <span className="delivered">Delivered</span> : null}
+          {onRetry ? (
+            <span className="unconfirmed" data-unconfirmed>
+              Not confirmed yet{" "}
+              <button
+                type="button"
+                title="open-dot didn't answer your last change to this message. Ask again for the same change."
+                onClick={onRetry}
+              >
+                Try again
+              </button>
+            </span>
+          ) : null}
+          {message.hidden ? (
+            <button type="button" disabled={blocked} onClick={() => onRestore(message)}>
+              Restore
+            </button>
+          ) : (
             <button
               type="button"
-              title="open-dot didn't answer your last change to this message. Ask again for the same change."
-              onClick={onRetry}
+              className="more"
+              aria-label="Message actions"
+              aria-haspopup="menu"
+              disabled={blocked}
+              onClick={(event) => {
+                const box = event.currentTarget.getBoundingClientRect();
+                open(box.left, box.bottom);
+              }}
             >
-              Try again
+              ⋯
             </button>
-          </span>
-        ) : null}
-        {message.hidden ? (
-          <button type="button" disabled={blocked} onClick={() => onRestore(message)}>
-            Restore
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="more"
-            aria-label="Message actions"
-            aria-haspopup="menu"
-            disabled={blocked}
-            onClick={(event) => {
-              const box = event.currentTarget.getBoundingClientRect();
-              open(box.left, box.bottom);
-            }}
-          >
-            ⋯
-          </button>
-        )}
-      </div>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 };
@@ -2862,14 +2908,29 @@ const WorkerPanel = ({
           {!view.messages.length ? (
             <p className="note">No text messages in the recent history.</p>
           ) : null}
-          {view.messages.map((message) => (
+          {groupActivity(
+            view.messages,
+            (message) => (message.role === "assistant" ? view.sessionID : undefined),
+            (message) =>
+              message.role === "assistant" && !message.text.trim() && !message.attachments,
+          ).map(({ message, activity }) => (
             <article key={message.id} className="worker-message" data-worker-message={message.id}>
-              <div className="note">
-                {message.role === "assistant" ? "Worker" : "Input"} · {time(message.time)}
-              </div>
+              {message.text.trim() || message.attachments || message.role !== "assistant" ? (
+                <div className="note">
+                  {message.role === "assistant" ? "Worker" : "Input"} · {time(message.time)}
+                </div>
+              ) : null}
               <Markdown text={message.text} />
-              {message.tools.length ? (
-                <p className="note">Tools: {message.tools.join(", ")}</p>
+              {[message, ...activity].some((source) => source.tools.length || source.truncated) ? (
+                <ExecutionDetails>
+                  {[message, ...activity].map((source) => (
+                    <div key={source.id} className="note">
+                      {time(source.time)}
+                      {source.tools.length ? ` · Tools: ${source.tools.join(", ")}` : ""}
+                      {source.truncated ? " · Message shortened; full text in terminal" : ""}
+                    </div>
+                  ))}
+                </ExecutionDetails>
               ) : null}
               {message.attachments ? (
                 <p className="note">{message.attachments} attachment(s) · view in terminal</p>

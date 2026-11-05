@@ -695,6 +695,34 @@ export interface WorkState {
   open: WorkLogView | undefined;
 }
 
+export const groupActivity = <T>(
+  messages: readonly T[],
+  group: (message: T) => string | undefined,
+  activityOnly: (message: T) => boolean,
+): { message: T; activity: T[] }[] => {
+  const result: { message: T; activity: T[] }[] = [];
+  for (let index = 0; index < messages.length;) {
+    const first = messages[index];
+    if (!first) break;
+    const key = group(first);
+    let end = index + 1;
+    if (key !== undefined)
+      while (end < messages.length) {
+        const next = messages[end];
+        if (!next || group(next) !== key) break;
+        end++;
+      }
+    const run = messages.slice(index, end);
+    const content = run.filter((message) => !activityOnly(message));
+    const target = content.at(-1) ?? first;
+    const activity = run.filter((message) => message !== target && activityOnly(message));
+    for (const message of content.length ? content : [first])
+      result.push({ message, activity: message === target ? activity : [] });
+    index = end;
+  }
+  return result;
+};
+
 /** The page's well-formed logs; a daemon without the work log sends none. */
 export const pageWork = (page: Pick<PageView, "work">): WorkLogView[] =>
   Array.isArray(page.work) ? page.work.filter((log) => fits(log, workLogShape)) : [];

@@ -1,6 +1,6 @@
 /** @jsxImportSource react */
 // What the window's panes share: the bridge, the one dialog and a section heading.
-import { type ComponentProps, type ReactNode, useEffect, useMemo, useRef } from "react";
+import { type ComponentProps, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import type { Bridge, DraftImage } from "./bridge";
 
 const loaded = globalThis.openDot;
@@ -19,6 +19,7 @@ const icons = {
   progress: "M20 12a8 8 0 1 1-8-8",
   stop: "M6 6h12v12H6z",
   terminal: "M3 4h18v16H3zM7 8l4 4-4 4m6 0h4",
+  info: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20M12 10v7m0-11v1",
   down: "M12 5v14m-6-6 6 6 6-6",
   settings:
     "M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1zM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
@@ -62,10 +63,33 @@ export const IconButton = ({
   </button>
 );
 
-/**
- * A question for the owner. The first button is the safe one, which Escape and Return pick; a
- * button without `run` only closes.
- */
+export const ExecutionDetails = ({
+  children,
+  failed = false,
+}: {
+  children: ReactNode;
+  failed?: boolean;
+}) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="execution-details">
+      <IconButton
+        icon="info"
+        label="Execution details"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      />
+      {failed ? (
+        <span className="warning" role="status">
+          Execution failed
+        </span>
+      ) : null}
+      {open ? <div className="execution-content">{children}</div> : null}
+    </div>
+  );
+};
+
+/** A question for the owner. The first button is safe; a button without `run` only closes. */
 export interface Ask {
   role?: "dialog" | "alertdialog";
   title: string;
